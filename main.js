@@ -216,35 +216,95 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        //OPEN STEP BIBLE
         this.addCommand({
-            id: 'open-step-bible',
-            name: 'Open STEP Bible',
-            callback: async () => {
-                const localUrl = "http://localhost:8989/";
-                const onlineUrl = "https://www.stepbible.org/";
+            id: "step-bible-search",
+            name: "Search Bible Reference…",
+            editorCallback: (editor) => {
+                const { Modal, requestUrl } = require("obsidian");
 
-                try {
-                    // Try pinging localhost
-                    const res = await requestUrl({
-                        url: localUrl,
-                        method: "GET",
-                        throw: false
-                    });
-
-                    // If localhost responds with 2xx–3xx, open it
-                    if (res.status >= 200 && res.status < 400) {
-                        window.open(localUrl, "_blank");
-                        return;
+                class BibleSearchModal extends Modal {
+                    constructor(app, onSubmit) {
+                        super(app);
+                        this.onSubmit = onSubmit;
                     }
 
-                    // Otherwise fall back to online STEP
-                    window.open(onlineUrl, "_blank");
+                    onOpen() {
+                        const { contentEl } = this;
 
-                } catch (err) {
-                    // Any failure → open online STEP
-                    window.open(onlineUrl, "_blank");
+                        contentEl.createEl("h3", { text: "Enter Bible Reference" });
+
+                        const input = contentEl.createEl("input", {
+                            type: "text",
+                            placeholder: "e.g., Numbers 3:16"
+                        });
+
+                        input.style.width = "100%";
+                        input.style.marginTop = "10px";
+
+                        input.addEventListener("keydown", (evt) => {
+                            if (evt.key === "Enter") {
+                                evt.preventDefault();
+                                evt.stopPropagation();
+
+                                this.onSubmit(input.value);
+                                this.close();
+                            }
+                        });
+
+                        input.focus();
+                    }
+
+                    onClose() {
+                        this.contentEl.empty();
+                    }
                 }
+
+                const modal = new BibleSearchModal(this.app, async (refText) => {
+                    console.log("Modal submitted:", refText);
+
+                    // If the reference ends with letters (no digits after the letters), append " 1"
+                    if (/^[A-Za-z0-9\s]+[A-Za-z]+$/.test(refText)) {
+                        refText = refText.trim() + " 1";
+                    }
+
+                    const result = this.buildStepLink(refText);
+                    console.log("buildStepLink result:", result);
+
+                    if (!result) return;
+
+                    // 🔹 Do NOT insert anything into the editor
+
+                    // 🔹 Use your helper first
+                    const localIsUp = await this.isLocalStepRunning();
+
+                    let urlToOpen;
+                    if (localIsUp) {
+                        // Try the actual local URL; if that specific URL fails, then fall back
+                        try {
+                            const res = await requestUrl({
+                                url: result.finalUrl,
+                                method: "GET",
+                                throw: false
+                            });
+
+                            if (res.status >= 200 && res.status < 400) {
+                                urlToOpen = result.finalUrl;
+                            } else {
+                                urlToOpen = this.rewriteToOnline(result.finalUrl);
+                            }
+                        } catch {
+                            urlToOpen = this.rewriteToOnline(result.finalUrl);
+                        }
+                    } else {
+                        // Local server not running at all → straight to online
+                        urlToOpen = this.rewriteToOnline(result.finalUrl);
+                    }
+
+                    console.log("Opening URL:", urlToOpen);
+                    window.open(urlToOpen, "_blank");
+                });
+
+                modal.open();
             }
         });
     }
@@ -297,8 +357,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         };
     }
 
-
-
+    // CHECKS IF LOCAL STEP IS RUNNING
     async isLocalStepRunning() {
         try {
             const res = await requestUrl({
@@ -313,6 +372,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         }
     }
 
+    // REWRITES URL TO ONLINE STEP BIBLE
     rewriteToOnline(url) {
         const onlineBase = "https://www.stepbible.org/?";
 
@@ -792,8 +852,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         });
         return flatMap;
     }
-
-    
 
     getBookOverview(book) {
         const overviews = {

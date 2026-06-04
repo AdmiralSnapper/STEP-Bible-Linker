@@ -216,13 +216,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        //DIALOGUE BOX FOR REFERENCE SEARCH
         // DIALOGUE BOX FOR REFERENCE SEARCH (works in editor, reading mode, or with no note open)
+        // Includes: darker hint, more vertical spacing, auto-close on Ctrl+Enter, "bible" special case
         this.addCommand({
             id: "step-bible-search",
             name: "Search Bible Reference…",
 
-            // Use a generic callback so the command works even when no editor is open
             callback: () => {
                 const { Modal, requestUrl, MarkdownView } = require("obsidian");
                 const plugin = this;
@@ -238,68 +237,109 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     onOpen() {
                         const { contentEl } = this;
 
-                        contentEl.createEl("h3", { text: "Enter Bible Reference" });
+                        // Use flex column + gap for consistent vertical spacing
+                        contentEl.style.display = "flex";
+                        contentEl.style.flexDirection = "column";
+                        contentEl.style.gap = "14px";
+                        contentEl.style.padding = "12px";
+
+                        const title = contentEl.createEl("h3", { text: "Enter Bible Reference" });
+                        title.style.margin = "0";
+                        title.style.padding = "0";
+                        title.style.fontSize = "16px";
 
                         const input = contentEl.createEl("input", {
                             type: "text",
                             placeholder: "e.g., Numbers 3:16"
                         });
 
+                        // Larger input spacing and comfortable touch target
                         input.style.width = "100%";
-                        input.style.marginTop = "10px";
+                        input.style.margin = "0";
+                        input.style.padding = "10px 8px";
+                        input.style.fontSize = "14px";
+                        input.style.borderRadius = "6px";
+
+                        // Small hint under the input — make it almost the same color as the background
+                        const hint = contentEl.createEl("div", {
+                            text: "ENTER -> STEP, CTRL+ENTER -> OBSIDIAN"
+                        });
+                        hint.style.fontSize = "12px";
+                        hint.style.margin = "0";
+                        hint.style.padding = "0";
+
+                        // Detect theme and set hint color to be nearly background-matching
+                        const isDark = document.body.classList.contains("theme-dark");
+                        // Very subtle: near-background (almost invisible)
+                        hint.style.color = isDark ? "rgba(255, 255, 255, 0.07)" : "rgba(0, 0, 0, 0)";
+                        hint.style.opacity = "1";
 
                         // Prefill if provided
                         if (this.prefill && this.prefill.trim()) {
                             input.value = this.prefill.trim();
-                            // select the text so user can quickly replace it
                             input.select();
                         }
 
-                        input.addEventListener("keydown", (evt) => {
-                            // CTRL + ENTER → open Obsidian search
+                        // Store handler so we can remove it later
+                        this._keydownHandler = async (evt) => {
+                            const rawValue = input.value || "";
+                            const trimmed = rawValue.trim();
+                            const isBibleToken = /^bible$/i.test(trimmed);
+
+                            // CTRL + ENTER → open Obsidian search (LEFT SIDEBAR)
                             if (evt.key === "Enter" && evt.ctrlKey) {
                                 evt.preventDefault();
                                 evt.stopPropagation();
 
-                                const query = this.buildSearchQuery(input.value.trim());
-                                input.select();
+                                const query = isBibleToken ? `"reference="` : this.buildSearchQuery(trimmed);
 
-                                const leaves = plugin.app.workspace.getLeavesOfType("search");
+                                // 1. Open the left sidebar
+                                plugin.app.workspace.leftSplit?.expand();
 
-                                if (leaves.length > 0) {
-                                    const leaf = leaves[0];
-                                    if (leaf.view && leaf.view.setQuery) {
-                                        leaf.view.setQuery(query);
-                                    }
-                                } else {
-                                    const leaf = plugin.app.workspace.getRightLeaf(false);
-                                    leaf.setViewState({
+                                // 2. Get or create a search leaf IN THE LEFT SIDEBAR
+                                let leaf = plugin.app.workspace.getLeavesOfType("search")[0];
+
+                                if (!leaf) {
+                                    leaf = plugin.app.workspace.getLeftLeaf(false);
+                                    await leaf.setViewState({
                                         type: "search",
                                         state: { query }
                                     });
-
-                                    if (leaf.view && leaf.view.setQuery) {
-                                        leaf.view.setQuery(query);
-                                    }
                                 }
 
+                                // 3. Set the query
+                                leaf.view?.setQuery?.(query);
+
+                                // 4. Focus the search view
+                                plugin.app.workspace.setActiveLeaf(leaf, { focus: true });
+
+                                this.close();
                                 return;
                             }
 
-                            // ENTER → normal submit
-                            if (evt.key === "Enter") {
+                            // ENTER → normal submit (ONLY when CTRL is NOT pressed)
+                            else if (evt.key === "Enter") {
+                                if (isBibleToken) {
+                                    evt.preventDefault();
+                                    evt.stopPropagation();
+                                    return;
+                                }
+
                                 evt.preventDefault();
                                 evt.stopPropagation();
 
                                 this.onSubmit(input.value);
                                 this.close();
                             }
-                        });
+                        };
+
+                        input.addEventListener("keydown", this._keydownHandler);
+
 
                         input.focus();
                     }
 
-                    // buildSearchQuery unchanged (uses plugin helpers on plugin)
+                    // buildSearchQuery uses plugin helpers on plugin
                     buildSearchQuery(ref) {
                         ref = ref.trim();
 
@@ -358,8 +398,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     }
 
                     onClose() {
+                        const input = this.contentEl.querySelector("input");
+                        if (input && this._keydownHandler) {
+                            input.removeEventListener("keydown", this._keydownHandler);
+                        }
+
                         this.contentEl.empty();
                     }
+
                 }
 
                 // Determine a sensible prefill:
@@ -372,7 +418,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (activeView && activeView.editor) {
                     prefill = activeView.editor.getSelection() || "";
                 } else {
-                    // reading mode or no note open: try DOM selection
                     try {
                         const domSel = (window.getSelection && window.getSelection().toString && window.getSelection().toString()) || "";
                         prefill = domSel || "";
@@ -427,6 +472,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 modal.open();
             }
         });
+
+
+        
 
     }
 

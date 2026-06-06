@@ -174,7 +174,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
 
                 // Route Jude hover to ONLINE STEP
-                if (serverRef.startsWith("Jude.")) {
+                if (serverRef.startsWith("Jude.") || serverRef.startsWith("Revelation.")) {
                     linkUrl =
                         `https://www.stepbible.org/?q=version=ESV@version=THOT@version=SBLG@reference=${serverRef}&options=NGUVH&display=COLUMN`;
                 }
@@ -291,9 +291,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 // Normal submit
                                 this.onSubmit(input.value);
 
-                                // Start a STEP search session
-                                plugin._stepSearchSessionActive = true;
-
                                 // Put Obsidian into reading mode
                                 plugin.app.workspace.getActiveViewOfType(MarkdownView)?.setMode("preview");
 
@@ -341,7 +338,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         // Book-only: match any STEP reference that starts with the book
                         if (!serverRef.includes(".")) {
-                            return `"reference=${serverRef}."`;
+                            return `"reference=${serverRef}"`;
                         }
 
                         let refs = [];
@@ -485,7 +482,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             if (!book) return null;
 
-            const isJude = book === "Jude";
+            const isJude = (book === "Jude" || book === "Revelation");
             const baseUrl = isJude
                 ? urlLocalPrefix
                 : urlOnlinePrefix;
@@ -500,7 +497,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const parsingResult = this.parseAndExpandVerse(clean);
         if (!parsingResult) return null;
 
-        const isJude = parsingResult.serverRef.startsWith("Jude.");
+        const isJude = (parsingResult.serverRef.startsWith("Jude.") || parsingResult.serverRef.startsWith("Revelation"));
 
         const baseUrl = isJude
             ? urlOnlinePrefix

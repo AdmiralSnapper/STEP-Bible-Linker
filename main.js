@@ -216,8 +216,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        // DIALOGUE BOX FOR REFERENCE SEARCH (works in editor, reading mode, or with no note open)
-        // Includes: darker hint, more vertical spacing, auto-close on Ctrl+Enter, "bible" special case
+        // DIALOGUE BOX FOR REFERENCE SEARCH
         this.addCommand({
             id: "step-bible-search",
             name: "Search Bible Reference…",
@@ -262,7 +261,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         // Small hint under the input — make it almost the same color as the background
                         const hint = contentEl.createEl("div", {
-                            text: "ENTER -> STEP, CTRL+ENTER -> OBSIDIAN"
+                            text: "Type bible for all scripture references."
                         });
                         hint.style.fontSize = "12px";
                         hint.style.margin = "0";
@@ -280,23 +279,29 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             input.select();
                         }
 
-                        // Store handler so we can remove it later
                         this._keydownHandler = async (evt) => {
                             const rawValue = input.value || "";
                             const trimmed = rawValue.trim();
-                            const isBibleToken = /^bible$/i.test(trimmed);
 
-                            // CTRL + ENTER → open Obsidian search (LEFT SIDEBAR)
-                            if (evt.key === "Enter" && evt.ctrlKey) {
+                            // ENTER → merged behavior (normal submit + open search)
+                            if (evt.key === "Enter") {
                                 evt.preventDefault();
                                 evt.stopPropagation();
 
-                                const query = isBibleToken ? `"reference="` : this.buildSearchQuery(trimmed);
+                                // Normal submit
+                                this.onSubmit(input.value);
 
-                                // 1. Open the left sidebar
+                                // Start a STEP search session
+                                plugin._stepSearchSessionActive = true;
+
+                                // Put Obsidian into reading mode
+                                plugin.app.workspace.getActiveViewOfType(MarkdownView)?.setMode("preview");
+
+                                // ALSO open search with the same query
+                                const query = this.buildSearchQuery(trimmed);
+
                                 plugin.app.workspace.leftSplit?.expand();
 
-                                // 2. Get or create a search leaf IN THE LEFT SIDEBAR
                                 let leaf = plugin.app.workspace.getLeavesOfType("search")[0];
 
                                 if (!leaf) {
@@ -307,34 +312,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     });
                                 }
 
-                                // 3. Set the query
                                 leaf.view?.setQuery?.(query);
-
-                                // 4. Focus the search view
                                 plugin.app.workspace.setActiveLeaf(leaf, { focus: true });
 
-                                this.close();
-                                return;
-                            }
-
-                            // ENTER → normal submit (ONLY when CTRL is NOT pressed)
-                            else if (evt.key === "Enter") {
-                                if (isBibleToken) {
-                                    evt.preventDefault();
-                                    evt.stopPropagation();
-                                    return;
-                                }
-
-                                evt.preventDefault();
-                                evt.stopPropagation();
-
-                                this.onSubmit(input.value);
                                 this.close();
                             }
                         };
 
                         input.addEventListener("keydown", this._keydownHandler);
-
 
                         input.focus();
                     }
@@ -342,6 +327,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     // buildSearchQuery uses plugin helpers on plugin
                     buildSearchQuery(ref) {
                         ref = ref.trim();
+
+                        if (ref.toLowerCase() === "bible") {
+                            return "reference=";
+                        }
 
                         const parsed = this.plugin.parseAndExpandVerse(ref);
                         if (!parsed || !parsed.serverRef) {
@@ -472,10 +461,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 modal.open();
             }
         });
-
-
         
-
     }
 
     // BUILDS THE STEP URL FROM GIVEN TEXT
@@ -490,7 +476,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         // 1. BOOK-ONLY HANDLING (optionally numbered, but NO chapter/verse)
         const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;
-        
+
         // Test the input to see if it just a book.
         if (bookOnlyPattern.test(clean)) {
             const lookupKey = clean.toLowerCase();
@@ -594,12 +580,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     }
 
     // --- Expand a STEP-style serverRef into a list of verse refs ---
-    // Handles:
-    // John.3.16
-    // John.3
-    // John.3.1-John.3.2
-    // John.3-John.4
-    // John.8-John.9.3
     expandServerRefToVerseList(serverRef) {
         // Normalize: remove spaces from book part if any slipped through
         serverRef = serverRef.replace(/\s+/g, "");
@@ -675,7 +655,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
     //TURNS REFERENCE TEXT INTO FULL REFERENCE AND URL
     parseAndExpandVerse(text) {
-        
+
         // 1. BOOK-ONLY HANDLING (optionally numbered, but NO chapter/verse)
         const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;
 
@@ -697,7 +677,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         // Detect spaced dash BEFORE normalization destroys spacing
         const hasSpacedDash = /\s+-\s+/.test(text);
-        
+
         let clean = text
             .replace(/–/g, "-")
             .replace(/\s*-\s*/g, "-")
@@ -844,74 +824,74 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     //MAP OF ALL BOOK NAMES
     getBookMap() {
         const rawData = {
-          "en": [
-            { bookName: "Genesis", abbreviations: ["Gen", "Ge", "Gn"] },
-            { bookName: "Exodus", abbreviations: ["Exod", "Ex"] },
-            { bookName: "Leviticus", abbreviations: ["Lev", "Lv", "Le"] },
-            { bookName: "Numbers", abbreviations: ["Num", "Nm", "Nu"] },
-            { bookName: "Deuteronomy", abbreviations: ["Deut", "Dt", "De", "Du"] },
-            { bookName: "Joshua", abbreviations: ["Josh", "Jos", "Jo"] },
-            { bookName: "Judges", abbreviations: ["Judg", "Jdg", "Jgs"] },
-            { bookName: "Ruth", abbreviations: ["Ruth", "Ru"] },
-            { bookName: "1 Samuel", abbreviations: ["1 Sam", "1Sm", "1Sa"] },
-            { bookName: "2 Samuel", abbreviations: ["2 Sam", "2Sm", "2Sa"] },
-            { bookName: "1 Kings", abbreviations: ["1 Kgs", "1Kg", "1Ki"] },
-            { bookName: "2 Kings", abbreviations: ["2 Kgs", "2Kg", "2Ki"] },
-            { bookName: "1 Chronicles", abbreviations: ["1 Chr", "1 Chron", "1Ch"] },
-            { bookName: "2 Chronicles", abbreviations: ["2 Chr", "2 Chron", "2Ch"] },
-            { bookName: "Ezra", abbreviations: ["Ezra", "Ezr"] },
-            { bookName: "Nehemiah", abbreviations: ["Neh", "Ne"] },
-            { bookName: "Esther", abbreviations: ["Esth", "Est", "Es"] },
-            { bookName: "Job", abbreviations: ["Job", "Jb"] },
-            { bookName: "Psalms", abbreviations: ["Ps", "Pss", "Psalm"] },
-            { bookName: "Proverbs", abbreviations: ["Prov", "Prv", "Pr"] },
-            { bookName: "Ecclesiastes", abbreviations: ["Qoheleth", "Eccl", "Eccles", "Ec", "Qoh"] },
-            { bookName: "Song of Songs", abbreviations: ["Song", "SS", "So", "Sg", "Song of Solomon"] },
-            { bookName: "Isaiah", abbreviations: ["Isa", "Is"] },
-            { bookName: "Jeremiah", abbreviations: ["Jer", "Je"] },
-            { bookName: "Lamentations", abbreviations: ["Lam", "La"] },
-            { bookName: "Ezekiel", abbreviations: ["Ezek", "Ezk", "Ez"] },
-            { bookName: "Daniel", abbreviations: ["Dan", "Dn", "Da"] },
-            { bookName: "Hosea", abbreviations: ["Hos", "Ho"] },
-            { bookName: "Joel", abbreviations: ["Joel", "Joe", "Jl"] },
-            { bookName: "Amos", abbreviations: ["Amos", "Am"] },
-            { bookName: "Obadiah", abbreviations: ["Obad", "Ob"] },
-            { bookName: "Jonah", abbreviations: ["Jonah", "Jon"] },
-            { bookName: "Micah", abbreviations: ["Mic", "Mi"] },
-            { bookName: "Nahum", abbreviations: ["Nah", "Na"] },
-            { bookName: "Habakkuk", abbreviations: ["Hab", "Hb"] },
-            { bookName: "Zephaniah", abbreviations: ["Zeph", "Zep"] },
-            { bookName: "Haggai", abbreviations: ["Hag", "Hg"] },
-            { bookName: "Zechariah", abbreviations: ["Zech", "Zec"] },
-            { bookName: "Malachi", abbreviations: ["Mal", "Ml"] },
-            { bookName: "Matthew", abbreviations: ["Matt", "Mat", "Mt"] },
-            { bookName: "Mark", abbreviations: ["Mark", "Mar", "Mk"] },
-            { bookName: "Luke", abbreviations: ["Luke", "Lk", "Lu"] },
-            { bookName: "John", abbreviations: ["John", "Jn", "Jo"] },
-            { bookName: "Acts", abbreviations: ["Acts", "Ac"] },
-            { bookName: "Romans", abbreviations: ["Rom", "Rm", "Ro"] },
-            { bookName: "1 Corinthians", abbreviations: ["1 Cor", "1 Co", "1C"] },
-            { bookName: "2 Corinthians", abbreviations: ["2 Cor", "2 Co", "2C"] },
-            { bookName: "Galatians", abbreviations: ["Gal", "Ga"] },
-            { bookName: "Ephesians", abbreviations: ["Eph", "Ep"] },
-            { bookName: "Philippians", abbreviations: ["Phil", "Php"] },
-            { bookName: "Colossians", abbreviations: ["Col", "Co"] },
-            { bookName: "1 Thessalonians", abbreviations: ["1 Thess", "1 Thes", "1Th"] },
-            { bookName: "2 Thessalonians", abbreviations: ["2 Thess", "2 Thes", "2Th"] },
-            { bookName: "1 Timothy", abbreviations: ["1 Tim", "1 Tm", "1 Ti", "1T"] },
-            { bookName: "2 Timothy", abbreviations: ["2 Tim", "2 Tm", "2 Ti", "2T"] },
-            { bookName: "Titus", abbreviations: ["Titus", "Tit", "Ti"] },
-            { bookName: "Philemon", abbreviations: ["Phlm", "Philem", "Phm"] },
-            { bookName: "Hebrews", abbreviations: ["Heb", "He"] },
-            { bookName: "James", abbreviations: ["Jas", "Ja"] },
-            { bookName: "1 Peter", abbreviations: ["1 Pet", "1 Pt", "1P"] },
-            { bookName: "2 Peter", abbreviations: ["2 Pet", "2 Pt", "2P"] },
-            { bookName: "1 John", abbreviations: ["1 John", "1 Jn", "1 Jo", "1J"] },
-            { bookName: "2 John", abbreviations: ["2 John", "2 Jn", "2 Jo", "2J"] },
-            { bookName: "3 John", abbreviations: ["3 John", "3 Jn", "3 Jo", "3J"] },
-            { bookName: "Jude", abbreviations: ["Jude", "Ju"] },
-            { bookName: "Revelation", abbreviations: ["Rev", "Re", "Rv"] }
-          ]
+            "en": [
+                { bookName: "Genesis", abbreviations: ["Gen", "Ge", "Gn"] },
+                { bookName: "Exodus", abbreviations: ["Exod", "Ex"] },
+                { bookName: "Leviticus", abbreviations: ["Lev", "Lv", "Le"] },
+                { bookName: "Numbers", abbreviations: ["Num", "Nm", "Nu"] },
+                { bookName: "Deuteronomy", abbreviations: ["Deut", "Dt", "De", "Du"] },
+                { bookName: "Joshua", abbreviations: ["Josh", "Jos", "Jo"] },
+                { bookName: "Judges", abbreviations: ["Judg", "Jdg", "Jgs"] },
+                { bookName: "Ruth", abbreviations: ["Ruth", "Ru"] },
+                { bookName: "1 Samuel", abbreviations: ["1 Sam", "1Sm", "1Sa"] },
+                { bookName: "2 Samuel", abbreviations: ["2 Sam", "2Sm", "2Sa"] },
+                { bookName: "1 Kings", abbreviations: ["1 Kgs", "1Kg", "1Ki"] },
+                { bookName: "2 Kings", abbreviations: ["2 Kgs", "2Kg", "2Ki"] },
+                { bookName: "1 Chronicles", abbreviations: ["1 Chr", "1 Chron", "1Ch"] },
+                { bookName: "2 Chronicles", abbreviations: ["2 Chr", "2 Chron", "2Ch"] },
+                { bookName: "Ezra", abbreviations: ["Ezra", "Ezr"] },
+                { bookName: "Nehemiah", abbreviations: ["Neh", "Ne"] },
+                { bookName: "Esther", abbreviations: ["Esth", "Est", "Es"] },
+                { bookName: "Job", abbreviations: ["Job", "Jb"] },
+                { bookName: "Psalms", abbreviations: ["Ps", "Pss", "Psalm"] },
+                { bookName: "Proverbs", abbreviations: ["Prov", "Prv", "Pr"] },
+                { bookName: "Ecclesiastes", abbreviations: ["Qoheleth", "Eccl", "Eccles", "Ec", "Qoh"] },
+                { bookName: "Song of Songs", abbreviations: ["Song", "SS", "So", "Sg", "Song of Solomon"] },
+                { bookName: "Isaiah", abbreviations: ["Isa", "Is"] },
+                { bookName: "Jeremiah", abbreviations: ["Jer", "Je"] },
+                { bookName: "Lamentations", abbreviations: ["Lam", "La"] },
+                { bookName: "Ezekiel", abbreviations: ["Ezek", "Ezk", "Ez"] },
+                { bookName: "Daniel", abbreviations: ["Dan", "Dn", "Da"] },
+                { bookName: "Hosea", abbreviations: ["Hos", "Ho"] },
+                { bookName: "Joel", abbreviations: ["Joel", "Joe", "Jl"] },
+                { bookName: "Amos", abbreviations: ["Amos", "Am"] },
+                { bookName: "Obadiah", abbreviations: ["Obad", "Ob"] },
+                { bookName: "Jonah", abbreviations: ["Jonah", "Jon"] },
+                { bookName: "Micah", abbreviations: ["Mic", "Mi"] },
+                { bookName: "Nahum", abbreviations: ["Nah", "Na"] },
+                { bookName: "Habakkuk", abbreviations: ["Hab", "Hb"] },
+                { bookName: "Zephaniah", abbreviations: ["Zeph", "Zep"] },
+                { bookName: "Haggai", abbreviations: ["Hag", "Hg"] },
+                { bookName: "Zechariah", abbreviations: ["Zech", "Zec"] },
+                { bookName: "Malachi", abbreviations: ["Mal", "Ml"] },
+                { bookName: "Matthew", abbreviations: ["Matt", "Mat", "Mt"] },
+                { bookName: "Mark", abbreviations: ["Mark", "Mar", "Mk"] },
+                { bookName: "Luke", abbreviations: ["Luke", "Lk", "Lu"] },
+                { bookName: "John", abbreviations: ["John", "Jn", "Jo"] },
+                { bookName: "Acts", abbreviations: ["Acts", "Ac"] },
+                { bookName: "Romans", abbreviations: ["Rom", "Rm", "Ro"] },
+                { bookName: "1 Corinthians", abbreviations: ["1 Cor", "1 Co", "1C"] },
+                { bookName: "2 Corinthians", abbreviations: ["2 Cor", "2 Co", "2C"] },
+                { bookName: "Galatians", abbreviations: ["Gal", "Ga"] },
+                { bookName: "Ephesians", abbreviations: ["Eph", "Ep"] },
+                { bookName: "Philippians", abbreviations: ["Phil", "Php"] },
+                { bookName: "Colossians", abbreviations: ["Col", "Co"] },
+                { bookName: "1 Thessalonians", abbreviations: ["1 Thess", "1 Thes", "1Th"] },
+                { bookName: "2 Thessalonians", abbreviations: ["2 Thess", "2 Thes", "2Th"] },
+                { bookName: "1 Timothy", abbreviations: ["1 Tim", "1 Tm", "1 Ti", "1T"] },
+                { bookName: "2 Timothy", abbreviations: ["2 Tim", "2 Tm", "2 Ti", "2T"] },
+                { bookName: "Titus", abbreviations: ["Titus", "Tit", "Ti"] },
+                { bookName: "Philemon", abbreviations: ["Phlm", "Philem", "Phm"] },
+                { bookName: "Hebrews", abbreviations: ["Heb", "He"] },
+                { bookName: "James", abbreviations: ["Jas", "Ja"] },
+                { bookName: "1 Peter", abbreviations: ["1 Pet", "1 Pt", "1P"] },
+                { bookName: "2 Peter", abbreviations: ["2 Pet", "2 Pt", "2P"] },
+                { bookName: "1 John", abbreviations: ["1 John", "1 Jn", "1 Jo", "1J"] },
+                { bookName: "2 John", abbreviations: ["2 John", "2 Jn", "2 Jo", "2J"] },
+                { bookName: "3 John", abbreviations: ["3 John", "3 Jn", "3 Jo", "3J"] },
+                { bookName: "Jude", abbreviations: ["Jude", "Ju"] },
+                { bookName: "Revelation", abbreviations: ["Rev", "Re", "Rv"] }
+            ]
         };
 
         const flatMap = {};
@@ -1557,7 +1537,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         return overviews[book] || null;
     }
-
 
     onunload() {
         if (this.activePopover && this.activePopover.parentNode) {

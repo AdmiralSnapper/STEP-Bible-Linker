@@ -43,7 +43,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!result) return;
 
                 //Replace the text with the correct link format. 
-                const replacement = `[${result.expandedText}](${result.finalUrl})`;
+                const replacement = `([${result.expandedText}](${result.finalUrl}))`;
                 const newLine = line.slice(0, start) + replacement + line.slice(end);
 
                 editor.setLine(cursor.line, newLine);

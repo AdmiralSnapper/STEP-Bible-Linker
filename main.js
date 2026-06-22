@@ -75,6 +75,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const u = targetEl.closest('.cm-underline');
                 if (u) {
                     const t = u.textContent.trim();
+
                     const refPattern =
                         /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*(?:\s+\d+(?::\d+)?(?:\s*-\s*\d+(?::\d+)?)?)?$/;
 
@@ -85,8 +86,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
             }
 
-            if (!linkUrl.startsWith('http://localhost:8989/') &&
-                !linkUrl.startsWith('https://www.stepbible.org/')) return;
+            if (!linkUrl.startsWith('http://localhost:8989/')) return;
 
             // If a popover is already open, close it
             if (this.activePopover) {
@@ -171,12 +171,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     // Fallback if overview missing
                     pop.innerHTML = `<b>${serverRef}</b><br>No overview available.`;
                     return;
-                }
-
-                // Route Jude hover to ONLINE STEP
-                if (serverRef.startsWith("Jude.") || serverRef.startsWith("Revelation.")) {
-                    linkUrl =
-                        `https://www.stepbible.org/?q=version=ESV@version=THOT@version=SBLG@reference=${serverRef}&options=NGUVH&display=COLUMN`;
                 }
 
                 const verseRefs = this.expandServerRefToVerseList(serverRef);
@@ -285,14 +279,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                             // ENTER → merged behavior (normal submit + open search)
                             if (evt.key === "Enter") {
+
                                 evt.preventDefault();
                                 evt.stopPropagation();
 
                                 // Normal submit
                                 this.onSubmit(input.value);
-
-                                // Put Obsidian into reading mode
-                                plugin.app.workspace.getActiveViewOfType(MarkdownView)?.setMode("preview");
 
                                 // ALSO open search with the same query
                                 const query = this.buildSearchQuery(trimmed);
@@ -300,6 +292,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 plugin.app.workspace.leftSplit?.expand();
 
                                 let leaf = plugin.app.workspace.getLeavesOfType("search")[0];
+
+                                console.log(leaf)
 
                                 if (!leaf) {
                                     leaf = plugin.app.workspace.getLeftLeaf(false);
@@ -315,7 +309,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 this.close();
                             }
                         };
-
+                        
                         input.addEventListener("keydown", this._keydownHandler);
 
                         input.focus();
@@ -464,8 +458,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // BUILDS THE STEP URL FROM GIVEN TEXT
     buildStepLink(refText) {
 
-        const urlLocalPrefix = "http://localhost:8989/?q=version=ESV@version=THOT@version=SBLG@reference=";
-        const urlOnlinePrefix = "https://www.stepbible.org/?q=version=ESV@version=THOT@version=SBLG@reference="
+        const urlPrefix = "http://localhost:8989/?q=version=ESV@version=THOT@version=SBLG@reference=";
         const urlSuffix = "&options=GNVUH&display=COLUMN";
 
         // Normalize input
@@ -482,14 +475,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             if (!book) return null;
 
-            const isJude = (book === "Jude" || book === "Revelation");
-            const baseUrl = isJude
-                ? urlLocalPrefix
-                : urlOnlinePrefix;
-
             return {
                 expandedText: book,
-                finalUrl: `${baseUrl}${book}${urlSuffix}`
+                finalUrl: `${urlPrefix}${book}${urlSuffix}`
             };
         }
 
@@ -497,15 +485,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const parsingResult = this.parseAndExpandVerse(clean);
         if (!parsingResult) return null;
 
-        const isJude = (parsingResult.serverRef.startsWith("Jude.") || parsingResult.serverRef.startsWith("Revelation"));
-
-        const baseUrl = isJude
-            ? urlOnlinePrefix
-            : urlLocalPrefix;
-
         return {
             expandedText: parsingResult.expandedText,
-            finalUrl: `${baseUrl}${parsingResult.serverRef}${urlSuffix}`
+            finalUrl: `${urlPrefix}${parsingResult.serverRef}${urlSuffix}`
         };
     }
 

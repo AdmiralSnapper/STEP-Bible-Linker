@@ -5,6 +5,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         console.log('STEP Bible Linker: Restored Text Overlay Engine Active.');
         this.activePopover = null;
 
+        this.addCommand({
+            id: 'TEST',
+            name: 'TEST',
+            editorCallback: (editor) => {
+                console.log("TEST command executed.");
+                const iframe = document.querySelector('iframe'); // replace with a specific selector
+                if (!iframe) return;
+                console.log({ src: iframe.getAttribute('src'), url: iframe.src });
+            }
+        });
+
         // LINK REFERENCE AT CURSOR 
         this.addCommand({
             id: 'auto-link-step-ref',
@@ -289,6 +300,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 // ALSO open search with the same query
                                 const query = this.buildSearchQuery(trimmed);
 
+                                if(query === "") {
+                                    this.close();
+                                    return;
+                                }
+
                                 plugin.app.workspace.leftSplit?.expand();
 
                                 let leaf = plugin.app.workspace.getLeavesOfType("search")[0];
@@ -321,6 +337,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         if (ref.toLowerCase() === "bible") {
                             return "reference=";
+                        }
+
+                        if (ref === "") {
+                            return "";
                         }
 
                         const parsed = this.plugin.parseAndExpandVerse(ref);

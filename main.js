@@ -5,16 +5,84 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         console.log('STEP Bible Linker: Restored Text Overlay Engine Active.');
         this.activePopover = null;
 
-        this.addCommand({
-            id: 'TEST',
-            name: 'TEST',
-            editorCallback: (editor) => {
-                console.log("TEST command executed.");
-                const iframe = document.querySelector('iframe'); // replace with a specific selector
-                if (!iframe) return;
-                console.log({ src: iframe.getAttribute('src'), url: iframe.src });
-            }
-        });
+        // IF WEBVIEWER IS OPEN, LISTEN FOR URL CHANGES AND UPDATE SEARCH PANEL
+        this.registerEvent(
+            this.app.workspace.on("active-leaf-change", leaf => {
+                const view = leaf?.view;
+                const webviewEl = view?.webview;
+
+                if (!webviewEl) return;
+
+                // Avoid double-binding
+                if (webviewEl.__stepListenerAttached) return;
+                webviewEl.__stepListenerAttached = true;
+
+                // Listen for URL changes inside the webviewer
+                webviewEl.addEventListener("did-navigate-in-page", (event) => {
+                    const url = webviewEl.getURL?.();
+                    if (!url) return;
+
+                    if (!url.includes("reference=")) return;
+
+                    const ref = this.extractReferenceFromUrl(url);
+                    if (!ref) return;
+
+                    const query = this.buildSearchQuery(ref);
+
+                    // Update left search panel
+                    this.app.workspace.leftSplit?.expand();
+
+                    let searchLeaf = this.app.workspace.getLeavesOfType("search")[0];
+
+                    if (!searchLeaf) {
+                        searchLeaf = this.app.workspace.getLeftLeaf(false);
+                        searchLeaf.setViewState({
+                            type: "search",
+                            state: { query }
+                        });
+                    }
+
+                    searchLeaf.view?.setQuery?.(query);
+                    this.app.workspace.setActiveLeaf(searchLeaf, { focus: false });
+                });
+            })
+        );
+        
+        // IF WEBVIEWER IS OPEN, UPDATE SEARCH PANEL IMMEDIATELY ON LEAF CHANGE
+        this.registerEvent(
+            this.app.workspace.on("active-leaf-change", leaf => {
+                const view = leaf?.view;
+                const webviewEl = view?.webview;
+
+                if (!webviewEl) return;
+
+                // When switching to a new webviewer, update immediately
+                const url = view?.url ?? webviewEl.getURL?.();
+                if (!url) return;
+
+                if (!url.includes("reference=")) return;
+
+                const ref = this.extractReferenceFromUrl(url);
+                if (!ref) return;
+
+                const query = this.buildSearchQuery(ref);
+
+                // Update left search panel
+                this.app.workspace.leftSplit?.expand();
+
+                let searchLeaf = this.app.workspace.getLeavesOfType("search")[0];
+
+                if (!searchLeaf) {
+                    searchLeaf = this.app.workspace.getLeftLeaf(false);
+                    searchLeaf.setViewState({
+                        type: "search",
+                        state: { query }
+                    });
+                }
+
+                searchLeaf.view?.setQuery?.(query);
+            })
+        );
 
         // LINK REFERENCE AT CURSOR 
         this.addCommand({
@@ -254,7 +322,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         const input = contentEl.createEl("input", {
                             type: "text",
-                            placeholder: "e.g., Numbers 3:16"
+                            placeholder: "reference here"
                         });
 
                         // Larger input spacing and comfortable touch target
@@ -298,8 +366,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 this.onSubmit(input.value);
 
                                 // ALSO open search with the same query
-                                const query = this.buildSearchQuery(trimmed);
+                                const query = plugin.buildSearchQuery(trimmed);
 
+                                console.log(trimmed);
+
+                                // If no query, no search bar opens, but link still goes through. 
                                 if(query === "") {
                                     this.close();
                                     return;
@@ -331,72 +402,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         input.focus();
                     }
 
-                    // buildSearchQuery uses plugin helpers on plugin
-                    buildSearchQuery(ref) {
-                        ref = ref.trim();
-
-                        if (ref.toLowerCase() === "bible") {
-                            return "reference=";
-                        }
-
-                        if (ref === "") {
-                            return "";
-                        }
-
-                        const parsed = this.plugin.parseAndExpandVerse(ref);
-                        if (!parsed || !parsed.serverRef) {
-                            return `"${ref}"`;
-                        }
-
-                        const serverRef = parsed.serverRef.replace(/\s+/g, "");
-
-                        // Book-only: match any STEP reference that starts with the book
-                        if (!serverRef.includes(".")) {
-                            return `"reference=${serverRef}"`;
-                        }
-
-                        let refs = [];
-
-                        if (serverRef.includes("-")) {
-                            const [left, right] = serverRef.split("-");
-                            const lParts = left.split(".");
-                            const rParts = right.split(".");
-
-                            if (lParts.length === 2 && rParts.length === 2 && lParts[0] === rParts[0]) {
-                                const book = lParts[0];
-                                const startChap = parseInt(lParts[1], 10);
-                                const endChap = parseInt(rParts[1], 10);
-
-                                if (!Number.isNaN(startChap) && !Number.isNaN(endChap) && startChap <= endChap) {
-                                    for (let c = startChap; c <= endChap; c++) {
-                                        refs.push(`${book}.${c}`);
-                                    }
-                                } else {
-                                    refs = this.plugin.expandServerRefToVerseList
-                                        ? this.plugin.expandServerRefToVerseList(serverRef)
-                                        : [serverRef];
-                                }
-                            } else {
-                                refs = this.plugin.expandServerRefToVerseList
-                                    ? this.plugin.expandServerRefToVerseList(serverRef)
-                                    : [serverRef];
-                            }
-                        } else {
-                            const parts = serverRef.split(".");
-                            if (parts.length === 2) {
-                                refs.push(serverRef);
-                            } else {
-                                refs.push(serverRef);
-                            }
-                        }
-
-                        refs = Array.from(new Set(refs || []));
-                        if (refs.length === 0) return `"${ref}"`;
-
-                        const parts = refs.map(r => `"reference=${r}"`);
-                        return parts.join(" OR ");
-                    }
-
+                    
                     onClose() {
                         const input = this.contentEl.querySelector("input");
                         if (input && this._keydownHandler) {
@@ -472,7 +478,73 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 modal.open();
             }
         });
-        
+    }
+
+    // TAKE A REFERENCE AND BUILD A SEARCH QUERY FROM IT
+    buildSearchQuery(ref) {
+        //remove spaces
+        ref = ref.trim();
+
+        if (ref.toLowerCase() === "bible") {
+            return "reference=";
+        }
+
+        if (ref === "") {
+            return "";
+        }
+
+        const parsed = this.parseAndExpandVerse(ref);
+        if (!parsed || !parsed.serverRef) {
+            return `"${ref}"`;
+        }
+
+        const serverRef = parsed.serverRef.replace(/\s+/g, "");
+
+        // Book-only: match any STEP reference that starts with the book
+        if (!serverRef.includes(".")) {
+            return `"reference=${serverRef}"`;
+        }
+
+        let refs = [];
+
+        if (serverRef.includes("-")) {
+            const [left, right] = serverRef.split("-");
+            const lParts = left.split(".");
+            const rParts = right.split(".");
+
+            if (lParts.length === 2 && rParts.length === 2 && lParts[0] === rParts[0]) {
+                const book = lParts[0];
+                const startChap = parseInt(lParts[1], 10);
+                const endChap = parseInt(rParts[1], 10);
+
+                if (!Number.isNaN(startChap) && !Number.isNaN(endChap) && startChap <= endChap) {
+                    for (let c = startChap; c <= endChap; c++) {
+                        refs.push(`${book}.${c}`);
+                    }
+                } else {
+                    refs = this.expandServerRefToVerseList
+                        ? this.expandServerRefToVerseList(serverRef)
+                        : [serverRef];
+                }
+            } else {
+                refs = this.expandServerRefToVerseList
+                    ? this.expandServerRefToVerseList(serverRef)
+                    : [serverRef];
+            }
+        } else {
+            const parts = serverRef.split(".");
+            if (parts.length === 2) {
+                refs.push(serverRef);
+            } else {
+                refs.push(serverRef);
+            }
+        }
+
+        refs = Array.from(new Set(refs || []));
+        if (refs.length === 0) return `"${ref}"`;
+
+        const parts = refs.map(r => `"reference=${r}"`);
+        return parts.join(" OR ");
     }
 
     // BUILDS THE STEP URL FROM GIVEN TEXT
@@ -652,8 +724,94 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return [startRef];
     }
 
-    //TURNS REFERENCE TEXT INTO FULL REFERENCE AND URL
+    //TURNS REFERENCE TEXT OF ANY FORMAT INTO FULL REFERENCE AND URL
     parseAndExpandVerse(text) {
+
+        // --- STEP-style dotted reference handling (with abbreviation expansion) ---
+        {
+            const stepPattern = /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)\.(\d+)(?:\.(\d+))?(?:-([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)?\.(\d+)(?:\.(\d+))?)?$/;
+
+            const m = text.match(stepPattern);
+            if (m) {
+                // --- Normalize book1 ---
+                const rawBook1 = m[1].trim();
+                const lookup1 = rawBook1.replace(/\s+/g, " ").toLowerCase();
+                let book1 = this.getBookMap()[lookup1] || rawBook1;
+
+                // STEP fixes
+                const stepFix = {
+                    "Song of Solomon": "Song",
+                    "Song of Songs": "Song",
+                    "Canticles": "Song",
+                    "Song": "Song"
+                };
+                book1 = stepFix[book1] || book1;
+
+                const chap1 = m[2];
+                const verse1 = m[3] || null;
+
+                const bookKey1 = book1.replace(/\s+/g, "");
+
+                // --- Single chapter only: Genesis.1 ---
+                if (!m[4] && !verse1) {
+                    return {
+                        expandedText: `${book1} ${chap1}`,
+                        serverRef: `${bookKey1}.${chap1}`
+                    };
+                }
+
+                // --- Single verse: Genesis.1.2 ---
+                if (!m[4] && verse1) {
+                    return {
+                        expandedText: `${book1} ${chap1}:${verse1}`,
+                        serverRef: `${bookKey1}.${chap1}.${verse1}`
+                    };
+                }
+
+                // --- Normalize book2 (may be missing → inherit book1) ---
+                const rawBook2 = (m[4] || rawBook1).trim();
+                const lookup2 = rawBook2.replace(/\s+/g, " ").toLowerCase();
+                let book2 = this.getBookMap()[lookup2] || rawBook2;
+                book2 = stepFix[book2] || book2;
+
+                const chap2 = m[5];
+                const verse2 = m[6] || null;
+
+                const bookKey2 = book2.replace(/\s+/g, "");
+
+                // --- Chapter → Chapter: Genesis.1-Genesis.2 ---
+                if (!verse1 && !verse2) {
+                    return {
+                        expandedText: `${book1} ${chap1}-${chap2}`,
+                        serverRef: `${bookKey1}.${chap1}-${bookKey2}.${chap2}`
+                    };
+                }
+
+                // --- Full verse range: Genesis.1.1-Genesis.1.2 ---
+                if (verse1 && verse2) {
+                    return {
+                        expandedText: `${book1} ${chap1}:${verse1} - ${book2} ${chap2}:${verse2}`,
+                        serverRef: `${bookKey1}.${chap1}.${verse1}-${bookKey2}.${chap2}.${verse2}`
+                    };
+                }
+
+                // --- Chapter → Verse: Genesis.1-2.3 ---
+                if (!verse1 && verse2) {
+                    return {
+                        expandedText: `${book1} ${chap1} - ${book2} ${chap2}:${verse2}`,
+                        serverRef: `${bookKey1}.${chap1}-${bookKey2}.${chap2}.${verse2}`
+                    };
+                }
+
+                // --- Same-chapter verse range: Genesis.1.1-2 ---
+                if (verse1 && !verse2) {
+                    return {
+                        expandedText: `${book1} ${chap1}:${verse1}-${chap2}`,
+                        serverRef: `${bookKey1}.${chap1}.${verse1}-${bookKey2}.${chap1}.${chap2}`
+                    };
+                }
+            }
+        }
 
         // 1. BOOK-ONLY HANDLING (optionally numbered, but NO chapter/verse)
         const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;

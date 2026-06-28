@@ -2,59 +2,73 @@ const { Plugin, requestUrl } = require('obsidian');
 
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     async onload() {
-        console.log('STEP Bible Linker: Restored Text Overlay Engine Active.');
+        console.log('STEP Bible Linker Loaded.');
         this.activePopover = null;
 
-        // IF WEBVIEWER IS OPEN, LISTEN FOR URL CHANGES AND UPDATE SEARCH PANEL
-        this.registerEvent(
-            this.app.workspace.on("active-leaf-change", leaf => {
-                const view = leaf?.view;
-                const webviewEl = view?.webview;
 
+        // Unified STEP Bible → Search Panel Sync
+        this.registerEvent(
+            this.app.workspace.on("active-leaf-change", async (leaf) => {
+                const view = leaf?.view;
+                if (!view) return;
+
+                // Only handle WebViewer tabs
+                if (view.getViewType?.() !== "webviewer") return;
+
+                const webviewEl = view.webview;
                 if (!webviewEl) return;
 
-                // Avoid double-binding
-                if (webviewEl.__stepListenerAttached) return;
-                webviewEl.__stepListenerAttached = true;
+                //
+                // 1. TAB SWITCHING — always update search panel using view.url
+                //
+                const currentUrl = view.url;
+                if (currentUrl && currentUrl.includes("reference=")) {
+                    const ref = this.extractReferenceFromUrl(currentUrl);
+                    if (ref) {
+                        const query = this.buildSearchQuery(ref);
+                        await this.updateSearchPanel(query);
+                    }
+                }
 
-                // Listen for URL changes inside the webviewer
-                webviewEl.addEventListener("did-navigate-in-page", async () => {
-                    const url = webviewEl.getURL?.();
-                    if (!url) return;
-                    if (!url.includes("reference=")) return;
+                //
+                // 2. INITIAL LOAD + INTERNAL NAVIGATION — attach listeners once
+                //
+                if (!webviewEl.__stepListenersAttached) {
+                    webviewEl.__stepListenersAttached = true;
 
-                    const ref = this.extractReferenceFromUrl(url);
-                    if (!ref) return;
+                    // INITIAL LOAD — fires once when the page finishes loading
+                    webviewEl.addEventListener("did-finish-load", async () => {
+                        const url = view.url; // SAFE
+                        if (!url || !url.includes("reference=")) return;
 
-                    const query = this.buildSearchQuery(ref);
+                        const ref = this.extractReferenceFromUrl(url);
+                        if (!ref) return;
 
-                    // Use helper
-                    await this.updateSearchPanel(query);
-                });
+                        const query = this.buildSearchQuery(ref);
+                        await this.updateSearchPanel(query);
+                    });
+
+                    // INTERNAL NAVIGATION — fires when clicking inside STEP
+                    webviewEl.addEventListener("did-navigate-in-page", async () => {
+                        let url;
+                        try {
+                            url = webviewEl.getURL();
+                        } catch {
+                            return;
+                        }
+
+                        if (!url.includes("reference=")) return;
+
+                        const ref = this.extractReferenceFromUrl(url);
+                        if (!ref) return;
+
+                        const query = this.buildSearchQuery(ref);
+                        await this.updateSearchPanel(query);
+                    });
+                }
             })
         );
-        
-        // IF WEBVIEWER IS OPEN, UPDATE SEARCH PANEL IMMEDIATELY ON LEAF CHANGE
-        this.registerEvent(
-            this.app.workspace.on("active-leaf-change", async leaf => {
-                const view = leaf?.view;
-                const webviewEl = view?.webview;
 
-                if (!webviewEl) return;
-
-                const url = view?.url ?? webviewEl.getURL?.();
-                if (!url) return;
-                if (!url.includes("reference=")) return;
-
-                const ref = this.extractReferenceFromUrl(url);
-                if (!ref) return;
-
-                const query = this.buildSearchQuery(ref);
-
-                // Use helper
-                await this.updateSearchPanel(query);
-            })
-        );
 
         // LINK REFERENCE AT CURSOR 
         this.addCommand({
@@ -101,7 +115,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        //HOVERING HANDLER
+        // HOVERING HANDLER
         this.registerDomEvent(document, 'mouseover', async (evt) => {
             const targetEl = evt.target;
             if (!targetEl) return;
@@ -145,13 +159,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 this.activePopover = null;
             }
 
-            // Create popover
+            // Create popover (initially hidden off-screen)
             const pop = document.createElement("div");
             Object.assign(pop.style, {
                 position: "fixed",
-                left: `${evt.clientX + 15}px`,
-                top: `${evt.clientY + 15}px`,
-                backgroundColor: "var(--background-secondary-alt)",
+                left: "-9999px",
+                top: "-9999px",
+                visibility: "hidden",
+
+                backgroundColor: "#323232",
                 border: "1px solid var(--border-color)",
                 borderRadius: "6px",
                 padding: "14px",
@@ -160,7 +176,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 overflowY: "auto",
                 boxShadow: "0 4px 14px rgba(0,0,0,0.25)",
                 zIndex: "99999",
-                color: "var(--text-normal)",
+                color: "#d6d6d6",
+
                 fontSize: "13.5px",
                 lineHeight: "1.6",
                 fontFamily: "var(--font-interface)"
@@ -168,6 +185,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             pop.innerHTML = "<i>Loading STEP Bible…</i>";
             document.body.appendChild(pop);
+
+            // Measure BEFORE showing
+            const rect = pop.getBoundingClientRect();
+
+            // Decide left/right placement BEFORE revealing
+            let leftPos = evt.clientX + 15;
+            if (leftPos + rect.width > window.innerWidth) {
+                leftPos = evt.clientX - rect.width - 15;
+            }
+
+            // Apply final position
+            pop.style.left = `${leftPos}px`;
+            pop.style.top = `${evt.clientY + 15}px`;
+            pop.style.visibility = "visible";
+
             this.activePopover = pop;
 
             // Hide logic
@@ -201,25 +233,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!serverRef) return;
 
                 // BOOK-ONLY HOVER HANDLING
-                // A book-only reference has no chapter/verse → no dots in serverRef
                 if (!serverRef.includes(".")) {
                     const info = this.getBookOverview(serverRef);
 
                     if (info) {
                         pop.innerHTML = `
-                            <b>${info.name}</b><br>
-                            ${info.chapters} chapters<br><br>
-                            <i>Author:</i> ${info.author}<br>
-                            <i>Location:</i> ${info.location}<br>
-                            <i>Date:</i> ${info.date}<br><br>
-                            ${info.synopsis}
-                        `;
-
-                        // Stop here — do NOT run the verse-fetching logic
+                    <b>${info.name}</b><br>
+                    ${info.chapters} chapters<br><br>
+                    <i>Author:</i> ${info.author}<br>
+                    <i>Location:</i> ${info.location}<br>
+                    <i>Date:</i> ${info.date}<br><br>
+                    ${info.synopsis}
+                `;
                         return;
                     }
 
-                    // Fallback if overview missing
                     pop.innerHTML = `<b>${serverRef}</b><br>No overview available.`;
                     return;
                 }
@@ -244,15 +272,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // Add bottom padding only if scrollable
                 requestAnimationFrame(() => {
                     if (pop.scrollHeight > pop.clientHeight) {
-                        pop.style.paddingBottom = "24px"; // or whatever feels right
-                    }
-
-                    // Prevent right-edge overflow
-                    const rect = pop.getBoundingClientRect();
-                    const overflow = rect.right - window.innerWidth;
-
-                    if (overflow > 0) {
-                        pop.style.left = `${evt.clientX - rect.width - 15}px`;
+                        pop.style.paddingBottom = "24px";
                     }
                 });
 
@@ -260,6 +280,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 pop.innerHTML = `<span style="color:var(--text-error)">Failed to load STEP Bible.</span>`;
             }
         });
+
 
         // DIALOGUE BOX FOR REFERENCE SEARCH
         this.addCommand({
@@ -281,7 +302,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     onOpen() {
                         const { contentEl } = this;
 
-                        // Use flex column + gap for consistent vertical spacing
                         contentEl.style.display = "flex";
                         contentEl.style.flexDirection = "column";
                         contentEl.style.gap = "14px";
@@ -297,14 +317,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             placeholder: "reference here"
                         });
 
-                        // Larger input spacing and comfortable touch target
                         input.style.width = "100%";
                         input.style.margin = "0";
                         input.style.padding = "10px 8px";
                         input.style.fontSize = "14px";
                         input.style.borderRadius = "6px";
 
-                        // Small hint under the input — make it almost the same color as the background
                         const hint = contentEl.createEl("div", {
                             text: "Type bible for all scripture references."
                         });
@@ -312,13 +330,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         hint.style.margin = "0";
                         hint.style.padding = "0";
 
-                        // Detect theme and set hint color to be nearly background-matching
                         const isDark = document.body.classList.contains("theme-dark");
-                        // Very subtle: near-background (almost invisible)
                         hint.style.color = isDark ? "rgba(255, 255, 255, 0.07)" : "rgba(0, 0, 0, 0)";
                         hint.style.opacity = "1";
 
-                        // Prefill if provided
                         if (this.prefill && this.prefill.trim()) {
                             input.value = this.prefill.trim();
                             input.select();
@@ -328,64 +343,42 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const rawValue = input.value || "";
                             const trimmed = rawValue.trim();
 
-                            // ENTER → merged behavior (normal submit + open search)
                             if (evt.key === "Enter") {
-
                                 evt.preventDefault();
                                 evt.stopPropagation();
 
                                 // Normal submit
                                 this.onSubmit(input.value);
 
-                                // ALSO open search with the same query
-                                const query = plugin.buildSearchQuery(trimmed);
-
-                                console.log(trimmed);
-
-                                // If no query, no search bar opens, but link still goes through.
-                                if (query === "") {
-                                    this.close();
-                                    return;
-                                }
-
-                                // Use your modular helper
-                                await plugin.updateSearchPanel(query);
-
+                                // Close modal — search panel is handled elsewhere now
                                 this.close();
                             }
                         };
-                        
-                        input.addEventListener("keydown", this._keydownHandler);
 
+                        input.addEventListener("keydown", this._keydownHandler);
                         input.focus();
                     }
 
-                    
                     onClose() {
                         const input = this.contentEl.querySelector("input");
                         if (input && this._keydownHandler) {
                             input.removeEventListener("keydown", this._keydownHandler);
                         }
-
                         this.contentEl.empty();
                     }
-
                 }
 
-                // Determine a sensible prefill:
-                // 1) If an editor is active, use its selection
-                // 2) Otherwise, try the DOM selection (reading mode)
-                // 3) Otherwise, empty string
+                // Determine prefill
                 let prefill = "";
-
                 const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
+
                 if (activeView && activeView.editor) {
                     prefill = activeView.editor.getSelection() || "";
                 } else {
                     try {
-                        const domSel = (window.getSelection && window.getSelection().toString && window.getSelection().toString()) || "";
+                        const domSel = window.getSelection()?.toString() || "";
                         prefill = domSel || "";
-                    } catch (e) {
+                    } catch {
                         prefill = "";
                     }
                 }
@@ -393,19 +386,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const modal = new BibleSearchModal(this.app, plugin, async (refText) => {
                     console.log("Modal submitted:", refText);
 
-                    // If the reference ends with letters (no digits after the letters), append " 1"
+                    // Append "1" to book names without chapter numbers
                     if (/^[A-Za-z0-9\s]+[A-Za-z]+$/.test(refText)) {
                         refText = refText.trim() + " 1";
                     }
 
                     const result = this.buildStepLink(refText);
                     console.log("buildStepLink result:", result);
-
                     if (!result) return;
 
-                    // Do NOT insert anything into the editor
-
-                    // Use your helper first
+                    // Determine whether local STEP is running
                     const localIsUp = await this.isLocalStepRunning();
 
                     let urlToOpen;
@@ -436,6 +426,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 modal.open();
             }
         });
+
     }
 
     // UPDATE THE SEARCH PANEL WITH A GIVEN QUERY

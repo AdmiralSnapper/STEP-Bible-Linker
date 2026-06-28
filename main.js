@@ -18,10 +18,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 webviewEl.__stepListenerAttached = true;
 
                 // Listen for URL changes inside the webviewer
-                webviewEl.addEventListener("did-navigate-in-page", (event) => {
+                webviewEl.addEventListener("did-navigate-in-page", async () => {
                     const url = webviewEl.getURL?.();
                     if (!url) return;
-
                     if (!url.includes("reference=")) return;
 
                     const ref = this.extractReferenceFromUrl(url);
@@ -29,37 +28,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                     const query = this.buildSearchQuery(ref);
 
-                    // Update left search panel
-                    this.app.workspace.leftSplit?.expand();
-
-                    let searchLeaf = this.app.workspace.getLeavesOfType("search")[0];
-
-                    if (!searchLeaf) {
-                        searchLeaf = this.app.workspace.getLeftLeaf(false);
-                        searchLeaf.setViewState({
-                            type: "search",
-                            state: { query }
-                        });
-                    }
-
-                    searchLeaf.view?.setQuery?.(query);
-                    this.app.workspace.setActiveLeaf(searchLeaf, { focus: false });
+                    // Use helper
+                    await this.updateSearchPanel(query);
                 });
             })
         );
         
         // IF WEBVIEWER IS OPEN, UPDATE SEARCH PANEL IMMEDIATELY ON LEAF CHANGE
         this.registerEvent(
-            this.app.workspace.on("active-leaf-change", leaf => {
+            this.app.workspace.on("active-leaf-change", async leaf => {
                 const view = leaf?.view;
                 const webviewEl = view?.webview;
 
                 if (!webviewEl) return;
 
-                // When switching to a new webviewer, update immediately
                 const url = view?.url ?? webviewEl.getURL?.();
                 if (!url) return;
-
                 if (!url.includes("reference=")) return;
 
                 const ref = this.extractReferenceFromUrl(url);
@@ -67,20 +51,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 const query = this.buildSearchQuery(ref);
 
-                // Update left search panel
-                this.app.workspace.leftSplit?.expand();
-
-                let searchLeaf = this.app.workspace.getLeavesOfType("search")[0];
-
-                if (!searchLeaf) {
-                    searchLeaf = this.app.workspace.getLeftLeaf(false);
-                    searchLeaf.setViewState({
-                        type: "search",
-                        state: { query }
-                    });
-                }
-
-                searchLeaf.view?.setQuery?.(query);
+                // Use helper
+                await this.updateSearchPanel(query);
             })
         );
 
@@ -370,28 +342,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                                 console.log(trimmed);
 
-                                // If no query, no search bar opens, but link still goes through. 
-                                if(query === "") {
+                                // If no query, no search bar opens, but link still goes through.
+                                if (query === "") {
                                     this.close();
                                     return;
                                 }
 
-                                plugin.app.workspace.leftSplit?.expand();
-
-                                let leaf = plugin.app.workspace.getLeavesOfType("search")[0];
-
-                                console.log(leaf)
-
-                                if (!leaf) {
-                                    leaf = plugin.app.workspace.getLeftLeaf(false);
-                                    await leaf.setViewState({
-                                        type: "search",
-                                        state: { query }
-                                    });
-                                }
-
-                                leaf.view?.setQuery?.(query);
-                                plugin.app.workspace.setActiveLeaf(leaf, { focus: true });
+                                // Use your modular helper
+                                await plugin.updateSearchPanel(query);
 
                                 this.close();
                             }
@@ -478,6 +436,29 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 modal.open();
             }
         });
+    }
+
+    // UPDATE THE SEARCH PANEL WITH A GIVEN QUERY
+    async updateSearchPanel(query) {
+        // Expand left sidebar
+        this.app.workspace.leftSplit?.expand();
+
+        // Find or create search leaf
+        let searchLeaf = this.app.workspace.getLeavesOfType("search")[0];
+
+        if (!searchLeaf) {
+            searchLeaf = this.app.workspace.getLeftLeaf(false);
+            await searchLeaf.setViewState({
+                type: "search",
+                state: { query }
+            });
+        }
+
+        // Update query
+        searchLeaf.view?.setQuery?.(query);
+
+        // Optional: focus the leaf
+        this.app.workspace.setActiveLeaf(searchLeaf, { focus: false });
     }
 
     // TAKE A REFERENCE AND BUILD A SEARCH QUERY FROM IT

@@ -5,6 +5,55 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         console.log('STEP Bible Linker Loaded.');
         this.activePopover = null;
 
+        this.addCommand({
+            id: "step-sync-search-panel",
+            name: "Update STEP Search Panel",
+            callback: async () => {
+
+                //
+                // 1. GET ACTIVE LEAF — same as listener
+                //
+                const leaf = this.app.workspace.activeLeaf;
+                if (!leaf) return;
+
+                const view = leaf.view;
+                if (!view) return;
+
+                // Only handle WebViewer tabs
+                if (view.getViewType?.() !== "webviewer") return;
+
+                //
+                // 2. GET URL — same pattern as listener
+                //
+                let url = view.url;
+
+                // Fallback: STEP internal navigation sometimes updates only the webview
+                if (view.webview?.getURL) {
+                    try {
+                        url = view.webview.getURL();
+                    } catch { }
+                }
+
+                if (!url || !url.includes("reference=")) return;
+
+                //
+                // 3. EXTRACT REF + BUILD QUERY — identical to listener
+                //
+                const ref = this.extractReferenceFromUrl(url);
+                if (!ref) return;
+
+                const query = this.buildSearchQuery(ref);
+
+                //
+                // 4. UPDATE SEARCH PANEL — identical to listener
+                //
+                await this.updateSearchPanel(query);
+
+                console.log("STEP Sync: Manual search panel update complete.");
+            }
+        });
+
+
 
         // Unified STEP Bible → Search Panel Sync
         this.registerEvent(

@@ -1,5 +1,6 @@
-const { Plugin, PluginSettingTab, Setting, requestUrl } = require('obsidian');
+const { Plugin, PluginSettingTab, ItemView, Setting, requestUrl } = require('obsidian');
 
+//SETTINGS ======================================================================
 /**
  * @typedef {Object} StepBibleLinkerSettings
  * @property {boolean} autoSyncOnNavigation - If true, STEP auto-syncs on navigation
@@ -12,7 +13,6 @@ const DEFAULT_SETTINGS = {
     enabledVersions: ["ESV", "THOT", "SBLG"]
 };
 
-//SETTINGS TAB OBJECT
 class StepBibleLinkerSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
@@ -185,6 +185,96 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
     }
 }
 
+//SEARCH VIEW ===================================================================
+const STEP_SEARCH_VIEW = "step-search-view";
+
+class StepSearchView extends ItemView {
+    constructor(leaf, plugin) {
+        super(leaf);
+        this.plugin = plugin;
+    }
+
+    getViewType() {
+        return STEP_SEARCH_VIEW;
+    }
+
+    getDisplayText() {
+        return "STEP Search";
+    }
+
+    onOpen() {
+        const container = this.containerEl.children[1];
+        container.empty();
+
+        // Search input
+        this.input = container.createEl("input", {
+            type: "text",
+            placeholder: "STEP search…"
+        });
+
+        this.input.style.width = "100%";
+        this.input.style.marginBottom = "10px";
+
+        // Results area (you can fill this later if you want)
+        this.resultsEl = container.createEl("div");
+    }
+
+    setQuery(query) {
+        if (this.input) {
+            this.input.value = query;
+        }
+
+        console.log("STEP SearchView: setQuery()", query);
+
+        this.runSearch(query);
+    }
+
+    async runSearch(queryArray) {
+        this.resultsEl.empty();
+
+        if (!Array.isArray(queryArray) || queryArray.length === 0) {
+            this.resultsEl.createEl("div", { text: "No query." });
+            return;
+        }
+
+        const files = this.plugin.app.vault.getMarkdownFiles();
+        const matchedFiles = new Set();
+
+        for (const file of files) {
+            const text = await this.plugin.app.vault.read(file);
+
+            for (const q of queryArray) {
+                if (text.includes(q)) {
+                    matchedFiles.add(file);
+                    break; // no need to check other queries for this file
+                }
+            }
+        }
+
+        if (matchedFiles.size === 0) {
+            this.resultsEl.createEl("div", { text: "No matches found." });
+            return;
+        }
+
+        for (const file of matchedFiles) {
+            const item = this.resultsEl.createEl("div", {
+                text: file.basename
+            });
+
+            item.style.cursor = "pointer";
+            item.style.fontSize = "0.9em";        // smaller text
+            item.style.marginBottom = "8px";      // spacing between entries
+            item.style.lineHeight = "1.4";        // easier multi-line readability
+
+            item.onclick = () => {
+                this.plugin.app.workspace.openLinkText(file.path, file.path);
+            };
+        }
+    }
+}
+
+
+// PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
     settings;
@@ -196,6 +286,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // Load settings and add settings tab
         await this.loadSettings();
         this.addSettingTab(new StepBibleLinkerSettingTab(this.app, this));
+
+        // REGISTER SEARCH VIEW
+        this.registerView(
+            STEP_SEARCH_VIEW,
+            (leaf) => new StepSearchView(leaf, this)
+        );
 
         // SEARCH BASED ON STEP URL
         this.addCommand({
@@ -240,7 +336,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 //
                 // 4. UPDATE SEARCH PANEL — identical to listener
                 //
-                await this.updateSearchPanel(query);
+                const searchView = await this.openSearchLeaf();
+                await this.setSearchLeafQuery(query, searchView);
 
                 console.log("STEP Sync: Manual search panel update complete.");
             }
@@ -261,16 +358,27 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!webviewEl) return;
 
                 //
+                // DEDUPE: ensure we only process each reference once
+                //
+                const processRef = async (url) => {
+                    if (!url || !url.includes("reference=")) return;
+
+                    const ref = this.extractReferenceFromUrl(url);
+                    if (!ref) return;
+
+                    // If we've already processed this ref, skip
+                    if (webviewEl.__lastProcessedRef === ref) return;
+                    webviewEl.__lastProcessedRef = ref;
+
+                    const query = this.buildSearchQuery(ref);
+                    const searchView = await this.openSearchLeaf();
+                    await this.setSearchLeafQuery(query, searchView);
+                };
+
+                //
                 // 1. TAB SWITCHING — always update search panel using view.url
                 //
-                const currentUrl = view.url;
-                if (currentUrl && currentUrl.includes("reference=")) {
-                    const ref = this.extractReferenceFromUrl(currentUrl);
-                    if (ref) {
-                        const query = this.buildSearchQuery(ref);
-                        await this.updateSearchPanel(query);
-                    }
-                }
+                await processRef(view.url);
 
                 //
                 // 2. INITIAL LOAD + INTERNAL NAVIGATION — attach listeners once
@@ -280,14 +388,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                     // INITIAL LOAD — fires once when the page finishes loading
                     webviewEl.addEventListener("did-finish-load", async () => {
-                        const url = view.url; // SAFE
-                        if (!url || !url.includes("reference=")) return;
-
-                        const ref = this.extractReferenceFromUrl(url);
-                        if (!ref) return;
-
-                        const query = this.buildSearchQuery(ref);
-                        await this.updateSearchPanel(query);
+                        await processRef(view.url);
                     });
 
                     // INTERNAL NAVIGATION — fires when clicking inside STEP
@@ -299,13 +400,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             return;
                         }
 
-                        if (!url.includes("reference=")) return;
-
-                        const ref = this.extractReferenceFromUrl(url);
-                        if (!ref) return;
-
-                        const query = this.buildSearchQuery(ref);
-                        await this.updateSearchPanel(query);
+                        await processRef(url);
                     });
                 }
             })
@@ -683,48 +778,60 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
     }
 
-    // UPDATE THE SEARCH PANEL WITH A GIVEN QUERY
-    async updateSearchPanel(query) {
+    // OPEN THE SEARCH LEAF, CREATING IT IF NECESSARY
+    async openSearchLeaf() {
         // Expand left sidebar
         this.app.workspace.leftSplit?.expand();
 
-        // Find or create search leaf
-        let searchLeaf = this.app.workspace.getLeavesOfType("search")[0];
+        // Try to find an existing STEP search leaf
+        let leaf = this.app.workspace.getLeavesOfType("step-search-view")[0];
 
-        if (!searchLeaf) {
-            searchLeaf = this.app.workspace.getLeftLeaf(false);
-            await searchLeaf.setViewState({
-                type: "search",
-                state: { query }
+        // If none exists, create one
+        if (!leaf) {
+            leaf = this.app.workspace.getLeftLeaf(false);
+            await leaf.setViewState({
+                type: "step-search-view",
+                state: {}
             });
         }
 
-        // Update query
-        searchLeaf.view?.setQuery?.(query);
+        // Focus the leaf
+        this.app.workspace.setActiveLeaf(leaf, { focus: false });
 
-        // Optional: focus the leaf
-        this.app.workspace.setActiveLeaf(searchLeaf, { focus: false });
+        return leaf.view;
     }
 
-    // TAKE A REFERENCE AND BUILD A SEARCH QUERY FROM IT
+    // UPDATE THE SEARCH LEAF WITH A QUERY, CREATING IT IF NECESSARY
+    async setSearchLeafQuery(queryArray, view) {
+        if (!view || !Array.isArray(queryArray)) return;
+
+        // Show the first query in the input box
+        if (view.input) {
+            view.input.value = queryArray.join(" OR ");
+        }
+
+        view.runSearch(queryArray);
+    }
+
     buildSearchQuery(ref) {
-        //remove spaces
+        // remove spaces
         ref = ref.trim();
 
         if (ref === "") {
-            return "";
+            return [];
         }
 
         const parsed = this.parseAndExpandVerse(ref);
         if (!parsed || !parsed.serverRef) {
-            return `"${ref}"`;
+            // fallback: search the raw ref text
+            return [ref];
         }
 
         const serverRef = parsed.serverRef.replace(/\s+/g, "");
 
         // Book-only: match any STEP reference that starts with the book
         if (!serverRef.includes(".")) {
-            return `"reference=${serverRef}"`;
+            return [`reference=${serverRef}`];
         }
 
         let refs = [];
@@ -763,10 +870,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         }
 
         refs = Array.from(new Set(refs || []));
-        if (refs.length === 0) return `"${ref}"`;
+        if (refs.length === 0) return [ref];
 
-        const parts = refs.map(r => `"reference=${r}"`);
-        return parts.join(" OR ");
+        // turn each ref into a full search token
+        const parts = refs.map(r => `reference=${r}`);
+        return parts; // ← array of strings
     }
 
     // BUILDS THE STEP URL FROM ENTERED TEXT
@@ -1969,8 +2077,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         new Notice("STEP Bible links updated.");
     }
-
-
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     } 

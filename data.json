@@ -1,7 +1,8 @@
 {
-  "autoSyncOnNavigation": false,
+  "autoSyncOnNavigation": true,
   "enabledVersions": [
     "ESV",
+    "SBLG",
     "THOT"
   ]
 }

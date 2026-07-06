@@ -6,5 +6,6 @@
 	"description": "Custom plugin to link to STEP Bible.",
 	"author": "ME",
 	"authorUrl": "",
-	"isDesktopOnly": true
+	"isDesktopOnly": true,
+	"main": "main.js"
 }

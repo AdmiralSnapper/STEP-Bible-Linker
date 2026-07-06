@@ -1,10 +1,203 @@
-const { Plugin, requestUrl } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, requestUrl } = require('obsidian');
+
+/**
+ * @typedef {Object} StepBibleLinkerSettings
+ * @property {boolean} autoSyncOnNavigation - If true, STEP auto-syncs on navigation
+ * @property {string[]} enabledVersions - List of STEP Bible versions to include in generated links
+ */
+
+/** @type {StepBibleLinkerSettings} */
+const DEFAULT_SETTINGS = {
+    autoSyncOnNavigation: true,
+    enabledVersions: ["ESV", "THOT", "SBLG"]
+};
+
+//SETTINGS TAB OBJECT
+class StepBibleLinkerSettingTab extends PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display() {
+        const { containerEl } = this;
+        containerEl.empty();
+
+        containerEl.createEl("h2", { text: "STEP Bible Linker Settings" });
+
+        new Setting(containerEl)
+            .setName("Auto-sync on navigation")
+            .setDesc("Automatically update the search panel when navigating inside STEP Bible.")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.autoSyncOnNavigation)
+                    .onChange(async (value) => {
+                        this.plugin.settings.autoSyncOnNavigation = value;
+                        await this.plugin.saveSettings();
+                    });
+            });
+
+        //BIBLE VERSION TOGGLES ==========================================================================
+        containerEl.createEl("h3", { text: "Bible Versions Enabled" });
+
+        new Setting(containerEl)
+            .setName("Enable ESV")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.enabledVersions.includes("ESV"))
+                    .onChange(async (value) => {
+                        this.plugin.toggleVersion("ESV", value);
+                        await this.plugin.saveSettings();
+
+                        // Rewrite all STEP links to match new version list
+                        await this.plugin.rewriteStepLinks();
+                        //Refresh UI to reflect changes in version order
+                        this.display();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Enable NIV")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.enabledVersions.includes("NIV"))
+                    .onChange(async (value) => {
+                        this.plugin.toggleVersion("NIV", value);
+                        await this.plugin.saveSettings();
+
+                        // Rewrite all STEP links to match new version list
+                        await this.plugin.rewriteStepLinks();
+                        //Refresh UI to reflect changes in version order
+                        this.display(); 
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Enable KJV")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.enabledVersions.includes("KJV"))
+                    .onChange(async (value) => {
+                        this.plugin.toggleVersion("KJV", value);
+                        await this.plugin.saveSettings();
+
+                        // Rewrite all STEP links to match new version list
+                        await this.plugin.rewriteStepLinks();
+                        //Refresh UI to reflect changes in version order
+                        this.display(); 
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Enable THOT")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.enabledVersions.includes("THOT"))
+                    .onChange(async (value) => {
+                        this.plugin.toggleVersion("THOT", value);
+                        await this.plugin.saveSettings();
+
+                        // Rewrite all STEP links to match new version list
+                        await this.plugin.rewriteStepLinks();
+                        //Refresh UI to reflect changes in version order
+                        this.display(); 
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Enable SBLG")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.enabledVersions.includes("SBLG"))
+                    .onChange(async (value) => {
+                        this.plugin.toggleVersion("SBLG", value);
+                        await this.plugin.saveSettings();
+
+                        // Rewrite all STEP links to match new version list
+                        await this.plugin.rewriteStepLinks();
+                        //Refresh UI to reflect changes in version order
+                        this.display(); 
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Enable LXX")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.enabledVersions.includes("LXX"))
+                    .onChange(async (value) => {
+                        this.plugin.toggleVersion("LXX", value);
+                        await this.plugin.saveSettings();
+
+                        // Rewrite all STEP links to match new version list
+                        await this.plugin.rewriteStepLinks();
+                        //Refresh UI to reflect changes in version order
+                        this.display(); 
+                    });
+            });
+
+        
+
+        // VERSION REORDERING ==========================================================================
+        containerEl.createEl("h3", { text: "Version Order" });
+
+        const versions = this.plugin.settings.enabledVersions;
+
+        versions.forEach((version, index) => {
+            const setting = new Setting(containerEl)
+                .setName(version)
+                .setDesc("Order determines display order in STEP Bible.");
+
+            // Move up
+            setting.addButton(btn => {
+                btn.setButtonText("↑")
+                    .setDisabled(index === 0)
+                    .onClick(async () => {
+                        this.plugin.moveVersion(index, index - 1);
+                        await this.plugin.saveSettings();
+
+                        // IMPORTANT: re-read updated version list
+                        this.plugin.settings.enabledVersions = [...this.plugin.settings.enabledVersions];
+
+                        await this.plugin.rewriteStepLinks();
+                        this.display();
+                    });
+            });
+
+            // Move down
+            setting.addButton(btn => {
+                btn.setButtonText("↓")
+                    .setDisabled(index === versions.length - 1)
+                    .onClick(async () => {
+                        this.plugin.moveVersion(index, index + 1);
+                        await this.plugin.saveSettings();
+
+                        // IMPORTANT: re-read updated version list
+                        this.plugin.settings.enabledVersions = [...this.plugin.settings.enabledVersions];
+
+                        await this.plugin.rewriteStepLinks();
+                        this.display();
+                    });
+            });
+        });
+
+    
+    }
+}
 
 module.exports = class StepBibleLinkerPlugin extends Plugin {
+    /** @type {StepBibleLinkerSettings} */
+    settings;
+
     async onload() {
         console.log('STEP Bible Linker Loaded.');
         this.activePopover = null;
 
+        // Load settings and add settings tab
+        await this.loadSettings();
+        this.addSettingTab(new StepBibleLinkerSettingTab(this.app, this));
+
+        // SEARCH BASED ON STEP URL
         this.addCommand({
             id: "step-sync-search-panel",
             name: "Update STEP Search Panel",
@@ -53,11 +246,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-
-
-        // Unified STEP Bible → Search Panel Sync
+        // AUTO SEARCH ON NAVIGATION TO STEP URL
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
+                if (!this.settings.autoSyncOnNavigation) return;
+
                 const view = leaf?.view;
                 if (!view) return;
 
@@ -118,7 +311,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             })
         );
 
-
         // LINK REFERENCE AT CURSOR 
         this.addCommand({
             id: 'auto-link-step-ref',
@@ -129,7 +321,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 //Get text line with cursor
                 const line = editor.getLine(cursor.line);
 
-                const refRegex = this.buildReferenceRegexGlobal();
+                const refRegex = this.buildReferenceRegex();
                 let match = null, start = 0, end = 0;
 
                 let m;
@@ -330,7 +522,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-
         // DIALOGUE BOX FOR REFERENCE SEARCH
         this.addCommand({
             id: "step-bible-search",
@@ -392,16 +583,30 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const rawValue = input.value || "";
                             const trimmed = rawValue.trim();
 
-                            if (evt.key === "Enter") {
+                            if(evt.key === "Enter") {
                                 evt.preventDefault();
                                 evt.stopPropagation();
 
-                                // Normal submit
+                                const rawValue = input.value || "";
+                                const trimmed = rawValue.trim();
+
+                                // Validate using your existing regex
+                                const regex = this.plugin.buildReferenceRegex();
+                                const match = trimmed.match(regex);
+
+                                // Reject if no match OR match does not equal entire input
+                                if (!match || match[0].trim() !== trimmed) {
+                                    new Notice("Not a valid Bible reference.");
+                                    return;
+                                }
+
+                                // Submit
                                 this.onSubmit(input.value);
 
-                                // Close modal — search panel is handled elsewhere now
+                                // Close modal
                                 this.close();
                             }
+
                         };
 
                         input.addEventListener("keydown", this._keydownHandler);
@@ -506,10 +711,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         //remove spaces
         ref = ref.trim();
 
-        if (ref.toLowerCase() === "bible") {
-            return "reference=";
-        }
-
         if (ref === "") {
             return "";
         }
@@ -568,10 +769,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return parts.join(" OR ");
     }
 
-    // BUILDS THE STEP URL FROM GIVEN TEXT
+    // BUILDS THE STEP URL FROM ENTERED TEXT
     buildStepLink(refText) {
+        
+        const versionPart = this.settings.enabledVersions
+            .map(v => `version=${v}`)
+            .join("@");
 
-        const urlPrefix = "http://localhost:8989/?q=version=ESV@version=THOT@version=SBLG@reference=";
+        const urlPrefix = `http://localhost:8989/?q=${versionPart}@reference=`;
         const urlSuffix = "&options=GNVUH&display=COLUMN";
 
         // Normalize input
@@ -964,7 +1169,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     }
 
     //BUILDS A REGEX TO DETECT BOOK NAMES FROM TEXT LINE
-    buildReferenceRegexGlobal() {
+    buildReferenceRegex() {
         const books = this.getAllBookPatterns();
 
         // Book group
@@ -1714,6 +1919,63 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         };
 
         return overviews[book] || null;
+    }
+
+    // SETTINGS MANAGEMENT====================================================================================
+    toggleVersion(version, enabled) {
+        const list = this.settings.enabledVersions;
+
+        if (enabled) {
+            if (!list.includes(version)) list.push(version);
+        } else {
+            this.settings.enabledVersions = list.filter(v => v !== version);
+        }
+    }
+    moveVersion(fromIndex, toIndex) {
+        const list = this.settings.enabledVersions;
+        const item = list.splice(fromIndex, 1)[0];
+        list.splice(toIndex, 0, item);
+    }
+    async rewriteStepLinks() {
+        const files = this.app.vault.getMarkdownFiles();
+
+        // Build the version part from your toggles
+        const versionPart = this.settings.enabledVersions.length
+            ? this.settings.enabledVersions.map(v => `version=${v}`).join("@")
+            : "";
+
+        for (const file of files) {
+            let data = await this.app.vault.read(file);
+            let updated = data;
+
+            // CASE 1: Replace existing version block
+            updated = updated.replace(
+                /version=[A-Za-z0-9]+(?:@version=[A-Za-z0-9]+)*/g,
+                versionPart
+            );
+
+            // CASE 2: Replace empty version block: q=@reference=
+            updated = updated.replace(
+                /q=@reference=/g,
+                versionPart
+                    ? `q=${versionPart}@reference=`
+                    : `q=@reference=` // leave empty if no versions enabled
+            );
+
+            if (updated !== data) {
+                await this.app.vault.modify(file, updated);
+            }
+        }
+
+        new Notice("STEP Bible links updated.");
+    }
+
+
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    } 
+    async saveSettings() {
+        await this.saveData(this.settings);
     }
 
     onunload() {

@@ -358,7 +358,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!webviewEl) return;
 
                 //
-                // DEDUPE: ensure we only process each reference once
+                // IMPORTANT: Reset dedupe on tab-switch
+                //
+                webviewEl.__lastProcessedRef = null;
+
+                //
+                // DEDUPE + SEARCH HANDLER
                 //
                 const processRef = async (url) => {
                     if (!url || !url.includes("reference=")) return;
@@ -366,7 +371,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     const ref = this.extractReferenceFromUrl(url);
                     if (!ref) return;
 
-                    // If we've already processed this ref, skip
+                    // DEDUPE only for *internal navigation*, not tab-switch
                     if (webviewEl.__lastProcessedRef === ref) return;
                     webviewEl.__lastProcessedRef = ref;
 
@@ -376,9 +381,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 };
 
                 //
-                // 1. TAB SWITCHING — always update search panel using view.url
+                // 1. TAB SWITCHING — MUST use getURL()
                 //
-                await processRef(view.url);
+                let currentUrl;
+                try {
+                    currentUrl = webviewEl.getURL();
+                } catch {
+                    currentUrl = view.url;
+                }
+
+                await processRef(currentUrl);
 
                 //
                 // 2. INITIAL LOAD + INTERNAL NAVIGATION — attach listeners once
@@ -386,12 +398,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!webviewEl.__stepListenersAttached) {
                     webviewEl.__stepListenersAttached = true;
 
-                    // INITIAL LOAD — fires once when the page finishes loading
                     webviewEl.addEventListener("did-finish-load", async () => {
-                        await processRef(view.url);
+                        let url;
+                        try {
+                            url = webviewEl.getURL();
+                        } catch {
+                            url = view.url;
+                        }
+                        await processRef(url);
                     });
 
-                    // INTERNAL NAVIGATION — fires when clicking inside STEP
                     webviewEl.addEventListener("did-navigate-in-page", async () => {
                         let url;
                         try {
@@ -399,12 +415,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         } catch {
                             return;
                         }
-
                         await processRef(url);
                     });
                 }
             })
         );
+
 
         // LINK REFERENCE AT CURSOR 
         this.addCommand({

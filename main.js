@@ -343,54 +343,26 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        // AUTO SEARCH ON NAVIGATION TO STEP URL
+        // SEARCH BASED ON STEP URL AUTOMATICALLY
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
-                if (!this.settings.autoSyncOnNavigation) return;
 
                 const view = leaf?.view;
                 if (!view) return;
 
                 // Only handle WebViewer tabs
                 if (view.getViewType?.() !== "webviewer") return;
-
                 const webviewEl = view.webview;
                 if (!webviewEl) return;
 
-                //
-                // IMPORTANT: Reset dedupe on tab-switch
-                //
+                // Reset dedupe on tab switch
                 webviewEl.__lastProcessedRef = null;
 
                 //
-                // DEDUPE + SEARCH HANDLER
+                // 1. TAB SWITCHING — use view.url (this one *is* correct)
                 //
-                const processRef = async (url) => {
-                    if (!url || !url.includes("reference=")) return;
-
-                    const ref = this.extractReferenceFromUrl(url);
-                    if (!ref) return;
-
-                    // DEDUPE only for *internal navigation*, not tab-switch
-                    if (webviewEl.__lastProcessedRef === ref) return;
-                    webviewEl.__lastProcessedRef = ref;
-
-                    const query = this.buildSearchQuery(ref);
-                    const searchView = await this.openSearchLeaf();
-                    await this.setSearchLeafQuery(query, searchView);
-                };
-
-                //
-                // 1. TAB SWITCHING — MUST use getURL()
-                //
-                let currentUrl;
-                try {
-                    currentUrl = webviewEl.getURL();
-                } catch {
-                    currentUrl = view.url;
-                }
-
-                await processRef(currentUrl);
+                const currentUrl = view.url;
+                await this.handleStepReference(webviewEl, currentUrl);
 
                 //
                 // 2. INITIAL LOAD + INTERNAL NAVIGATION — attach listeners once
@@ -398,29 +370,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!webviewEl.__stepListenersAttached) {
                     webviewEl.__stepListenersAttached = true;
 
+                    // INITIAL LOAD — fires once when the page finishes loading
                     webviewEl.addEventListener("did-finish-load", async () => {
-                        let url;
-                        try {
-                            url = webviewEl.getURL();
-                        } catch {
-                            url = view.url;
-                        }
-                        await processRef(url);
+                        const url = view.url; // SAFE for initial load
+                        await this.handleStepReference(webviewEl, url);
                     });
 
+                    // INTERNAL NAVIGATION — fires when clicking inside STEP
                     webviewEl.addEventListener("did-navigate-in-page", async () => {
-                        let url;
-                        try {
-                            url = webviewEl.getURL();
-                        } catch {
-                            return;
-                        }
-                        await processRef(url);
+
+                        url = webviewEl.getURL(); 
+
+                        await this.handleStepReference(webviewEl, url);
                     });
                 }
             })
         );
-
 
         // LINK REFERENCE AT CURSOR 
         this.addCommand({
@@ -633,7 +598,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        // DIALOGUE BOX FOR REFERENCE SEARCH
+        // MODAL FOR REFERENCE SEARCH
         this.addCommand({
             id: "step-bible-search",
             name: "Search Bible Reference…",
@@ -749,7 +714,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
 
                 const modal = new BibleSearchModal(this.app, plugin, async (refText) => {
-                    console.log("Modal submitted:", refText);
 
                     // Append "1" to book names without chapter numbers
                     if (/^[A-Za-z0-9\s]+[A-Za-z]+$/.test(refText)) {
@@ -757,7 +721,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     }
 
                     const result = this.buildStepLink(refText);
-                    console.log("buildStepLink result:", result);
                     if (!result) return;
 
                     // Determine whether local STEP is running
@@ -784,7 +747,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         urlToOpen = this.rewriteToOnline(result.finalUrl);
                     }
 
-                    console.log("Opening URL:", urlToOpen);
                     window.open(urlToOpen, "_blank");
                 }, prefill);
 
@@ -794,6 +756,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
     }
 
+    async handleStepReference(webviewEl, url) {
+        if (!url || !url.includes("reference=")) return;
+
+        const ref = this.extractReferenceFromUrl(url);
+        if (!ref) return;
+
+        // DEDUPE: only skip if this exact ref was already processed
+        if (webviewEl.__lastProcessedRef === ref) return;
+        webviewEl.__lastProcessedRef = ref;
+
+        const query = this.buildSearchQuery(ref);
+        const searchView = await this.openSearchLeaf();
+        await this.setSearchLeafQuery(query, searchView);
+    }
+    
     // OPEN THE SEARCH LEAF, CREATING IT IF NECESSARY
     async openSearchLeaf() {
         // Expand left sidebar

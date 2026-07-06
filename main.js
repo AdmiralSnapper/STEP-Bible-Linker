@@ -217,9 +217,20 @@ class StepSearchView extends ItemView {
 
         this.input.style.width = "100%";
         this.input.style.marginBottom = "10px";
+        this.input.readOnly = true; // Disable manual typing
+
+        this.loadingEl = container.createEl("div", {
+            text: "Searching…"
+        });
+        this.loadingEl.style.display = "none";
+        this.loadingEl.style.marginBottom = "10px";
+        this.loadingEl.style.color = "#888";
+        this.loadingEl.style.fontSize = "0.75em";
 
         // Results area (you can fill this later if you want)
         this.resultsEl = container.createEl("div");
+
+        
     }
 
     setQuery(query) {
@@ -240,6 +251,7 @@ class StepSearchView extends ItemView {
         }
 
         this.searchInProgress = true;
+        this.showLoading();
         this.resultsEl.empty();
 
         console.log("Searching query array", queryArray);
@@ -265,6 +277,8 @@ class StepSearchView extends ItemView {
                 }
             }
         }
+
+        this.hideLoading();
 
         if (matchedFiles.size === 0) {
             this.resultsEl.createEl("div", { text: "No matches found." });
@@ -295,6 +309,17 @@ class StepSearchView extends ItemView {
         }
     }
 
+    showLoading() {
+        if (this.loadingEl) {
+            this.loadingEl.style.display = "block";
+        }
+    }
+
+    hideLoading() {
+        if (this.loadingEl) {
+            this.loadingEl.style.display = "none";
+        }
+    }
 
 }
 

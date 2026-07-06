@@ -192,6 +192,9 @@ class StepSearchView extends ItemView {
     constructor(leaf, plugin) {
         super(leaf);
         this.plugin = plugin;
+
+        this.searchInProgress = false;
+        this.pendingQuery = null;
     }
 
     getViewType() {
@@ -230,10 +233,20 @@ class StepSearchView extends ItemView {
     }
 
     async runSearch(queryArray) {
+        // If a search is already running, queue the latest query
+        if (this.searchInProgress) {
+            this.pendingQuery = queryArray;
+            return;
+        }
+
+        this.searchInProgress = true;
         this.resultsEl.empty();
+
+        console.log("Searching query array", queryArray);
 
         if (!Array.isArray(queryArray) || queryArray.length === 0) {
             this.resultsEl.createEl("div", { text: "No query." });
+            this.searchInProgress = false;
             return;
         }
 
@@ -244,33 +257,45 @@ class StepSearchView extends ItemView {
             const text = await this.plugin.app.vault.read(file);
 
             for (const q of queryArray) {
-                if (text.includes(q)) {
+                const regex = new RegExp(`${q}(?:[.-]|&)`);
+
+                if (regex.test(text)) {
                     matchedFiles.add(file);
-                    break; // no need to check other queries for this file
+                    break;
                 }
             }
         }
 
         if (matchedFiles.size === 0) {
             this.resultsEl.createEl("div", { text: "No matches found." });
-            return;
+        } else {
+            for (const file of matchedFiles) {
+                const item = this.resultsEl.createEl("div", {
+                    text: file.basename
+                });
+
+                item.style.cursor = "pointer";
+                item.style.fontSize = "0.9em";
+                item.style.marginBottom = "8px";
+                item.style.lineHeight = "1.4";
+
+                item.onclick = () => {
+                    this.plugin.app.workspace.openLinkText(file.path, file.path);
+                };
+            }
         }
 
-        for (const file of matchedFiles) {
-            const item = this.resultsEl.createEl("div", {
-                text: file.basename
-            });
+        this.searchInProgress = false;
 
-            item.style.cursor = "pointer";
-            item.style.fontSize = "0.9em";        // smaller text
-            item.style.marginBottom = "8px";      // spacing between entries
-            item.style.lineHeight = "1.4";        // easier multi-line readability
-
-            item.onclick = () => {
-                this.plugin.app.workspace.openLinkText(file.path, file.path);
-            };
+        // ⭐ If a new query arrived while we were searching, run it now
+        if (this.pendingQuery) {
+            const nextQuery = this.pendingQuery;
+            this.pendingQuery = null;
+            this.runSearch(nextQuery);
         }
     }
+
+
 }
 
 
@@ -346,46 +371,41 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // SEARCH BASED ON STEP URL AUTOMATICALLY
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
+                console.log("active leaf changed");
+                if (!this.settings.autoSyncOnNavigation) return;
 
                 const view = leaf?.view;
                 if (!view) return;
 
-                // Only handle WebViewer tabs
                 if (view.getViewType?.() !== "webviewer") return;
                 const webviewEl = view.webview;
                 if (!webviewEl) return;
 
-                // Reset dedupe on tab switch
+                // Always reset dedupe on tab switch
                 webviewEl.__lastProcessedRef = null;
 
-                //
-                // 1. TAB SWITCHING — use view.url (this one *is* correct)
-                //
-                const currentUrl = view.url;
-                await this.handleStepReference(webviewEl, currentUrl);
+                // TAB SWITCHING — view.url is correct here
+                const tabUrl = view.url;
+                await this.handleStepReference(webviewEl, tabUrl);
 
                 //
-                // 2. INITIAL LOAD + INTERNAL NAVIGATION — attach listeners once
+                // ALWAYS attach listeners fresh — WebView is recreated on tab switch
                 //
-                if (!webviewEl.__stepListenersAttached) {
-                    webviewEl.__stepListenersAttached = true;
+                webviewEl.addEventListener("did-finish-load", async () => {
+                    //console.log("Finished load");
+                    const currentUrl = webviewEl.getURL();
+                    await this.handleStepReference(webviewEl, currentUrl);
+                });
 
-                    // INITIAL LOAD — fires once when the page finishes loading
-                    webviewEl.addEventListener("did-finish-load", async () => {
-                        const url = view.url; // SAFE for initial load
-                        await this.handleStepReference(webviewEl, url);
-                    });
-
-                    // INTERNAL NAVIGATION — fires when clicking inside STEP
-                    webviewEl.addEventListener("did-navigate-in-page", async () => {
-
-                        url = webviewEl.getURL(); 
-
-                        await this.handleStepReference(webviewEl, url);
-                    });
-                }
+                webviewEl.addEventListener("did-navigate-in-page", async () => {
+                    //console.log("In-page navigation");
+                    const currentUrl = webviewEl.getURL();
+                    await this.handleStepReference(webviewEl, currentUrl);
+                });
             })
         );
+
+
 
         // LINK REFERENCE AT CURSOR 
         this.addCommand({

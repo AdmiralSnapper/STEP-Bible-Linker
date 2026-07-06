@@ -430,8 +430,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             })
         );
 
-
-
         // LINK REFERENCE AT CURSOR 
         this.addCommand({
             id: 'auto-link-step-ref',
@@ -759,11 +757,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
 
                 const modal = new BibleSearchModal(this.app, plugin, async (refText) => {
-
-                    // Append "1" to book names without chapter numbers
-                    if (/^[A-Za-z0-9\s]+[A-Za-z]+$/.test(refText)) {
-                        refText = refText.trim() + " 1";
-                    }
 
                     const result = this.buildStepLink(refText);
                     if (!result) return;

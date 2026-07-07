@@ -12,7 +12,7 @@ const { Plugin, PluginSettingTab, ItemView, Setting, requestUrl } = require('obs
 const DEFAULT_SETTINGS = {
     autoSyncOnNavigation: true,
     autoCloseSearchPanel: true,
-    enabledVersions: ["ESV", "THOT", "SBLG"]
+    enabledVersions: ["ESV", "THOT", "SBLG"],
 };
 
 class StepBibleLinkerSettingTab extends PluginSettingTab {
@@ -195,7 +195,6 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
             });
         });
 
-    
     }
 }
 
@@ -219,6 +218,10 @@ class StepSearchView extends ItemView {
         return "STEP Search";
     }
 
+    getIcon() {
+        return "book-open-text"; // or any Lucide icon name
+    }
+
     onOpen() {
         const container = this.containerEl.children[1];
         container.empty();
@@ -232,6 +235,9 @@ class StepSearchView extends ItemView {
         this.input.style.width = "100%";
         this.input.style.marginBottom = "10px";
         this.input.readOnly = true; // Disable manual typing
+        this.input.style.backgroundColor = "#3b3b3b";
+        this.input.style.color = "#b9b9b9";
+        this.input.style.fontWeight = "bold";
 
         this.loadingEl = container.createEl("div", {
             text: "Searching…"

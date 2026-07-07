@@ -247,15 +247,16 @@ class StepSearchView extends ItemView {
         
     }
 
-    setQuery(query) {
+    updateQuery(queryArray, queryReference) {
+        // Update the top box with the readable reference
         if (this.input) {
-            this.input.value = query;
+            this.input.value = queryReference;
         }
 
-        console.log("STEP SearchView: setQuery()", query);
-
-        this.runSearch(query);
+        // Run the search
+        this.runSearch(queryArray, queryReference);
     }
+
 
     async runSearch(queryArray) {
         // If a search is already running, queue the latest query
@@ -451,6 +452,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 const view = leaf?.view;
                 if (!view) return;
+
+                if (leaf.getRoot() !== this.app.workspace.rootSplit) {
+                    // Focus is NOT in the main editor area → do nothing
+                    return;
+                }
 
                 // If the focused tab IS the STEP Search panel → do nothing
                 if (view.getViewType?.() === "step-search-view") {
@@ -853,6 +859,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
     }
 
+//SEARCH HELPERS ====================================================================================
+
+    // HANDLE STEP REFERENCE FROM WEBVIEW URL
     async handleStepReference(webviewEl, url) {
         if (!url || !url.includes("reference=")) return;
 
@@ -863,11 +872,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         if (webviewEl.__lastProcessedRef === ref) return;
         webviewEl.__lastProcessedRef = ref;
 
-        const query = this.buildSearchQuery(ref);
+        const queryArray = this.buildSearchQuery(ref);
+        const queryReference = this.buildSearchQueryReference(ref);
         const searchView = await this.openSearchLeaf();
-        await this.setSearchLeafQuery(query, searchView);
+        searchView.updateQuery(queryArray, queryReference);
     }
-    
+
     // OPEN THE SEARCH LEAF, CREATING IT IF NECESSARY
     async openSearchLeaf() {
         // Expand left sidebar
@@ -904,18 +914,61 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         }
     }
 
-    // UPDATE THE SEARCH LEAF WITH A QUERY, CREATING IT IF NECESSARY
-    async setSearchLeafQuery(queryArray, view) {
-        if (!view || !Array.isArray(queryArray)) return;
+    // BUILDS FULLY FORMATTED READIBLE REFERENCE FROM URL REFERENCE
+    buildSearchQueryReference(ref) {
+        ref = ref.trim();
+        if (ref === "") return;
 
-        // Show the first query in the input box
-        if (view.input) {
-            view.input.value = queryArray.join(" OR ");
+        const parsed = this.parseAndExpandVerse(ref);
+        const expanded = parsed.expandedText;
+
+        // If no range, return as-is
+        if (!expanded.includes(" - ")) {
+            return expanded;
         }
 
-        view.runSearch(queryArray);
+        // Split the two sides of the range
+        const [left, right] = expanded.split(" - ").map(s => s.trim());
+
+        // Parse both sides into components
+        const leftParts = left.split(" ");
+        const rightParts = right.split(" ");
+
+        const leftBook = leftParts[0];
+        const rightBook = rightParts[0];
+
+        const leftRef = leftParts[1] ?? "";
+        const rightRef = rightParts[1] ?? "";
+
+        // If books differ → keep both fully
+        if (leftBook !== rightBook) {
+            return `${leftBook} ${leftRef} - ${rightBook} ${rightRef}`;
+        }
+
+        // Same book → contract book name
+        const [leftChap, leftVerse] = leftRef.split(":");
+        const [rightChap, rightVerse] = rightRef.split(":");
+
+        // If chapters differ → keep both chapter+verse
+        if (leftChap !== rightChap) {
+            // If right side has no verse (e.g., "Genesis 1:1 - Genesis 3")
+            if (!rightVerse) {
+                return `${leftBook} ${leftChap}:${leftVerse} - ${rightChap}`;
+            }
+
+            return `${leftBook} ${leftChap}:${leftVerse} - ${rightChap}:${rightVerse}`;
+        }
+
+        // Same chapter → contract chapter
+        if (rightVerse) {
+            return `${leftBook} ${leftChap}:${leftVerse}-${rightVerse}`;
+        }
+
+        // Same chapter, right side has no verse (e.g., "Genesis 1:1 - Genesis 1")
+        return `${leftBook} ${leftChap}:${leftVerse} - ${rightChap}`;
     }
 
+    // BUILDS ARRAY OF SEARCH TOKENS FROM URL REFERENCE 
     buildSearchQuery(ref) {
         // remove spaces
         ref = ref.trim();
@@ -979,6 +1032,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const parts = refs.map(r => `reference=${r}`);
         return parts; // ← array of strings
     }
+
+//MISCELLANEOUS HELPERS ====================================================================================
 
     // BUILDS THE STEP URL FROM ENTERED TEXT
     buildStepLink(refText) {
@@ -1046,13 +1101,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return `${onlineBase}q=${match[1]}`;
     }
 
-    // --- Extract "reference=..." from the STEP URL ---
+    // EXTRACT A REFERENCE FROM URL
     extractReferenceFromUrl(url) {
         const match = url.match(/reference=([^&]+)/);
         return match ? decodeURIComponent(match[1]) : null;
     }
 
-    // --- Build a new URL with a different reference=... ---
+    // BUILD A NEW URL WITH A DIFFERENT REFERENCE
     buildUrlForRef(originalUrl, newRef) {
         if (originalUrl.includes("reference=")) {
             return originalUrl.replace(/reference=[^&]+/, `reference=${encodeURIComponent(newRef)}`);
@@ -1060,7 +1115,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return originalUrl;
     }
 
-    // --- Fetch text by reading <title> text ---
+    // FETCH TEXT FROM STEP WEBPAGE
     async fetchSingleVerseFromTitle(url) {
         const response = await requestUrl({ url });
         const html = response.text;
@@ -1087,7 +1142,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return verseText || null;
     }
 
-    // --- Expand a STEP-style serverRef into a list of verse refs ---
+    // EXPAND A SERVER REFERENCE INTO A LIST OF VERSE REFERENCES
     expandServerRefToVerseList(serverRef) {
         // Normalize: remove spaces from book part if any slipped through
         serverRef = serverRef.replace(/\s+/g, "");
@@ -2132,7 +2187,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return overviews[book] || null;
     }
 
-    // SETTINGS MANAGEMENT====================================================================================
+// SETTINGS MANAGEMENT HELPERS ====================================================================================
     toggleVersion(version, enabled) {
         const list = this.settings.enabledVersions;
 

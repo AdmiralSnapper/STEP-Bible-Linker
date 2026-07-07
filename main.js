@@ -331,6 +331,13 @@ class StepSearchView extends ItemView {
                 expandBtn.style.color = "#71717166";
                 expandBtn.style.userSelect = "none";
 
+                // Counter element (left of arrow)
+                const counterEl = item.createEl("span");
+                counterEl.style.color = "#888";
+                counterEl.style.fontSize = "0.8em";
+                counterEl.style.marginRight = "6px";
+                counterEl.textContent = ""; // will be filled after preview loads
+
                 // Title text (click to open note)
                 const titleEl = item.createEl("span", { text: file.basename });
                 titleEl.style.cursor = "pointer";
@@ -401,32 +408,38 @@ class StepSearchView extends ItemView {
                         });
                     });
 
-                    // ⭐ Find the actual STEP link in the rendered preview
-                    let highlightEl = null;
+                    // Find each matching link
+                    const matchedLinks = [];
+                    const links = Array.from(preview.querySelectorAll("a"));
 
                     for (const q of queryArray) {
-                        const links = Array.from(preview.querySelectorAll("a"));
+                        // Use the SAME regex pattern as your search engine
+                        const regex = new RegExp(`${q}(?:[.:\\-]|&)`);
 
-                        const match = links.find(a => a.href.includes(q));
-
-                        if (match) {
-                            highlightEl = match;
-                            break;
-                        }
+                        links.forEach(a => {
+                            if (regex.test(a.href)) {
+                                matchedLinks.push(a);
+                            }
+                        });
                     }
 
-                    // Highlight ONLY the link (not the paragraph)
-                    if (highlightEl) {
-                        highlightEl.style.backgroundColor = "transparent"; 
-                        highlightEl.style.outline = "1px solid var(--background-modifier-hover)";
-                        highlightEl.style.outlineOffset = "2px";           // little breathing room
-                        highlightEl.style.borderRadius = "3px";
-                    }
+                    // Highlight each matching link using your exact convention
+                    matchedLinks.forEach(link => {
+                        link.style.textDecoration = "none";
+                        link.style.textShadow = "none";
+                        link.style.backgroundColor = "rgba(89, 89, 89, 0.35)";
+                        link.style.borderRadius = "3px";
+                    });
 
-                    // Find the paragraph/div containing the link
-                    let scrollTarget = highlightEl ? highlightEl.closest("p, div") : null;
+                    // Update counter
+                    counterEl.textContent = matchedLinks.length > 0 ? `(${matchedLinks.length})` : "";
 
-                    // ⭐ Animate open + scroll to highlight
+                    let scrollTarget = matchedLinks.length > 0
+                        ? matchedLinks[0].closest("p, div")
+                        : null;
+
+
+                    // Animate open + scroll to highlight
                     requestAnimationFrame(() => {
                         wrapper.style.maxHeight = preview.scrollHeight + "px";
 
@@ -436,8 +449,6 @@ class StepSearchView extends ItemView {
                             }, 250); // matches your animation duration
                         }
                     });
-
-
 
                     activeInlinePreview = { item, wrapper };
                     expandBtn.textContent = "v";

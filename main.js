@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, ItemView, Setting, requestUrl } = require('obsidian');
+const { Plugin, PluginSettingTab, MarkdownRenderer, ItemView, Setting, requestUrl } = require('obsidian');
 
 //SETTINGS ======================================================================
 /**
@@ -219,7 +219,7 @@ class StepSearchView extends ItemView {
     }
 
     getIcon() {
-        return "book-open-text"; // or any Lucide icon name
+        return "book-open-text";
     }
 
     onOpen() {
@@ -227,45 +227,53 @@ class StepSearchView extends ItemView {
         container.empty();
 
         // Search input
-        this.input = container.createEl("input", {
+        this.queryBox = container.createEl("input", {
             type: "text",
             placeholder: "STEP search…"
         });
 
-        this.input.style.width = "100%";
-        this.input.style.marginBottom = "10px";
-        this.input.readOnly = true; // Disable manual typing
-        this.input.style.backgroundColor = "#3b3b3b";
-        this.input.style.color = "#b9b9b9";
-        this.input.style.fontWeight = "bold";
+        this.queryBox.style.width = "100%";
+        this.queryBox.style.marginBottom = "10px";
+        this.queryBox.readOnly = true;
+        this.queryBox.style.backgroundColor = "#3b3b3b";
+        this.queryBox.style.color = "#b9b9b9";
+        this.queryBox.style.fontWeight = "bold";
 
-        this.loadingEl = container.createEl("div", {
+        // Loading indicator
+        this.searchLoadingIndicator = container.createEl("div", {
             text: "Searching…"
         });
-        this.loadingEl.style.display = "none";
-        this.loadingEl.style.marginBottom = "10px";
-        this.loadingEl.style.color = "#888";
-        this.loadingEl.style.fontSize = "0.75em";
+        this.searchLoadingIndicator.style.display = "none";
+        this.searchLoadingIndicator.style.marginBottom = "10px";
+        this.searchLoadingIndicator.style.color = "#888";
+        this.searchLoadingIndicator.style.fontSize = "0.75em";
 
-        // Results area (you can fill this later if you want)
+        // Results area
         this.resultsEl = container.createEl("div");
 
-        
+        // Tooltip container (hover preview)
+        this.hoverBox = document.body.createEl("div");
+        this.hoverBox.style.position = "fixed";       // ⭐ required to appear above webviews
+        this.hoverBox.style.zIndex = "999999";        // ⭐ very high to beat webviews
+        this.hoverBox.style.display = "none";
+        this.hoverBox.style.maxWidth = "300px";
+        this.hoverBox.style.padding = "10px";
+        this.hoverBox.style.borderRadius = "6px";
+        this.hoverBox.style.backgroundColor = "var(--background-primary)";
+        this.hoverBox.style.boxShadow = "0 4px 12px rgba(0,0,0,0.25)";
+        this.hoverBox.style.fontSize = "0.85em";
+        this.hoverBox.style.lineHeight = "1.4";
     }
 
     updateQuery(queryArray, queryReference) {
-        // Update the top box with the readable reference
-        if (this.input) {
-            this.input.value = queryReference;
+        if (this.queryBox) {
+            this.queryBox.value = queryReference;
         }
 
-        // Run the search
-        this.runSearch(queryArray, queryReference);
+        this.runSearch(queryArray);
     }
 
-
     async runSearch(queryArray) {
-        // If a search is already running, queue the latest query
         if (this.searchInProgress) {
             this.pendingQuery = queryArray;
             return;
@@ -274,8 +282,6 @@ class StepSearchView extends ItemView {
         this.searchInProgress = true;
         this.showLoading();
         this.resultsEl.empty();
-
-        console.log("Searching query array", queryArray);
 
         if (!Array.isArray(queryArray) || queryArray.length === 0) {
             this.resultsEl.createEl("div", { text: "No query." });
@@ -291,7 +297,6 @@ class StepSearchView extends ItemView {
 
             for (const q of queryArray) {
                 const regex = new RegExp(`${q}(?:[.-]|&)`);
-
                 if (regex.test(text)) {
                     matchedFiles.add(file);
                     break;
@@ -304,25 +309,130 @@ class StepSearchView extends ItemView {
         if (matchedFiles.size === 0) {
             this.resultsEl.createEl("div", { text: "No matches found." });
         } else {
-            for (const file of matchedFiles) {
-                const item = this.resultsEl.createEl("div", {
-                    text: file.basename
-                });
+            let activeInlinePreview = null;
 
-                item.style.cursor = "pointer";
-                item.style.fontSize = "0.9em";
+            for (const file of matchedFiles) {
+                const item = this.resultsEl.createEl("div");
+                item.style.transition = "background-color 0.15s ease";
+                item.addEventListener("mouseenter", () => item.style.backgroundColor = "var(--background-modifier-hover)");
+                item.addEventListener("mouseleave", () => item.style.backgroundColor = "");
+
+                item.style.display = "flex";
+                item.style.alignItems = "center";
+                item.style.gap = "6px";
                 item.style.marginBottom = "8px";
+                item.style.fontSize = "0.9em";
                 item.style.lineHeight = "1.4";
 
-                item.onclick = () => {
+                // Expand/collapse arrow on the LEFT
+                const expandBtn = item.createEl("span", { text: ">" });
+                expandBtn.style.cursor = "pointer";
+                expandBtn.style.color = "var(--text-muted)";
+                //expandBtn.style.fontWeight = "bold";
+                expandBtn.style.userSelect = "none";
+
+                // Title text (click to open note)
+                const titleEl = item.createEl("span", { text: file.basename });
+                titleEl.style.cursor = "pointer";
+                titleEl.style.flexGrow = "1";
+
+                titleEl.addEventListener("click", () => {
                     this.plugin.app.workspace.openLinkText(file.path, file.path);
-                };
+                });
+
+                // Expand/collapse preview
+                expandBtn.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+
+                    // Close previous preview if it's for another item
+                    if (activeInlinePreview && activeInlinePreview.item !== item) {
+                        activeInlinePreview.el.remove();
+                        activeInlinePreview = null;
+                    }
+
+                    // Collapse if already open
+                    if (activeInlinePreview && activeInlinePreview.item === item) {
+                        activeInlinePreview.el.remove();
+                        activeInlinePreview = null;
+                        expandBtn.textContent = ">";
+                        return;
+                    }
+
+                    // Create preview box
+                    const preview = document.createElement("div");
+                    preview.style.padding = "10px";
+                    preview.style.margin = "6px 0 12px 0";
+                    preview.style.borderRadius = "6px";
+                    preview.style.backgroundColor = "var(--background-primary)";
+                    preview.style.boxShadow = "0 2px 6px rgba(0,0,0,0.15)";
+                    preview.style.fontSize = "0.85em";
+                    preview.style.lineHeight = "1.4";
+
+                    // ⭐ Make preview scrollable
+                    preview.style.maxHeight = "300px";
+                    preview.style.overflowY = "auto";
+
+                    // Insert preview under the item
+                    item.insertAdjacentElement("afterend", preview);
+
+                    // Load full file
+                    const fullText = await this.plugin.app.vault.read(file);
+
+                    // Render full Markdown file
+                    preview.empty();
+                    await MarkdownRenderer.render(
+                        this.plugin.app,
+                        fullText,
+                        preview,
+                        this.plugin.app.workspace.getActiveFile()?.path || "",
+                        this.plugin
+                    );
+
+                    // After MarkdownRenderer.render(...)
+                    preview.querySelectorAll("a").forEach(a => {
+                        // Remove any title attribute (helps reduce some tooltip cases)
+                        a.removeAttribute("title");
+
+                        // Keep STEP links clickable
+                        a.addEventListener("click", (ev) => {
+                            ev.preventDefault();
+                            window.open(a.href, "_blank");
+                        });
+                    });
+
+                    //  Auto-scroll to the matched reference
+                    const paragraphs = fullText.split(/\n\s*\n/);
+                    let targetParagraph = null;
+
+                    for (const p of paragraphs) {
+                        for (const q of queryArray) {
+                            const regex = new RegExp(`${q}(?:[.-]|&)`);
+                            if (regex.test(p)) {
+                                targetParagraph = p.trim();
+                                break;
+                            }
+                        }
+                        if (targetParagraph) break;
+                    }
+
+                    if (targetParagraph) {
+                        const el = Array.from(preview.querySelectorAll("p, div, span"))
+                            .find(e => e.textContent.includes(targetParagraph));
+
+                        if (el) {
+                            el.scrollIntoView({ behavior: "smooth", block: "center" });
+                        }
+                    }
+
+                    // Track active preview
+                    activeInlinePreview = { item, el: preview };
+                    expandBtn.textContent = "v";
+                });
             }
         }
 
         this.searchInProgress = false;
 
-        // ⭐ If a new query arrived while we were searching, run it now
         if (this.pendingQuery) {
             const nextQuery = this.pendingQuery;
             this.pendingQuery = null;
@@ -331,18 +441,29 @@ class StepSearchView extends ItemView {
     }
 
     showLoading() {
-        if (this.loadingEl) {
-            this.loadingEl.style.display = "block";
-        }
+        this.searchLoadingIndicator.style.display = "block";
     }
 
     hideLoading() {
-        if (this.loadingEl) {
-            this.loadingEl.style.display = "none";
-        }
+        this.searchLoadingIndicator.style.display = "none";
     }
 
+    extractParagraphMatchingQuery(text, queryArray) {
+        const paragraphs = text.split(/\n\s*\n/);
+
+        for (const p of paragraphs) {
+            for (const q of queryArray) {
+                const regex = new RegExp(`${q}(?:[.-]|&)`);
+                if (regex.test(p)) {
+                    return p.trim();
+                }
+            }
+        }
+
+        return null;
+    }
 }
+
 
 
 // PLUGIN =======================================================================
@@ -592,6 +713,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             // Create popover (initially hidden off-screen)
             const pop = document.createElement("div");
+            pop.classList.add("step-popover");
             Object.assign(pop.style, {
                 position: "fixed",
                 left: "-9999px",
@@ -606,7 +728,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 maxHeight: "350px",
                 overflowY: "auto",
                 boxShadow: "0 4px 14px rgba(0,0,0,0.25)",
-                zIndex: "99999",
+                zIndex: "1000000",
                 color: "#d6d6d6",
 
                 fontSize: "13.5px",

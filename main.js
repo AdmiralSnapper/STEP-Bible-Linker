@@ -4,12 +4,14 @@ const { Plugin, PluginSettingTab, ItemView, Setting, requestUrl } = require('obs
 /**
  * @typedef {Object} StepBibleLinkerSettings
  * @property {boolean} autoSyncOnNavigation - If true, STEP auto-syncs on navigation
+ * @property {boolean} autoCloseSearchPanel - If true, the STEP search panel auto-closes when switching to a non-STEP tab
  * @property {string[]} enabledVersions - List of STEP Bible versions to include in generated links
  */
 
 /** @type {StepBibleLinkerSettings} */
 const DEFAULT_SETTINGS = {
     autoSyncOnNavigation: true,
+    autoCloseSearchPanel: true,
     enabledVersions: ["ESV", "THOT", "SBLG"]
 };
 
@@ -33,6 +35,18 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
                     .setValue(this.plugin.settings.autoSyncOnNavigation)
                     .onChange(async (value) => {
                         this.plugin.settings.autoSyncOnNavigation = value;
+                        await this.plugin.saveSettings();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Auto-close search panel")
+            .setDesc("Automatically close the search panel when switching to a non-STEP tab.")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.autoCloseSearchPanel)
+                    .onChange(async (value) => {
+                        this.plugin.settings.autoCloseSearchPanel = value;
                         await this.plugin.saveSettings();
                     });
             });
@@ -427,6 +441,51 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     const currentUrl = webviewEl.getURL();
                     await this.handleStepReference(webviewEl, currentUrl);
                 });
+            })
+        );
+
+        // CLOSE SEARCH PANEL WHEN TAB CHANGES — BUT NOT WHEN SEARCH TAB IS FOCUSED
+        this.registerEvent(
+            this.app.workspace.on("active-leaf-change", (leaf) => {
+                if (!this.settings.autoCloseSearchPanel) return;
+
+                const view = leaf?.view;
+                if (!view) return;
+
+                // If the focused tab IS the STEP Search panel → do nothing
+                if (view.getViewType?.() === "step-search-view") {
+                    return;
+                }
+
+                // If the focused tab is NOT a webviewer → close search panel
+                if (view.getViewType?.() !== "webviewer") {
+                    this.closeSearchLeaf();
+                    return;
+                }
+
+                // It's a webviewer — check URL
+                const webviewEl = view.webview;
+                if (!webviewEl) {
+                    this.closeSearchLeaf();
+                    return;
+                }
+
+                let url = null;
+
+                try {
+                    // Try the live webview URL first
+                    url = webviewEl.getURL?.();
+                } catch (e) {
+                    // WebView not ready — ignore silently
+                }
+
+                // If URL does NOT contain reference= → close search panel
+                if (!url || !url.includes("reference=")) {
+                    this.closeSearchLeaf();
+                    return;
+                }
+
+                // Otherwise: keep search panel open
             })
         );
 
@@ -830,6 +889,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this.app.workspace.setActiveLeaf(leaf, { focus: false });
 
         return leaf.view;
+    }
+
+    // CLOSE THE SEARCH LEAF IF IT EXISTS
+    closeSearchLeaf() {
+        const leaf = this.app.workspace.getLeavesOfType("step-search-view")[0];
+        if (leaf) {
+            this.app.workspace.detachLeavesOfType("step-search-view");
+
+            const leftSplit = this.app.workspace.leftSplit;
+            if (leftSplit && leftSplit.collapsed == false) {
+                leftSplit.collapse();
+            }
+        }
     }
 
     // UPDATE THE SEARCH LEAF WITH A QUERY, CREATING IT IF NECESSARY

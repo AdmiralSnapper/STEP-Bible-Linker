@@ -1,5 +1,6 @@
 {
   "autoSyncOnNavigation": true,
+  "autoCloseSearchPanel": true,
   "enabledVersions": [
     "ESV",
     "SBLG",

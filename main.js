@@ -322,7 +322,9 @@ class StepSearchView extends ItemView {
         this.hideLoading();
 
         if (matchedFiles.length === 0) {
-            this.resultsEl.createEl("div", { text: "No matches found." });
+            const msg = this.resultsEl.createEl("div", { text: "No matches found." });
+            msg.style.color = "#414141"; 
+            msg.style.fontSize = "0.75em";
         } else {
             let activeInlinePreview = null;
 
@@ -348,6 +350,7 @@ class StepSearchView extends ItemView {
                 circleBtn.style.width = "22px";
                 circleBtn.style.height = "22px";
                 circleBtn.style.borderRadius = "50%";
+                circleBtn.style.flexShrink = "0";
                 circleBtn.style.display = "flex";
                 circleBtn.style.alignItems = "center";
                 circleBtn.style.justifyContent = "center";
@@ -360,6 +363,23 @@ class StepSearchView extends ItemView {
                 circleBtn.style.backgroundColor = "var(--background-modifier-border)";
                 circleBtn.style.color = "var(--text-normal)";
                 circleBtn.textContent = linkCount > 0 ? linkCount : "";
+
+                circleBtn.onmouseenter = () => {
+                    // Only highlight if dropdown is open
+                    if (activeInlinePreview && activeInlinePreview.item === item) {
+                        circleBtn.style.backgroundColor = "var(--interactive-accent)";
+                        circleBtn.style.color = "white";
+                    }
+                };
+
+                circleBtn.onmouseleave = () => {
+                    // Only un-highlight if dropdown is open
+                    if (activeInlinePreview && activeInlinePreview.item === item) {
+                        circleBtn.style.backgroundColor = "var(--background-modifier-border)";
+                        circleBtn.style.color = "var(--text-normal)";
+                    }
+                };
+
 
                 // Title text (click to open note)
                 const titleEl = item.createEl("span", { text: file.basename });
@@ -414,9 +434,9 @@ class StepSearchView extends ItemView {
                         return;
                     }
 
-                    // Highlight circle because dropdown is opening
-                    circleBtn.style.backgroundColor = "var(--interactive-accent)";
-                    circleBtn.style.color = "white";
+                    // Circle enters "active but not hovered" state
+                    circleBtn.style.backgroundColor = "var(--background-modifier-border-hover)";
+                    circleBtn.style.color = "var(--text-normal)";
 
                     // Create wrapper for animation
                     const wrapper = document.createElement("div");
@@ -471,7 +491,6 @@ class StepSearchView extends ItemView {
                         }
                     });
 
-
                     // Start at first match
                     cycleIndex = 1;
                     circleBtn.textContent = `${cycleIndex}/${previewLinks.length}`;
@@ -479,17 +498,15 @@ class StepSearchView extends ItemView {
                     // Highlight first match
                     highlightCurrent();
 
-                    // Scroll to first match (outer search container will move)
+                    // Scroll to first match
                     if (previewLinks.length > 0) {
                         const firstTarget = previewLinks[0];
-                        if (firstTarget) {
-                            setTimeout(() => {
-                                preview.scrollTo({
-                                    top: firstTarget.offsetTop - preview.clientHeight / 2,
-                                    behavior: "smooth"
-                                });
-                            }, 300); // 250ms animation + 50ms render buffer
-                        }
+                        setTimeout(() => {
+                            preview.scrollTo({
+                                top: firstTarget.offsetTop - preview.clientHeight / 2,
+                                behavior: "smooth"
+                            });
+                        }, 300);
                     }
 
                     // Animate open
@@ -500,39 +517,50 @@ class StepSearchView extends ItemView {
                     activeInlinePreview = { item, wrapper, preview };
                 };
 
+
+                // Title click toggles dropdown
                 titleEl.onclick = async () => {
+
                     // If open → close it
                     if (activeInlinePreview && activeInlinePreview.item === item) {
-                        // Collapse preview
+
                         activeInlinePreview.wrapper.style.maxHeight = "0";
                         activeInlinePreview = null;
 
-                        // Reset circle to default state
+                        // Circle returns to closed state
                         circleBtn.style.backgroundColor = "var(--background-modifier-border)";
                         circleBtn.style.color = "var(--text-normal)";
                         circleBtn.textContent = linkCount > 0 ? linkCount : "";
 
-                        // Reset cycle index
                         cycleIndex = 1;
-
                         return;
                     }
 
                     // If closed → open it
                     await openPreview();
 
-                    // Highlight circle when open
-                    circleBtn.style.backgroundColor = "var(--interactive-accent)";
-                    circleBtn.style.color = "white";
-
                     // Show cycling index
                     circleBtn.textContent = `1/${previewLinks.length}`;
                     cycleIndex = 1;
                 };
 
-                // Circle opens preview AND cycles through matches
-                circleBtn.onclick = () => {
-                    if (!activeInlinePreview || activeInlinePreview.item !== item) return;
+
+                circleBtn.onclick = async () => {
+
+                    // If dropdown is closed → open it
+                    if (!activeInlinePreview || activeInlinePreview.item !== item) {
+                        await openPreview();
+
+                        // Set active state
+                        circleBtn.style.backgroundColor = "var(--interactive-accent)";
+                        circleBtn.style.color = "white";
+
+                        circleBtn.textContent = `1/${previewLinks.length}`;
+                        cycleIndex = 1;
+                        return;
+                    }
+
+                    // If dropdown is open → cycle
                     if (previewLinks.length === 0) return;
 
                     cycleIndex = (cycleIndex % previewLinks.length) + 1;
@@ -544,12 +572,32 @@ class StepSearchView extends ItemView {
                     const target = previewLinks[cycleIndex - 1];
 
                     if (target) {
-                        target.scrollIntoView({
-                            behavior: "smooth",
-                            block: "center"
-                        });
+                        setTimeout(() => {
+                            previewEl.scrollTo({
+                                top: target.offsetTop - previewEl.clientHeight / 2,
+                                behavior: "smooth"
+                            });
+                        }, 30);
+                    }                   
+                };
+
+
+
+                // Hover behavior (only when dropdown is open)
+                circleBtn.onmouseenter = () => {
+                    if (activeInlinePreview && activeInlinePreview.item === item) {
+                        circleBtn.style.backgroundColor = "var(--interactive-accent)";
+                        circleBtn.style.color = "white";
                     }
                 };
+
+                circleBtn.onmouseleave = () => {
+                    if (activeInlinePreview && activeInlinePreview.item === item) {
+                        circleBtn.style.backgroundColor = "var(--background-modifier-border-hover)";
+                        circleBtn.style.color = "var(--text-normal)";
+                    }
+                };
+
 
 
             }

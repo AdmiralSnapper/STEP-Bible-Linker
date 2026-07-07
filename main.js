@@ -290,28 +290,44 @@ class StepSearchView extends ItemView {
         }
 
         const files = this.plugin.app.vault.getMarkdownFiles();
-        const matchedFiles = new Set();
 
+        // Build regex list once
+        const regexList = queryArray.map(q => new RegExp(`${q}(?:[.:\\-]|&)`));
+
+        const matchedFiles = [];
+
+        // ⭐ PRE‑SCAN FILES FOR MATCHES + COUNT LINKS
         for (const file of files) {
             const text = await this.plugin.app.vault.read(file);
 
-            for (const q of queryArray) {
-                const regex = new RegExp(`${q}(?:[.-]|&)`);
-                if (regex.test(text)) {
-                    matchedFiles.add(file);
-                    break;
+            // Does the file contain ANY match?
+            const fileMatches = regexList.some(rx => rx.test(text));
+            if (!fileMatches) continue;
+
+            // Count matching links BEFORE rendering
+            let linkCount = 0;
+
+            // Extract all hrefs from Markdown links
+            const hrefScan = [...text.matchAll(/\(([^)]+)\)/g)];
+
+            for (const [, href] of hrefScan) {
+                if (regexList.some(rx => rx.test(href))) {
+                    linkCount++;
                 }
             }
+
+            matchedFiles.push({ file, linkCount });
         }
 
         this.hideLoading();
 
-        if (matchedFiles.size === 0) {
+        if (matchedFiles.length === 0) {
             this.resultsEl.createEl("div", { text: "No matches found." });
         } else {
             let activeInlinePreview = null;
 
-            for (const file of matchedFiles) {
+            for (const { file, linkCount } of matchedFiles) {
+
                 const item = this.resultsEl.createEl("div");
                 item.style.transition = "background-color 0.15s ease";
                 item.style.padding = "4px 6px";
@@ -320,50 +336,87 @@ class StepSearchView extends ItemView {
                 item.addEventListener("mouseleave", () => item.style.backgroundColor = "");
                 item.style.display = "flex";
                 item.style.alignItems = "center";
-                item.style.gap = "6px";
+                item.style.gap = "10px";
                 item.style.marginBottom = "4px";
                 item.style.fontSize = "0.9em";
                 item.style.lineHeight = "1.4";
 
-                // Expand/collapse arrow on the LEFT
-                const expandBtn = item.createEl("span", { text: ">" });
-                expandBtn.style.cursor = "pointer";
-                expandBtn.style.color = "#71717166";
-                expandBtn.style.userSelect = "none";
+                // Circle badge (number always visible, subtle background)
+                const circleBtn = item.createEl("div");
+                circleBtn.classList.add("circle-btn");
+                circleBtn.setAttribute("data-count", linkCount);
+                circleBtn.style.width = "22px";
+                circleBtn.style.height = "22px";
+                circleBtn.style.borderRadius = "50%";
+                circleBtn.style.display = "flex";
+                circleBtn.style.alignItems = "center";
+                circleBtn.style.justifyContent = "center";
+                circleBtn.style.fontSize = "0.75em";
+                circleBtn.style.cursor = "pointer";
+                circleBtn.style.userSelect = "none";
+                circleBtn.style.transition = "all 0.15s ease";
 
-                // Counter element (left of arrow)
-                const counterEl = item.createEl("span");
-                counterEl.style.color = "#888";
-                counterEl.style.fontSize = "0.8em";
-                counterEl.style.marginRight = "6px";
-                counterEl.textContent = ""; // will be filled after preview loads
+                // Default (dropdown closed)
+                circleBtn.style.backgroundColor = "var(--background-modifier-border)";
+                circleBtn.style.color = "var(--text-normal)";
+                circleBtn.textContent = linkCount > 0 ? linkCount : "";
 
                 // Title text (click to open note)
                 const titleEl = item.createEl("span", { text: file.basename });
                 titleEl.style.cursor = "pointer";
                 titleEl.style.flexGrow = "1";
 
-                titleEl.addEventListener("click", () => {
-                    this.plugin.app.workspace.openLinkText(file.path, file.path);
-                });
+                // Shared state for preview + cycling
+                let previewLinks = [];
+                let cycleIndex = 0;
 
-                // Expand/collapse preview WITH animation
-                expandBtn.addEventListener("click", async (ev) => {
-                    ev.stopPropagation();
+                // Highlight only the currently selected reference
+                const highlightCurrent = () => {
+                    previewLinks.forEach((link, index) => {
+                        if (index === cycleIndex - 1) {
+                            // Your exact highlight convention
+                            link.style.textDecoration = "none";
+                            link.style.textShadow = "none";
+                            link.style.backgroundColor = "rgba(89, 89, 89, 0.35)";
+                            link.style.borderRadius = "3px";
+                        } else {
+                            link.style.backgroundColor = "";
+                            link.style.borderRadius = "";
+                        }
+                    });
+                };
 
-                    // Close previous preview if it's for another item
+                // Extract preview-opening logic into a function
+                const openPreview = async () => {
+
+                    // If another preview is open, close it AND reset its circle
                     if (activeInlinePreview && activeInlinePreview.item !== item) {
+
+                        // Collapse the old preview
                         activeInlinePreview.wrapper.style.maxHeight = "0";
+
+                        // Reset the old circle to closed state
+                        const oldCircle = activeInlinePreview.item.querySelector(".circle-btn");
+                        if (oldCircle) {
+                            oldCircle.style.backgroundColor = "var(--background-modifier-border)";
+                            oldCircle.style.color = "var(--text-normal)";
+
+                            // Restore plain count
+                            const oldCount = oldCircle.getAttribute("data-count");
+                            oldCircle.textContent = oldCount || "";
+                        }
+
                         activeInlinePreview = null;
                     }
 
-                    // Collapse if already open
+                    // If already open, do nothing
                     if (activeInlinePreview && activeInlinePreview.item === item) {
-                        activeInlinePreview.wrapper.style.maxHeight = "0";
-                        activeInlinePreview = null;
-                        expandBtn.textContent = ">";
                         return;
                     }
+
+                    // Highlight circle because dropdown is opening
+                    circleBtn.style.backgroundColor = "var(--interactive-accent)";
+                    circleBtn.style.color = "white";
 
                     // Create wrapper for animation
                     const wrapper = document.createElement("div");
@@ -408,51 +461,96 @@ class StepSearchView extends ItemView {
                         });
                     });
 
-                    // Find each matching link
-                    const matchedLinks = [];
+                    // Find matching links in rendered preview
+                    previewLinks = [];
                     const links = Array.from(preview.querySelectorAll("a"));
 
-                    for (const q of queryArray) {
-                        // Use the SAME regex pattern as your search engine
-                        const regex = new RegExp(`${q}(?:[.:\\-]|&)`);
-
-                        links.forEach(a => {
-                            if (regex.test(a.href)) {
-                                matchedLinks.push(a);
-                            }
-                        });
-                    }
-
-                    // Highlight each matching link using your exact convention
-                    matchedLinks.forEach(link => {
-                        link.style.textDecoration = "none";
-                        link.style.textShadow = "none";
-                        link.style.backgroundColor = "rgba(89, 89, 89, 0.35)";
-                        link.style.borderRadius = "3px";
-                    });
-
-                    // Update counter
-                    counterEl.textContent = matchedLinks.length > 0 ? `(${matchedLinks.length})` : "";
-
-                    let scrollTarget = matchedLinks.length > 0
-                        ? matchedLinks[0].closest("p, div")
-                        : null;
-
-
-                    // Animate open + scroll to highlight
-                    requestAnimationFrame(() => {
-                        wrapper.style.maxHeight = preview.scrollHeight + "px";
-
-                        if (scrollTarget) {
-                            setTimeout(() => {
-                                scrollTarget.scrollIntoView({ behavior: "smooth", block: "center" });
-                            }, 250); // matches your animation duration
+                    links.forEach(a => {
+                        if (regexList.some(rx => rx.test(a.href))) {
+                            previewLinks.push(a);
                         }
                     });
 
-                    activeInlinePreview = { item, wrapper };
-                    expandBtn.textContent = "v";
-                });
+
+                    // Start at first match
+                    cycleIndex = 1;
+                    circleBtn.textContent = `${cycleIndex}/${previewLinks.length}`;
+
+                    // Highlight first match
+                    highlightCurrent();
+
+                    // Scroll to first match (outer search container will move)
+                    if (previewLinks.length > 0) {
+                        const firstTarget = previewLinks[0];
+                        if (firstTarget) {
+                            setTimeout(() => {
+                                preview.scrollTo({
+                                    top: firstTarget.offsetTop - preview.clientHeight / 2,
+                                    behavior: "smooth"
+                                });
+                            }, 300); // 250ms animation + 50ms render buffer
+                        }
+                    }
+
+                    // Animate open
+                    requestAnimationFrame(() => {
+                        wrapper.style.maxHeight = preview.scrollHeight + "px";
+                    });
+
+                    activeInlinePreview = { item, wrapper, preview };
+                };
+
+                titleEl.onclick = async () => {
+                    // If open → close it
+                    if (activeInlinePreview && activeInlinePreview.item === item) {
+                        // Collapse preview
+                        activeInlinePreview.wrapper.style.maxHeight = "0";
+                        activeInlinePreview = null;
+
+                        // Reset circle to default state
+                        circleBtn.style.backgroundColor = "var(--background-modifier-border)";
+                        circleBtn.style.color = "var(--text-normal)";
+                        circleBtn.textContent = linkCount > 0 ? linkCount : "";
+
+                        // Reset cycle index
+                        cycleIndex = 1;
+
+                        return;
+                    }
+
+                    // If closed → open it
+                    await openPreview();
+
+                    // Highlight circle when open
+                    circleBtn.style.backgroundColor = "var(--interactive-accent)";
+                    circleBtn.style.color = "white";
+
+                    // Show cycling index
+                    circleBtn.textContent = `1/${previewLinks.length}`;
+                    cycleIndex = 1;
+                };
+
+                // Circle opens preview AND cycles through matches
+                circleBtn.onclick = () => {
+                    if (!activeInlinePreview || activeInlinePreview.item !== item) return;
+                    if (previewLinks.length === 0) return;
+
+                    cycleIndex = (cycleIndex % previewLinks.length) + 1;
+                    circleBtn.textContent = `${cycleIndex}/${previewLinks.length}`;
+
+                    highlightCurrent();
+
+                    const previewEl = activeInlinePreview.preview;
+                    const target = previewLinks[cycleIndex - 1];
+
+                    if (target) {
+                        target.scrollIntoView({
+                            behavior: "smooth",
+                            block: "center"
+                        });
+                    }
+                };
+
 
             }
         }

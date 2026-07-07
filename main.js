@@ -253,8 +253,8 @@ class StepSearchView extends ItemView {
 
         // Tooltip container (hover preview)
         this.hoverBox = document.body.createEl("div");
-        this.hoverBox.style.position = "fixed";       // ⭐ required to appear above webviews
-        this.hoverBox.style.zIndex = "999999";        // ⭐ very high to beat webviews
+        this.hoverBox.style.position = "fixed";
+        this.hoverBox.style.zIndex = "999999";
         this.hoverBox.style.display = "none";
         this.hoverBox.style.maxWidth = "300px";
         this.hoverBox.style.padding = "10px";
@@ -314,21 +314,21 @@ class StepSearchView extends ItemView {
             for (const file of matchedFiles) {
                 const item = this.resultsEl.createEl("div");
                 item.style.transition = "background-color 0.15s ease";
+                item.style.padding = "4px 6px";
+                item.style.borderRadius = "2px";
                 item.addEventListener("mouseenter", () => item.style.backgroundColor = "var(--background-modifier-hover)");
                 item.addEventListener("mouseleave", () => item.style.backgroundColor = "");
-
                 item.style.display = "flex";
                 item.style.alignItems = "center";
                 item.style.gap = "6px";
-                item.style.marginBottom = "8px";
+                item.style.marginBottom = "4px";
                 item.style.fontSize = "0.9em";
                 item.style.lineHeight = "1.4";
 
                 // Expand/collapse arrow on the LEFT
                 const expandBtn = item.createEl("span", { text: ">" });
                 expandBtn.style.cursor = "pointer";
-                expandBtn.style.color = "var(--text-muted)";
-                //expandBtn.style.fontWeight = "bold";
+                expandBtn.style.color = "#71717166";
                 expandBtn.style.userSelect = "none";
 
                 // Title text (click to open note)
@@ -340,23 +340,29 @@ class StepSearchView extends ItemView {
                     this.plugin.app.workspace.openLinkText(file.path, file.path);
                 });
 
-                // Expand/collapse preview
+                // Expand/collapse preview WITH animation
                 expandBtn.addEventListener("click", async (ev) => {
                     ev.stopPropagation();
 
                     // Close previous preview if it's for another item
                     if (activeInlinePreview && activeInlinePreview.item !== item) {
-                        activeInlinePreview.el.remove();
+                        activeInlinePreview.wrapper.style.maxHeight = "0";
                         activeInlinePreview = null;
                     }
 
                     // Collapse if already open
                     if (activeInlinePreview && activeInlinePreview.item === item) {
-                        activeInlinePreview.el.remove();
+                        activeInlinePreview.wrapper.style.maxHeight = "0";
                         activeInlinePreview = null;
                         expandBtn.textContent = ">";
                         return;
                     }
+
+                    // Create wrapper for animation
+                    const wrapper = document.createElement("div");
+                    wrapper.style.overflow = "hidden";
+                    wrapper.style.maxHeight = "0";
+                    wrapper.style.transition = "max-height 0.25s ease";
 
                     // Create preview box
                     const preview = document.createElement("div");
@@ -367,13 +373,11 @@ class StepSearchView extends ItemView {
                     preview.style.boxShadow = "0 2px 6px rgba(0,0,0,0.15)";
                     preview.style.fontSize = "0.85em";
                     preview.style.lineHeight = "1.4";
-
-                    // ⭐ Make preview scrollable
                     preview.style.maxHeight = "300px";
                     preview.style.overflowY = "auto";
 
-                    // Insert preview under the item
-                    item.insertAdjacentElement("afterend", preview);
+                    wrapper.appendChild(preview);
+                    item.insertAdjacentElement("afterend", wrapper);
 
                     // Load full file
                     const fullText = await this.plugin.app.vault.read(file);
@@ -388,46 +392,57 @@ class StepSearchView extends ItemView {
                         this.plugin
                     );
 
-                    // After MarkdownRenderer.render(...)
+                    // Remove tooltip + keep links clickable
                     preview.querySelectorAll("a").forEach(a => {
-                        // Remove any title attribute (helps reduce some tooltip cases)
                         a.removeAttribute("title");
-
-                        // Keep STEP links clickable
                         a.addEventListener("click", (ev) => {
                             ev.preventDefault();
                             window.open(a.href, "_blank");
                         });
                     });
 
-                    //  Auto-scroll to the matched reference
-                    const paragraphs = fullText.split(/\n\s*\n/);
-                    let targetParagraph = null;
+                    // ⭐ Find the actual STEP link in the rendered preview
+                    let highlightEl = null;
 
-                    for (const p of paragraphs) {
-                        for (const q of queryArray) {
-                            const regex = new RegExp(`${q}(?:[.-]|&)`);
-                            if (regex.test(p)) {
-                                targetParagraph = p.trim();
-                                break;
-                            }
-                        }
-                        if (targetParagraph) break;
-                    }
+                    for (const q of queryArray) {
+                        const links = Array.from(preview.querySelectorAll("a"));
 
-                    if (targetParagraph) {
-                        const el = Array.from(preview.querySelectorAll("p, div, span"))
-                            .find(e => e.textContent.includes(targetParagraph));
+                        const match = links.find(a => a.href.includes(q));
 
-                        if (el) {
-                            el.scrollIntoView({ behavior: "smooth", block: "center" });
+                        if (match) {
+                            highlightEl = match;
+                            break;
                         }
                     }
 
-                    // Track active preview
-                    activeInlinePreview = { item, el: preview };
+                    // Highlight ONLY the link (not the paragraph)
+                    if (highlightEl) {
+                        highlightEl.style.backgroundColor = "transparent"; 
+                        highlightEl.style.outline = "1px solid var(--background-modifier-hover)";
+                        highlightEl.style.outlineOffset = "2px";           // little breathing room
+                        highlightEl.style.borderRadius = "3px";
+                    }
+
+                    // Find the paragraph/div containing the link
+                    let scrollTarget = highlightEl ? highlightEl.closest("p, div") : null;
+
+                    // ⭐ Animate open + scroll to highlight
+                    requestAnimationFrame(() => {
+                        wrapper.style.maxHeight = preview.scrollHeight + "px";
+
+                        if (scrollTarget) {
+                            setTimeout(() => {
+                                scrollTarget.scrollIntoView({ behavior: "smooth", block: "center" });
+                            }, 250); // matches your animation duration
+                        }
+                    });
+
+
+
+                    activeInlinePreview = { item, wrapper };
                     expandBtn.textContent = "v";
                 });
+
             }
         }
 
@@ -463,6 +478,7 @@ class StepSearchView extends ItemView {
         return null;
     }
 }
+
 
 
 

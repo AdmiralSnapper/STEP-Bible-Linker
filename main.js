@@ -367,8 +367,6 @@ class StepSearchView extends ItemView {
                 item.style.lineHeight = "1.4";
 
                 
-
-
                 // Circle badge (number always visible, subtle background)
                 const circleBtn = item.createEl("div");
                 circleBtn.classList.add("circle-btn");
@@ -546,12 +544,10 @@ class StepSearchView extends ItemView {
                     // Scroll to first match
                     if (previewLinks.length > 0) {
                         const firstTarget = previewLinks[0];
-                        setTimeout(() => {
-                            preview.scrollTo({
-                                top: firstTarget.offsetTop - preview.clientHeight / 2,
-                                behavior: "smooth"
-                            });
-                        }, 300);
+                        firstTarget.scrollIntoView({
+                            block: "center",
+                            behavior: "smooth"
+                        });
                     }
 
                     // Animate open
@@ -616,13 +612,11 @@ class StepSearchView extends ItemView {
                     const target = previewLinks[cycleIndex - 1];
 
                     if (target) {
-                        setTimeout(() => {
-                            previewEl.scrollTo({
-                                top: target.offsetTop - previewEl.clientHeight / 2,
-                                behavior: "smooth"
-                            });
-                        }, 30);
-                    }                   
+                        target.scrollIntoView({
+                            block: "center",
+                            behavior: "smooth"
+                        });
+                    }                  
                 };
 
                 // Hover behavior (only when dropdown is open)

@@ -3,7 +3,6 @@
   "autoCloseSearchPanel": true,
   "enabledVersions": [
     "ESV",
-    "SBLG",
     "THOT"
   ]
 }

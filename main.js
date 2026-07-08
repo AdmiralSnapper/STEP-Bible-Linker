@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, MarkdownRenderer, ItemView, Setting, requestUrl } = require('obsidian');
+const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl } = require('obsidian');
 
 //SETTINGS ======================================================================
 /**
@@ -239,6 +239,28 @@ class StepSearchView extends ItemView {
         this.queryBox.style.color = "#b9b9b9";
         this.queryBox.style.fontWeight = "bold";
 
+        // CLICK LISTENER TO OPEN BIBLE SEARCH MODAL
+        this.queryBox.addEventListener("click", async () => {
+            const { MarkdownView } = require("obsidian");
+            const plugin = this.plugin;
+
+            let prefill = "";
+            const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
+
+            if (activeView && activeView.editor) {
+                prefill = activeView.editor.getSelection() || "";
+            } else {
+                try {
+                    prefill = window.getSelection()?.toString() || "";
+                } catch {
+                    prefill = "";
+                }
+            }
+
+            plugin.openBibleSearchModal(prefill);
+        });
+
+
         // Loading indicator
         this.searchLoadingIndicator = container.createEl("div", {
             text: "Searching…"
@@ -264,6 +286,7 @@ class StepSearchView extends ItemView {
         this.hoverBox.style.fontSize = "0.85em";
         this.hoverBox.style.lineHeight = "1.4";
     }
+
 
     updateQuery(queryArray, queryReference) {
         if (this.queryBox) {
@@ -296,7 +319,7 @@ class StepSearchView extends ItemView {
 
         const matchedFiles = [];
 
-        // ⭐ PRE‑SCAN FILES FOR MATCHES + COUNT LINKS
+        // PRE‑SCAN FILES FOR MATCHES + COUNT LINKS
         for (const file of files) {
             const text = await this.plugin.app.vault.read(file);
 
@@ -343,13 +366,16 @@ class StepSearchView extends ItemView {
                 item.style.fontSize = "0.9em";
                 item.style.lineHeight = "1.4";
 
+                
+
+
                 // Circle badge (number always visible, subtle background)
                 const circleBtn = item.createEl("div");
                 circleBtn.classList.add("circle-btn");
                 circleBtn.setAttribute("data-count", linkCount);
                 circleBtn.style.width = "22px";
                 circleBtn.style.height = "22px";
-                circleBtn.style.borderRadius = "50%";
+                circleBtn.style.borderRadius = "4px";
                 circleBtn.style.flexShrink = "0";
                 circleBtn.style.display = "flex";
                 circleBtn.style.alignItems = "center";
@@ -358,12 +384,9 @@ class StepSearchView extends ItemView {
                 circleBtn.style.cursor = "pointer";
                 circleBtn.style.userSelect = "none";
                 circleBtn.style.transition = "all 0.15s ease";
-
-                // Default (dropdown closed)
                 circleBtn.style.backgroundColor = "var(--background-modifier-border)";
                 circleBtn.style.color = "var(--text-normal)";
                 circleBtn.textContent = linkCount > 0 ? linkCount : "";
-
                 circleBtn.onmouseenter = () => {
                     // Only highlight if dropdown is open
                     if (activeInlinePreview && activeInlinePreview.item === item) {
@@ -371,7 +394,6 @@ class StepSearchView extends ItemView {
                         circleBtn.style.color = "white";
                     }
                 };
-
                 circleBtn.onmouseleave = () => {
                     // Only un-highlight if dropdown is open
                     if (activeInlinePreview && activeInlinePreview.item === item) {
@@ -380,11 +402,34 @@ class StepSearchView extends ItemView {
                     }
                 };
 
-
                 // Title text (click to open note)
                 const titleEl = item.createEl("span", { text: file.basename });
                 titleEl.style.cursor = "pointer";
                 titleEl.style.flexGrow = "1";
+
+                // Right‑side open button
+                const openBtn = item.createEl("div");
+                openBtn.innerHTML = `<span class="external-link"></span>`;  // ← replace ICON_NAME
+                openBtn.style.marginLeft = "auto"; // pushes icon to the far right
+                openBtn.style.cursor = "pointer";
+                openBtn.style.fontSize = "1.1em";
+                openBtn.style.color = "var(--interactive-accent)";
+                openBtn.style.opacity = "0.85";
+                openBtn.style.padding = "2px 4px";
+                openBtn.style.borderRadius = "4px";
+                openBtn.onmouseenter = () => {
+                    openBtn.style.opacity = "1";
+                    openBtn.style.backgroundColor = "var(--background-modifier-hover)";
+                };
+                openBtn.onmouseleave = () => {
+                    openBtn.style.opacity = "0.85";
+                    openBtn.style.backgroundColor = "";
+                };
+                openBtn.onclick = () => {
+                    if (file) {
+                        this.plugin.app.workspace.getLeaf(true).openFile(file);
+                    }
+                };
 
                 // Shared state for preview + cycling
                 let previewLinks = [];
@@ -517,7 +562,6 @@ class StepSearchView extends ItemView {
                     activeInlinePreview = { item, wrapper, preview };
                 };
 
-
                 // Title click toggles dropdown
                 titleEl.onclick = async () => {
 
@@ -581,8 +625,6 @@ class StepSearchView extends ItemView {
                     }                   
                 };
 
-
-
                 // Hover behavior (only when dropdown is open)
                 circleBtn.onmouseenter = () => {
                     if (activeInlinePreview && activeInlinePreview.item === item) {
@@ -597,9 +639,6 @@ class StepSearchView extends ItemView {
                         circleBtn.style.color = "var(--text-normal)";
                     }
                 };
-
-
-
             }
         }
 
@@ -636,8 +675,73 @@ class StepSearchView extends ItemView {
     }
 }
 
+class BibleSearchModal extends Modal {
+    constructor(app, plugin, onSubmit, prefill = "") {
+        super(app);
+        this.plugin = plugin;
+        this.onSubmit = onSubmit;
+        this.prefill = prefill;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+
+        // Your normal content
+        contentEl.style.display = "flex";
+        contentEl.style.flexDirection = "column";
+        contentEl.style.gap = "14px";
+        contentEl.style.padding = "12px";
+
+        const input = contentEl.createEl("input", {
+            type: "text",
+            placeholder: "Enter Reference"
+        });
+
+        input.style.width = "100%";
+        input.style.margin = "0";
+        input.style.padding = "10px 10px";
+        input.style.fontSize = "14px";
+        input.style.fontWeight = "bold";
+        input.style.borderRadius = "4px";
+        input.style.border = "1px solid var(--interactive-accent)";
+
+        if (this.prefill && this.prefill.trim()) {
+            input.value = this.prefill.trim();
+            input.select();
+        }
+
+        this._keydownHandler = async (evt) => {
+            if (evt.key === "Enter") {
+                evt.preventDefault();
+                evt.stopPropagation();
+
+                const trimmed = (input.value || "").trim();
+                const regex = this.plugin.buildReferenceRegex();
+                const match = trimmed.match(regex);
+
+                if (!match || match[0].trim() !== trimmed) {
+                    new Notice("Not a valid Bible reference.");
+                    return;
+                }
+
+                this.onSubmit(trimmed);
+                this.close();
+            }
+        };
+
+        input.addEventListener("keydown", this._keydownHandler);
+        input.focus();
+    }
 
 
+    onClose() {
+        const input = this.contentEl.querySelector("input");
+        if (input && this._keydownHandler) {
+            input.removeEventListener("keydown", this._keydownHandler);
+        }
+        this.contentEl.empty();
+    }
+}
 
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
@@ -1007,156 +1111,31 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        // MODAL FOR REFERENCE SEARCH
         this.addCommand({
             id: "step-bible-search",
             name: "Search Bible Reference…",
 
-            callback: () => {
-                const { Modal, requestUrl, MarkdownView } = require("obsidian");
-                const plugin = this;
+            callback: async () => {
+                const { MarkdownView } = require("obsidian");
 
-                class BibleSearchModal extends Modal {
-                    constructor(app, plugin, onSubmit, prefill = "") {
-                        super(app);
-                        this.plugin = plugin;
-                        this.onSubmit = onSubmit;
-                        this.prefill = prefill;
-                    }
-
-                    onOpen() {
-                        const { contentEl } = this;
-
-                        contentEl.style.display = "flex";
-                        contentEl.style.flexDirection = "column";
-                        contentEl.style.gap = "14px";
-                        contentEl.style.padding = "12px";
-
-                        const title = contentEl.createEl("h3", { text: "Enter Bible Reference" });
-                        title.style.margin = "0";
-                        title.style.padding = "0";
-                        title.style.fontSize = "16px";
-
-                        const input = contentEl.createEl("input", {
-                            type: "text",
-                            placeholder: "reference here"
-                        });
-
-                        input.style.width = "100%";
-                        input.style.margin = "0";
-                        input.style.padding = "10px 8px";
-                        input.style.fontSize = "14px";
-                        input.style.borderRadius = "6px";
-
-                        const hint = contentEl.createEl("div", {
-                            text: "Type bible for all scripture references."
-                        });
-                        hint.style.fontSize = "12px";
-                        hint.style.margin = "0";
-                        hint.style.padding = "0";
-
-                        const isDark = document.body.classList.contains("theme-dark");
-                        hint.style.color = isDark ? "rgba(255, 255, 255, 0.07)" : "rgba(0, 0, 0, 0)";
-                        hint.style.opacity = "1";
-
-                        if (this.prefill && this.prefill.trim()) {
-                            input.value = this.prefill.trim();
-                            input.select();
-                        }
-
-                        this._keydownHandler = async (evt) => {
-                            const rawValue = input.value || "";
-                            const trimmed = rawValue.trim();
-
-                            if(evt.key === "Enter") {
-                                evt.preventDefault();
-                                evt.stopPropagation();
-
-                                const rawValue = input.value || "";
-                                const trimmed = rawValue.trim();
-
-                                // Validate using your existing regex
-                                const regex = this.plugin.buildReferenceRegex();
-                                const match = trimmed.match(regex);
-
-                                // Reject if no match OR match does not equal entire input
-                                if (!match || match[0].trim() !== trimmed) {
-                                    new Notice("Not a valid Bible reference.");
-                                    return;
-                                }
-
-                                // Submit
-                                this.onSubmit(input.value);
-
-                                // Close modal
-                                this.close();
-                            }
-
-                        };
-
-                        input.addEventListener("keydown", this._keydownHandler);
-                        input.focus();
-                    }
-
-                    onClose() {
-                        const input = this.contentEl.querySelector("input");
-                        if (input && this._keydownHandler) {
-                            input.removeEventListener("keydown", this._keydownHandler);
-                        }
-                        this.contentEl.empty();
-                    }
-                }
-
-                // Determine prefill
                 let prefill = "";
-                const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
+                const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
 
                 if (activeView && activeView.editor) {
                     prefill = activeView.editor.getSelection() || "";
                 } else {
                     try {
-                        const domSel = window.getSelection()?.toString() || "";
-                        prefill = domSel || "";
+                        prefill = window.getSelection()?.toString() || "";
                     } catch {
                         prefill = "";
                     }
                 }
 
-                const modal = new BibleSearchModal(this.app, plugin, async (refText) => {
-
-                    const result = this.buildStepLink(refText);
-                    if (!result) return;
-
-                    // Determine whether local STEP is running
-                    const localIsUp = await this.isLocalStepRunning();
-
-                    let urlToOpen;
-                    if (localIsUp) {
-                        try {
-                            const res = await requestUrl({
-                                url: result.finalUrl,
-                                method: "GET",
-                                throw: false
-                            });
-
-                            if (res.status >= 200 && res.status < 400) {
-                                urlToOpen = result.finalUrl;
-                            } else {
-                                urlToOpen = this.rewriteToOnline(result.finalUrl);
-                            }
-                        } catch {
-                            urlToOpen = this.rewriteToOnline(result.finalUrl);
-                        }
-                    } else {
-                        urlToOpen = this.rewriteToOnline(result.finalUrl);
-                    }
-
-                    window.open(urlToOpen, "_blank");
-                }, prefill);
-
-                modal.open();
+                this.openBibleSearchModal(prefill);
             }
         });
+
+
 
     }
 
@@ -1333,6 +1312,50 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const parts = refs.map(r => `reference=${r}`);
         return parts; // ← array of strings
     }
+
+    // OPENS THE BIBLE SEARCH MODAL WITH OPTIONAL PREFILL
+    async openBibleSearchModal(prefill = "") {
+        const { requestUrl } = require("obsidian");
+        const plugin = this;
+
+        const modal = new BibleSearchModal(
+            this.app,
+            plugin,
+            async (refText) => {
+                const result = plugin.buildStepLink(refText);
+                if (!result) return;
+
+                const localIsUp = await plugin.isLocalStepRunning();
+                let urlToOpen;
+
+                if (localIsUp) {
+                    try {
+                        const res = await requestUrl({
+                            url: result.finalUrl,
+                            method: "GET",
+                            throw: false
+                        });
+
+                        if (res.status >= 200 && res.status < 400) {
+                            urlToOpen = result.finalUrl;
+                        } else {
+                            urlToOpen = plugin.rewriteToOnline(result.finalUrl);
+                        }
+                    } catch {
+                        urlToOpen = plugin.rewriteToOnline(result.finalUrl);
+                    }
+                } else {
+                    urlToOpen = plugin.rewriteToOnline(result.finalUrl);
+                }
+
+                window.open(urlToOpen, "_blank");
+            },
+            prefill
+        );
+
+        modal.open();
+    }
+
 
 //MISCELLANEOUS HELPERS ====================================================================================
 

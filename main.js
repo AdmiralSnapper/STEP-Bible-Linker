@@ -5,6 +5,7 @@ const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, re
  * @typedef {Object} StepBibleLinkerSettings
  * @property {boolean} autoSyncOnNavigation - If true, STEP auto-syncs on navigation
  * @property {boolean} autoCloseSearchPanel - If true, the STEP search panel auto-closes when switching to a non-STEP tab
+ * @property {boolean} useLocalUrlPrefix - If true, use local URL prefix.
  * @property {string[]} enabledVersions - List of STEP Bible versions to include in generated links
  */
 
@@ -13,6 +14,7 @@ const DEFAULT_SETTINGS = {
     autoSyncOnNavigation: true,
     autoCloseSearchPanel: true,
     enabledVersions: ["ESV", "THOT", "SBLG"],
+    useLocalUrlPrefix: true,
 };
 
 class StepBibleLinkerSettingTab extends PluginSettingTab {
@@ -50,6 +52,24 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     });
             });
+
+        new Setting(containerEl)
+            .setName("Use Local STEP Server")
+            .setDesc("Toggle between local STEP server and online STEP Bible.")
+            .addToggle(toggle => {
+                toggle
+                    .setValue(this.plugin.settings.useLocalStepServer)
+                    .onChange(async (value) => {
+                        this.plugin.settings.useLocalStepServer = value;
+                        await this.plugin.saveSettings();
+
+                        // Optional: rewrite links to match new prefix
+                        await this.plugin.toggleLocaltoOnline();
+
+                        this.display();
+                    });
+            });
+
 
         //BIBLE VERSION TOGGLES ==========================================================================
         containerEl.createEl("h3", { text: "Bible Versions Enabled" });
@@ -749,7 +769,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // Load settings and add settings tab
         await this.loadSettings();
         this.addSettingTab(new StepBibleLinkerSettingTab(this.app, this));
-
+        
         // REGISTER SEARCH VIEW
         this.registerView(
             STEP_SEARCH_VIEW,
@@ -954,9 +974,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             // 2. Reading mode <a>
             if (!linkUrl) {
-                const a = targetEl.closest('a[href]');
-                if (a && a.href.startsWith('http://localhost:8989/')) linkUrl = a.href;
+                const a = targetEl.closest("a[href]");
+                if (a) {
+                    const href = a.href;
+
+                    // Detect localhost STEP link
+                    if (href.startsWith(this.urlPrefix)) {
+                        linkUrl = href;
+                    }
+                }
             }
+
 
             // 3. Collapsed Live Preview
             if (!linkUrl) {
@@ -974,7 +1002,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
             }
 
-            if (!linkUrl.startsWith('http://localhost:8989/')) return;
+            if (
+                !(
+                    linkUrl.startsWith("http://localhost:8989/") ||
+                    linkUrl.startsWith("https://www.stepbible.org/")
+                )
+            ) return;
+
 
             // If a popover is already open, close it
             if (this.activePopover) {
@@ -1360,7 +1394,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             .map(v => `version=${v}`)
             .join("@");
 
-        const urlPrefix = `http://localhost:8989/?q=${versionPart}@reference=`;
+        const urlBase = `${this.urlPrefix}?q=${versionPart}@reference=`;
         const urlSuffix = "&options=GNVUH&display=COLUMN";
 
         // Normalize input
@@ -1379,7 +1413,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             return {
                 expandedText: book,
-                finalUrl: `${urlPrefix}${book}${urlSuffix}`
+                finalUrl: `${urlBase}${book}${urlSuffix}`
             };
         }
 
@@ -1389,7 +1423,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         return {
             expandedText: parsingResult.expandedText,
-            finalUrl: `${urlPrefix}${parsingResult.serverRef}${urlSuffix}`
+            finalUrl: `${urlBase}${parsingResult.serverRef}${urlSuffix}`
         };
     }
 
@@ -2553,11 +2587,51 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         new Notice("STEP Bible links updated.");
     }
+    async toggleLocaltoOnline() {
+        const vault = this.app.vault;
+        const mdFiles = vault.getMarkdownFiles();
+
+        // Determine target prefix based on setting
+        const targetPrefix = this.urlPrefix; // either localhost or online
+
+        // Determine the opposite prefix
+        const onlinePrefix = "https://www.stepbible.org/";
+        const localPrefix = "http://localhost:8989/";
+
+        const sourcePrefix = targetPrefix === localPrefix
+            ? onlinePrefix
+            : localPrefix;
+
+        for (const file of mdFiles) {
+            const text = await vault.read(file);
+
+            // Replace ALL occurrences of the source prefix with the target prefix
+            const replaced = text.replace(
+                new RegExp(sourcePrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
+                targetPrefix
+            );
+
+            if (replaced !== text) {
+                await vault.modify(file, replaced);
+            }
+        }
+
+        this.urlPrefix = targetPrefix;
+
+        new Notice("STEP Bible Links Updated.");
+    }
+
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        this.urlPrefix = this.settings.useLocalUrlPrefix
+            ? "http://localhost:8989/"
+            : "https://www.stepbible.org/";
     } 
     async saveSettings() {
         await this.saveData(this.settings);
+        this.urlPrefix = this.settings.useLocalStepServer
+            ? "http://localhost:8989/"
+            : "https://www.stepbible.org/";
     }
 
     onunload() {

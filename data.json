@@ -4,5 +4,7 @@
   "enabledVersions": [
     "ESV",
     "THOT"
-  ]
+  ],
+  "useLocalUrlPrefix": true,
+  "useLocalStepServer": true
 }

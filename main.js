@@ -277,8 +277,11 @@ class StepSearchView extends ItemView {
                 }
             }
 
-            plugin.openBibleSearchModal(prefill);
+            // NEW: open the refactored modal directly
+            const modal = new StepBibleSearchModal(plugin.app, plugin, prefill);
+            modal.open();
         });
+
 
 
         // Loading indicator
@@ -307,18 +310,19 @@ class StepSearchView extends ItemView {
         this.hoverBox.style.lineHeight = "1.4";
     }
 
-
-    updateQuery(queryArray, queryReference) {
+    updateQuery(queryRef, displayRef) {
+        // Update the query box to contain the formatted reference
         if (this.queryBox) {
-            this.queryBox.value = queryReference;
+            this.queryBox.value = displayRef;
         }
 
-        this.runSearch(queryArray);
+        // Run a search based on the query array.
+        this.runSearch(queryRef);
     }
 
-    async runSearch(queryArray) {
+    async runSearch(queryRef) {
         if (this.searchInProgress) {
-            this.pendingQuery = queryArray;
+            this.pendingQuery = queryRef;
             return;
         }
 
@@ -326,7 +330,7 @@ class StepSearchView extends ItemView {
         this.showLoading();
         this.resultsEl.empty();
 
-        if (!Array.isArray(queryArray) || queryArray.length === 0) {
+        if (!Array.isArray(queryRef) || queryRef.length === 0) {
             this.resultsEl.createEl("div", { text: "No query." });
             this.searchInProgress = false;
             return;
@@ -335,7 +339,7 @@ class StepSearchView extends ItemView {
         const files = this.plugin.app.vault.getMarkdownFiles();
 
         // Build regex list once
-        const regexList = queryArray.map(q => new RegExp(`${q}(?:[.:\\-]|&)`));
+        const regexList = queryRef.map(q => new RegExp(`${q}(?:[.:\\-]|&)`));
 
         const matchedFiles = [];
 
@@ -689,18 +693,35 @@ class StepSearchView extends ItemView {
     }
 }
 
-class BibleSearchModal extends Modal {
-    constructor(app, plugin, onSubmit, prefill = "") {
+class StepBibleSearchModal extends Modal {
+    constructor(app, plugin, prefill = "") {
         super(app);
         this.plugin = plugin;
-        this.onSubmit = onSubmit;
         this.prefill = prefill;
+    }
+
+    async openStepUrl(url) {
+        const localUp = await this.plugin.isLocalStepRunning();
+        if (!localUp) {
+            url = this.plugin.localUrl_onlineUrl(url);
+        } else {
+            try {
+                const { requestUrl } = require("obsidian");
+                const res = await requestUrl({ url, method: "GET", throw: false });
+                if (!(res.status >= 200 && res.status < 400)) {
+                    url = this.plugin.localUrl_onlineUrl(url);
+                }
+            } catch {
+                url = this.plugin.localUrl_onlineUrl(url);
+            }
+        }
+
+        window.open(url, "_blank");
     }
 
     onOpen() {
         const { contentEl } = this;
 
-        // Your normal content
         contentEl.style.display = "flex";
         contentEl.style.flexDirection = "column";
         contentEl.style.gap = "14px";
@@ -729,16 +750,22 @@ class BibleSearchModal extends Modal {
                 evt.preventDefault();
                 evt.stopPropagation();
 
-                const trimmed = (input.value || "").trim();
-                const regex = this.plugin.buildReferenceRegex();
-                const match = trimmed.match(regex);
+                const inputRef = (input.value || "").trim();
+                const regex = this.plugin.buildInputRefRegex();
+                const match = inputRef.match(regex);
 
-                if (!match || match[0].trim() !== trimmed) {
+                //Check if input ref matches regex
+                if (!match || match[0].trim() !== inputRef) {
                     new Notice("Not a valid Bible reference.");
                     return;
                 }
 
-                this.onSubmit(trimmed);
+                const urlRef = this.plugin.inputRef_urlRef(inputRef);
+                const url = this.plugin.urlRef_url(urlRef);
+
+                console.log(url);
+                if (url) await this.openStepUrl(url);
+
                 this.close();
             }
         };
@@ -746,7 +773,6 @@ class BibleSearchModal extends Modal {
         input.addEventListener("keydown", this._keydownHandler);
         input.focus();
     }
-
 
     onClose() {
         const input = this.contentEl.querySelector("input");
@@ -757,12 +783,14 @@ class BibleSearchModal extends Modal {
     }
 }
 
+
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
     settings;
 
     async onload() {
+
         console.log('STEP Bible Linker Loaded.');
         this.activePopover = null;
 
@@ -776,51 +804,71 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             (leaf) => new StepSearchView(leaf, this)
         );
 
+        // DETECT AND LINK INPUT REF AT CURSOR 
+        this.addCommand({
+            id: 'auto-link-step-ref',
+            name: 'Link Reference at Cursor',
+            editorCallback: (editor) => {
+
+                const cursor = editor.getCursor();
+                const line = editor.getLine(cursor.line);
+
+                // NEW: use detectInputRef()
+                const detected = this.detectInputRef(line, cursor.ch);
+                if (!detected) return;
+
+                const { inputRef, start, end } = detected;
+
+                const before = line.slice(0, start);
+                const after = line.slice(end);
+
+                // Already linked?
+                if (before.endsWith("[") && after.startsWith("]")) return;
+
+                const urlRef = this.inputRef_urlRef(inputRef);
+                const displayRef = this.urlRef_displayRef(urlRef);
+                const url = this.urlRef_url(urlRef);
+
+                // Build the fully compiled STEP link
+                const stepLink = `([${displayRef}](${url}))`;
+                if (!stepLink) return;
+
+                // Replace with Obsidian-style link
+                const newLine = line.slice(0, start) + stepLink + line.slice(end);
+
+                editor.setLine(cursor.line, newLine);
+            }
+        });
+
         // SEARCH BASED ON STEP URL
         this.addCommand({
             id: "step-sync-search-panel",
             name: "Update STEP Search Panel",
             callback: async () => {
 
-                //
-                // 1. GET ACTIVE LEAF — same as listener
-                //
                 const leaf = this.app.workspace.activeLeaf;
                 if (!leaf) return;
 
                 const view = leaf.view;
                 if (!view) return;
 
-                // Only handle WebViewer tabs
                 if (view.getViewType?.() !== "webviewer") return;
 
-                //
-                // 2. GET URL — same pattern as listener
-                //
+                // Get URL from view or webview fallback
                 let url = view.url;
-
-                // Fallback: STEP internal navigation sometimes updates only the webview
                 if (view.webview?.getURL) {
                     try {
                         url = view.webview.getURL();
                     } catch { }
                 }
 
-                if (!url || !url.includes("reference=")) return;
+                if (!url) return;
 
-                //
-                // 3. EXTRACT REF + BUILD QUERY — identical to listener
-                //
-                const ref = this.extractReferenceFromUrl(url);
-                if (!ref) return;
+                // FIX: ensure webviewEl exists
+                const webviewEl = view.webview;
+                if (!webviewEl) return;
 
-                const query = this.buildSearchQuery(ref);
-
-                //
-                // 4. UPDATE SEARCH PANEL — identical to listener
-                //
-                const searchView = await this.openSearchLeaf();
-                await this.setSearchLeafQuery(query, searchView);
+                await this.searchWebviewUrl(url, webviewEl);
 
                 console.log("STEP Sync: Manual search panel update complete.");
             }
@@ -829,7 +877,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // SEARCH BASED ON STEP URL AUTOMATICALLY
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
-                console.log("active leaf changed");
                 if (!this.settings.autoSyncOnNavigation) return;
 
                 const view = leaf?.view;
@@ -839,26 +886,23 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const webviewEl = view.webview;
                 if (!webviewEl) return;
 
-                // Always reset dedupe on tab switch
+                // Reset dedupe on tab switch
                 webviewEl.__lastProcessedRef = null;
 
                 // TAB SWITCHING — view.url is correct here
-                const tabUrl = view.url;
-                await this.handleStepReference(webviewEl, tabUrl);
+                await this.searchWebviewUrl(view.url, webviewEl);
 
                 //
                 // ALWAYS attach listeners fresh — WebView is recreated on tab switch
                 //
                 webviewEl.addEventListener("did-finish-load", async () => {
-                    //console.log("Finished load");
                     const currentUrl = webviewEl.getURL();
-                    await this.handleStepReference(webviewEl, currentUrl);
+                    await this.searchWebviewUrl(currentUrl, webviewEl);
                 });
 
                 webviewEl.addEventListener("did-navigate-in-page", async () => {
-                    //console.log("In-page navigation");
                     const currentUrl = webviewEl.getURL();
-                    await this.handleStepReference(webviewEl, currentUrl);
+                    await this.searchWebviewUrl(currentUrl, webviewEl);
                 });
             })
         );
@@ -883,14 +927,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 // If the focused tab is NOT a webviewer → close search panel
                 if (view.getViewType?.() !== "webviewer") {
-                    this.closeSearchLeaf();
+                    this.minimiseLeftLeaf();
                     return;
                 }
 
                 // It's a webviewer — check URL
                 const webviewEl = view.webview;
                 if (!webviewEl) {
-                    this.closeSearchLeaf();
+                    this.minimiseLeftLeaf();
                     return;
                 }
 
@@ -905,7 +949,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 // If URL does NOT contain reference= → close search panel
                 if (!url || !url.includes("reference=")) {
-                    this.closeSearchLeaf();
+                    this.minimiseLeftLeaf();
                     return;
                 }
 
@@ -913,110 +957,51 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             })
         );
 
-        // LINK REFERENCE AT CURSOR 
-        this.addCommand({
-            id: 'auto-link-step-ref',
-            name: 'Link Reference at Cursor',
-            editorCallback: (editor) => {
-                //Get cursor
-                const cursor = editor.getCursor();
-                //Get text line with cursor
-                const line = editor.getLine(cursor.line);
-
-                const refRegex = this.buildReferenceRegex();
-                let match = null, start = 0, end = 0;
-
-                let m;
-                //While there is a verse in the line:
-                while ((m = refRegex.exec(line)) !== null) {
-                    const mStart = m.index;
-                    const mEnd = mStart + m[0].length;
-
-                    if (cursor.ch >= mStart && cursor.ch <= mEnd) {
-                        match = m[0];
-                        start = mStart;
-                        end = mEnd;
-                        break;
-                    }
-                }
-                //If no match, return.
-                if (!match) return;
-
-                const before = line.slice(0, start);
-                const after = line.slice(end);
-                if (before.endsWith("[") && after.startsWith("]")) return;
-
-                //Build a URL from the match
-                const result = this.buildStepLink(match);
-                if (!result) return;
-
-                //Replace the text with the correct link format. 
-                const replacement = `([${result.expandedText}](${result.finalUrl}))`;
-                const newLine = line.slice(0, start) + replacement + line.slice(end);
-
-                editor.setLine(cursor.line, newLine);
-            }
-        });
-
         // HOVERING HANDLER
-        this.registerDomEvent(document, 'mouseover', async (evt) => {
+        this.registerDomEvent(document, "mouseover", async (evt) => {
             const targetEl = evt.target;
             if (!targetEl) return;
 
-            let linkUrl = "";
+            let url = "";
 
-            // 1. Expanded link in editor
-            const lineParent = targetEl.closest('.cm-line');
+            const lineParent = targetEl.closest(".cm-line");
             if (lineParent) {
-                const m = lineParent.textContent.match(/https?:\/\/localhost:8989\/[^\s)]+/);
-                if (m) linkUrl = m[0];
+                const m = lineParent.textContent.match(/https?:\/\/[^\s)]+/);
+                if (m) url = m[0];
             }
 
-            // 2. Reading mode <a>
-            if (!linkUrl) {
+            if (!url) {
                 const a = targetEl.closest("a[href]");
-                if (a) {
-                    const href = a.href;
-
-                    // Detect localhost STEP link
-                    if (href.startsWith(this.urlPrefix)) {
-                        linkUrl = href;
-                    }
+                if (a && a.href.startsWith(this.urlPrefix)) {
+                    url = a.href;
                 }
             }
 
-
-            // 3. Collapsed Live Preview
-            if (!linkUrl) {
-                const u = targetEl.closest('.cm-underline');
+            if (!url) {
+                const u = targetEl.closest(".cm-underline");
                 if (u) {
                     const t = u.textContent.trim();
-
                     const refPattern =
                         /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*(?:\s+\d+(?::\d+)?(?:\s*-\s*\d+(?::\d+)?)?)?$/;
 
                     if (refPattern.test(t)) {
-                        const result = this.buildStepLink(t);
-                        if (result) linkUrl = result.finalUrl;
+                        const urlRef = this.inputRef_urlRef(t);
+                        if (urlRef) {
+                            const builtUrl = this.urlRef_url(urlRef);
+                            if (builtUrl) url = builtUrl;
+                        }
                     }
                 }
             }
 
-            if (
-                !(
-                    linkUrl.startsWith("http://localhost:8989/") ||
-                    linkUrl.startsWith("https://www.stepbible.org/")
-                )
-            ) return;
 
+            if (!url || !url.startsWith(this.urlPrefix)) return;
 
-            // If a popover is already open, close it
             if (this.activePopover) {
                 this.activePopover.remove();
                 this.activePopover = null;
             }
 
-            // Create popover (initially hidden off-screen)
             const pop = document.createElement("div");
             pop.classList.add("step-popover");
             Object.assign(pop.style, {
@@ -1024,7 +1009,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 left: "-9999px",
                 top: "-9999px",
                 visibility: "hidden",
-
                 backgroundColor: "#323232",
                 border: "1px solid var(--border-color)",
                 borderRadius: "6px",
@@ -1035,7 +1019,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 boxShadow: "0 4px 14px rgba(0,0,0,0.25)",
                 zIndex: "1000000",
                 color: "#d6d6d6",
-
                 fontSize: "13.5px",
                 lineHeight: "1.6",
                 fontFamily: "var(--font-interface)"
@@ -1044,23 +1027,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             pop.innerHTML = "<i>Loading STEP Bible…</i>";
             document.body.appendChild(pop);
 
-            // Measure BEFORE showing
             const rect = pop.getBoundingClientRect();
-
-            // Decide left/right placement BEFORE revealing
             let leftPos = evt.clientX + 15;
             if (leftPos + rect.width > window.innerWidth) {
                 leftPos = evt.clientX - rect.width - 15;
             }
 
-            // Apply final position
             pop.style.left = `${leftPos}px`;
             pop.style.top = `${evt.clientY + 15}px`;
             pop.style.visibility = "visible";
 
             this.activePopover = pop;
 
-            // Hide logic
             let hideTimeout = null;
             const cancelHide = () => {
                 if (hideTimeout) clearTimeout(hideTimeout);
@@ -1074,50 +1052,70 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }, 200);
             };
 
-            // Attach listeners
             requestAnimationFrame(() => {
                 targetEl.addEventListener("mouseleave", scheduleHide, { once: true });
                 pop.addEventListener("mouseenter", cancelHide);
                 pop.addEventListener("mouseleave", scheduleHide);
             });
 
-            // Fetch STEP text
             try {
                 if (!(await this.isLocalStepRunning())) {
-                    linkUrl = this.rewriteToOnline(linkUrl);
+                    url = this.localUrl_onlineUrl(url);
                 }
 
-                const serverRef = this.extractReferenceFromUrl(linkUrl);
-                if (!serverRef) return;
+                const urlRef = this.url_urlRef(url);
+                if (!urlRef) return;
 
-                // BOOK-ONLY HOVER HANDLING
-                if (!serverRef.includes(".")) {
-                    const info = this.getBookOverview(serverRef);
+                //If only a book
+                if (!urlRef.includes(".")) {
+                    const info = this.getBookOverview(urlRef);
 
                     if (info) {
                         pop.innerHTML = `
-                    <b>${info.name}</b><br>
-                    ${info.chapters} chapters<br><br>
-                    <i>Author:</i> ${info.author}<br>
-                    <i>Location:</i> ${info.location}<br>
-                    <i>Date:</i> ${info.date}<br><br>
-                    ${info.synopsis}
-                `;
+                            <b>${info.name}</b><br>
+                            ${info.chapters} chapters<br><br>
+                            <i>Author:</i> ${info.author}<br>
+                            <i>Location:</i> ${info.location}<br>
+                            <i>Date:</i> ${info.date}<br><br>
+                            ${info.synopsis}
+                         `;
                         return;
                     }
 
-                    pop.innerHTML = `<b>${serverRef}</b><br>No overview available.`;
+                    pop.innerHTML = `<b>${urlRef}</b><br>No overview available.`;
                     return;
                 }
 
-                const verseRefs = this.expandServerRefToVerseList(serverRef);
+                const verseRefs = this.urlRef_verseListArray(urlRef);
 
                 let combined = "";
                 const seen = new Set();
 
                 for (const vRef of verseRefs) {
-                    const verseUrl = this.buildUrlForRef(linkUrl, vRef);
-                    const verseText = await this.fetchSingleVerseFromTitle(verseUrl);
+                    const verseUrl = url.includes("reference=")
+                        ? url.replace(/reference=[^&]+/, `reference=${encodeURIComponent(vRef)}`)
+                        : url;
+
+                    const response = await requestUrl({ url: verseUrl });
+                    const html = response.text;
+
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(html, "text/html");
+
+                    const title = doc.querySelector("title")?.textContent || "";
+                    const parts = title.split("|").map(p => p.trim());
+
+                    let verseText = "";
+                    if (parts.length >= 4) verseText = parts[3];
+
+                    verseText = verseText
+                        .replace(/\s+/g, " ")
+                        .replace(/\s+([,;:.!?])/g, "$1")
+                        .replace(/\s+\)/g, ")")
+                        .replace(/\(\s+/g, "(")
+                        .replace(/\s*,\s*$/g, "")
+                        .trim();
+
                     if (!verseText || seen.has(verseText)) continue;
                     seen.add(verseText);
 
@@ -1127,7 +1125,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 pop.innerHTML = combined || "<p><i>No English text found.</i></p>";
 
-                // Add bottom padding only if scrollable
                 requestAnimationFrame(() => {
                     if (pop.scrollHeight > pop.clientHeight) {
                         pop.style.paddingBottom = "24px";
@@ -1139,17 +1136,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
+        // OPEN SEARCH MODAL
         this.addCommand({
             id: "step-bible-search",
             name: "Search Bible Reference…",
-
-            callback: async () => {
+            callback: () => {
                 const { MarkdownView } = require("obsidian");
 
                 let prefill = "";
                 const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
 
-                if (activeView && activeView.editor) {
+                if (activeView?.editor) {
                     prefill = activeView.editor.getSelection() || "";
                 } else {
                     try {
@@ -1159,42 +1156,67 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     }
                 }
 
-                this.openBibleSearchModal(prefill);
+                new StepBibleSearchModal(this.app, this, prefill).open();
             }
         });
 
-
-
     }
 
-//SEARCH HELPERS ====================================================================================
+    // INPUT DETECTION =======================================================================================
+    detectInputRef(line, cursorCh) {
+        const refRegex = this.buildInputRefRegex();
 
-    // HANDLE STEP REFERENCE FROM WEBVIEW URL
-    async handleStepReference(webviewEl, url) {
+        let m;
+        while ((m = refRegex.exec(line)) !== null) {
+            const mStart = m.index;
+            const mEnd = mStart + m[0].length;
+
+            if (cursorCh >= mStart && cursorCh <= mEnd) {
+                return {
+                    inputRef: m[0],
+                    start: mStart,
+                    end: mEnd
+                };
+            }
+        }
+
+        return null;
+    }
+    buildInputRefRegex() {
+        const books = this.getAllBookPatterns();
+
+        // Book group
+        const bookGroup = `(?:${books.join("|")})`;
+
+        // Chapter/verse/range
+        const cv = `\\d+(?:[:.]\\d+)?`;
+        const range = `${cv}(?:\\s*-\\s*${cv})?`;
+
+        // Full pattern:
+        // - Book only
+        // - Book + chapter/verse/range
+        const pattern = `${bookGroup}(?:\\s+${range})?`;
+
+        return new RegExp(pattern, "gi");
+    }
+    
+    // SEARCH HELPERS =========================================================================================
+    async searchWebviewUrl(url, webviewEl) {
         if (!url || !url.includes("reference=")) return;
 
-        const ref = this.extractReferenceFromUrl(url);
-        if (!ref) return;
+        const urlRef = this.url_urlRef(url);
+        if (!urlRef) return;
 
-        // DEDUPE: only skip if this exact ref was already processed
-        if (webviewEl.__lastProcessedRef === ref) return;
-        webviewEl.__lastProcessedRef = ref;
+        if (webviewEl.__lastProcessedRef === urlRef) return;
+        webviewEl.__lastProcessedRef = urlRef;
 
-        const queryArray = this.buildSearchQuery(ref);
-        const queryReference = this.buildSearchQueryReference(ref);
-        const searchView = await this.openSearchLeaf();
-        searchView.updateQuery(queryArray, queryReference);
-    }
+        const queryRef = this.urlRef_queryRef(urlRef);
+        const displayRef = this.urlRef_displayRef(urlRef);
 
-    // OPEN THE SEARCH LEAF, CREATING IT IF NECESSARY
-    async openSearchLeaf() {
-        // Expand left sidebar
         this.app.workspace.leftSplit?.expand();
 
-        // Try to find an existing STEP search leaf
         let leaf = this.app.workspace.getLeavesOfType("step-search-view")[0];
 
-        // If none exists, create one
         if (!leaf) {
             leaf = this.app.workspace.getLeftLeaf(false);
             await leaf.setViewState({
@@ -1203,17 +1225,24 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             });
         }
 
-        // Focus the leaf
         this.app.workspace.setActiveLeaf(leaf, { focus: false });
 
-        return leaf.view;
-    }
+        let searchView = leaf.view;
 
-    // CLOSE THE SEARCH LEAF IF IT EXISTS
-    closeSearchLeaf() {
+        for (let i = 0; i < 10; i++) {
+            if (typeof searchView.updateQuery === "function") break;
+            await new Promise(r => requestAnimationFrame(r));
+            searchView = leaf.view;
+        }
+
+        if (typeof searchView.updateQuery !== "function") return;
+
+        searchView.updateQuery(queryRef, displayRef);
+    }
+    minimiseLeftLeaf() {
         const leaf = this.app.workspace.getLeavesOfType("step-search-view")[0];
         if (leaf) {
-            this.app.workspace.detachLeavesOfType("step-search-view");
+            //this.app.workspace.detachLeavesOfType("step-search-view");
 
             const leftSplit = this.app.workspace.leftSplit;
             if (leftSplit && leftSplit.collapsed == false) {
@@ -1222,212 +1251,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         }
     }
 
-    // BUILDS FULLY FORMATTED READIBLE REFERENCE FROM URL REFERENCE
-    buildSearchQueryReference(ref) {
-        ref = ref.trim();
-        if (ref === "") return;
-
-        const parsed = this.parseAndExpandVerse(ref);
-        const expanded = parsed.expandedText;
-
-        // If no range, return as-is
-        if (!expanded.includes(" - ")) {
-            return expanded;
-        }
-
-        // Split the two sides of the range
-        const [left, right] = expanded.split(" - ").map(s => s.trim());
-
-        // Parse both sides into components
-        const leftParts = left.split(" ");
-        const rightParts = right.split(" ");
-
-        const leftBook = leftParts[0];
-        const rightBook = rightParts[0];
-
-        const leftRef = leftParts[1] ?? "";
-        const rightRef = rightParts[1] ?? "";
-
-        // If books differ → keep both fully
-        if (leftBook !== rightBook) {
-            return `${leftBook} ${leftRef} - ${rightBook} ${rightRef}`;
-        }
-
-        // Same book → contract book name
-        const [leftChap, leftVerse] = leftRef.split(":");
-        const [rightChap, rightVerse] = rightRef.split(":");
-
-        // If chapters differ → keep both chapter+verse
-        if (leftChap !== rightChap) {
-            // If right side has no verse (e.g., "Genesis 1:1 - Genesis 3")
-            if (!rightVerse) {
-                return `${leftBook} ${leftChap}:${leftVerse} - ${rightChap}`;
-            }
-
-            return `${leftBook} ${leftChap}:${leftVerse} - ${rightChap}:${rightVerse}`;
-        }
-
-        // Same chapter → contract chapter
-        if (rightVerse) {
-            return `${leftBook} ${leftChap}:${leftVerse}-${rightVerse}`;
-        }
-
-        // Same chapter, right side has no verse (e.g., "Genesis 1:1 - Genesis 1")
-        return `${leftBook} ${leftChap}:${leftVerse} - ${rightChap}`;
-    }
-
-    // BUILDS ARRAY OF SEARCH TOKENS FROM URL REFERENCE 
-    buildSearchQuery(ref) {
-        // remove spaces
-        ref = ref.trim();
-
-        if (ref === "") {
-            return [];
-        }
-
-        const parsed = this.parseAndExpandVerse(ref);
-        if (!parsed || !parsed.serverRef) {
-            // fallback: search the raw ref text
-            return [ref];
-        }
-
-        const serverRef = parsed.serverRef.replace(/\s+/g, "");
-
-        // Book-only: match any STEP reference that starts with the book
-        if (!serverRef.includes(".")) {
-            return [`reference=${serverRef}`];
-        }
-
-        let refs = [];
-
-        if (serverRef.includes("-")) {
-            const [left, right] = serverRef.split("-");
-            const lParts = left.split(".");
-            const rParts = right.split(".");
-
-            if (lParts.length === 2 && rParts.length === 2 && lParts[0] === rParts[0]) {
-                const book = lParts[0];
-                const startChap = parseInt(lParts[1], 10);
-                const endChap = parseInt(rParts[1], 10);
-
-                if (!Number.isNaN(startChap) && !Number.isNaN(endChap) && startChap <= endChap) {
-                    for (let c = startChap; c <= endChap; c++) {
-                        refs.push(`${book}.${c}`);
-                    }
-                } else {
-                    refs = this.expandServerRefToVerseList
-                        ? this.expandServerRefToVerseList(serverRef)
-                        : [serverRef];
-                }
-            } else {
-                refs = this.expandServerRefToVerseList
-                    ? this.expandServerRefToVerseList(serverRef)
-                    : [serverRef];
-            }
-        } else {
-            const parts = serverRef.split(".");
-            if (parts.length === 2) {
-                refs.push(serverRef);
-            } else {
-                refs.push(serverRef);
-            }
-        }
-
-        refs = Array.from(new Set(refs || []));
-        if (refs.length === 0) return [ref];
-
-        // turn each ref into a full search token
-        const parts = refs.map(r => `reference=${r}`);
-        return parts; // ← array of strings
-    }
-
-    // OPENS THE BIBLE SEARCH MODAL WITH OPTIONAL PREFILL
-    async openBibleSearchModal(prefill = "") {
-        const { requestUrl } = require("obsidian");
-        const plugin = this;
-
-        const modal = new BibleSearchModal(
-            this.app,
-            plugin,
-            async (refText) => {
-                const result = plugin.buildStepLink(refText);
-                if (!result) return;
-
-                const localIsUp = await plugin.isLocalStepRunning();
-                let urlToOpen;
-
-                if (localIsUp) {
-                    try {
-                        const res = await requestUrl({
-                            url: result.finalUrl,
-                            method: "GET",
-                            throw: false
-                        });
-
-                        if (res.status >= 200 && res.status < 400) {
-                            urlToOpen = result.finalUrl;
-                        } else {
-                            urlToOpen = plugin.rewriteToOnline(result.finalUrl);
-                        }
-                    } catch {
-                        urlToOpen = plugin.rewriteToOnline(result.finalUrl);
-                    }
-                } else {
-                    urlToOpen = plugin.rewriteToOnline(result.finalUrl);
-                }
-
-                window.open(urlToOpen, "_blank");
-            },
-            prefill
-        );
-
-        modal.open();
-    }
-
-
-//MISCELLANEOUS HELPERS ====================================================================================
-
-    // BUILDS THE STEP URL FROM ENTERED TEXT
-    buildStepLink(refText) {
-        
-        const versionPart = this.settings.enabledVersions
-            .map(v => `version=${v}`)
-            .join("@");
-
-        const urlBase = `${this.urlPrefix}?q=${versionPart}@reference=`;
-        const urlSuffix = "&options=GNVUH&display=COLUMN";
-
-        // Normalize input
-        const clean = refText.trim().replace(/\s+/g, " ");
-
-        // 1. BOOK-ONLY HANDLING (optionally numbered, but NO chapter/verse)
-        const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;
-
-        // Test the input to see if it just a book.
-        if (bookOnlyPattern.test(clean)) {
-            const lookupKey = clean.toLowerCase();
-
-            const book = this.getBookMap()[lookupKey];
-
-            if (!book) return null;
-
-            return {
-                expandedText: book,
-                finalUrl: `${urlBase}${book}${urlSuffix}`
-            };
-        }
-
-        // 2. FULL PARSE (chapter/verse/range)
-        const parsingResult = this.parseAndExpandVerse(clean);
-        if (!parsingResult) return null;
-
-        return {
-            expandedText: parsingResult.expandedText,
-            finalUrl: `${urlBase}${parsingResult.serverRef}${urlSuffix}`
-        };
-    }
-
-    // CHECKS IF LOCAL STEP IS RUNNING
+    // LOCAL/ONLINE URL HELPERS ===============================================================================
     async isLocalStepRunning() {
         try {
             const res = await requestUrl({
@@ -1441,84 +1265,310 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             return false;
         }
     }
-
-    // REWRITES URL TO ONLINE STEP BIBLE
-    rewriteToOnline(url) {
+    localUrl_onlineUrl(localUrl) {
         const onlineBase = "https://www.stepbible.org/?";
 
         // Extract the query string after '?q='
-        const match = url.match(/\?q=([^#]+)/);
-        if (!match) return url;
+        const match = localUrl.match(/\?q=([^#]+)/);
+        if (!match) return localUrl;
 
         return `${onlineBase}q=${match[1]}`;
     }
 
-    // EXTRACT A REFERENCE FROM URL
-    extractReferenceFromUrl(url) {
+    // CONVERTERS  =============================================================================================
+    url_urlRef(url) {
         const match = url.match(/reference=([^&]+)/);
-        return match ? decodeURIComponent(match[1]) : null;
-    }
+        if (!match) return null;
 
-    // BUILD A NEW URL WITH A DIFFERENT REFERENCE
-    buildUrlForRef(originalUrl, newRef) {
-        if (originalUrl.includes("reference=")) {
-            return originalUrl.replace(/reference=[^&]+/, `reference=${encodeURIComponent(newRef)}`);
+        const raw = decodeURIComponent(match[1]).trim();
+        if (!raw) return null;
+
+        const bookMap = this.getBookMap(); // abbreviation → full name
+
+        // Normalize a single book token (no dots)
+        const normalizeBook = (bookToken) => {
+            const lookup = bookToken.replace(/\s+/g, " ").trim().toLowerCase();
+            const full = bookMap[lookup];
+            if (!full) return bookToken; // no match → leave unchanged
+            return full.replace(/\s+/g, ""); // canonical STEP form
+        };
+
+        // Normalize dotted reference like "Gen.1.2"
+        const urlRef = (ref) => {
+            const parts = ref.split(".");
+            parts[0] = normalizeBook(parts[0]);
+            return parts.join(".");
+        };
+
+        // Normalize ranges: "Gen.1-Gen.2"
+        if (raw.includes("-")) {
+            const [left, right] = raw.split("-");
+            return `${urlRef(left)}-${urlRef(right)}`;
         }
-        return originalUrl;
+
+        // Single reference
+        return urlRef(raw);
     }
+    urlRef_url(urlRef) {
+        const versionPart = this.settings.enabledVersions
+            .map(v => `version=${v}`)
+            .join("@");
 
-    // FETCH TEXT FROM STEP WEBPAGE
-    async fetchSingleVerseFromTitle(url) {
-        const response = await requestUrl({ url });
-        const html = response.text;
+        const urlBase = `${this.urlPrefix}?q=${versionPart}@reference=`;
+        const urlSuffix = "&options=GNVUH&display=COLUMN";
 
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(html, "text/html");
+        if (!urlRef) return null;
 
-        const title = doc.querySelector("title")?.textContent || "";
-        const parts = title.split("|").map(p => p.trim());
+        return `${urlBase}${urlRef}${urlSuffix}`;
+    }
+    inputRef_urlRef(inputRef) {
 
-        let verseText = "";
-        if (parts.length >= 4) {
-            verseText = parts[3]; // English text
+        const getBookMap = () => this.getBookMap();
+        const getMaxVerse = (book, chap) => this.getMaxVerse(book, chap);
+
+        const STEP_FIX = {
+            "Song of Solomon": "Song",
+            "Song of Songs": "Song",
+            "Canticles": "Song",
+            "Song": "Song"
+        };
+
+        const normalizeBook = (rawBook) => {
+            const lookup = rawBook.replace(/\s+/g, " ").toLowerCase();
+            const book = getBookMap()[lookup] || rawBook;
+            return STEP_FIX[book] || book;
+        };
+
+        const bookKey = (book) => book.replace(/\s+/g, "");
+
+        const text = inputRef.trim();
+
+        {
+            const stepPattern =
+                /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)\.(\d+)(?:\.(\d+))?(?:-([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)?\.(\d+)(?:\.(\d+))?)?$/;
+
+            const m = text.match(stepPattern);
+            if (m) {
+                const rawBook1 = m[1].trim();
+                const book1 = normalizeBook(rawBook1);
+                const chap1 = m[2];
+                const verse1 = m[3] || null;
+                const bk1 = bookKey(book1);
+
+                if (!m[4] && !verse1) return `${bk1}.${chap1}`;
+                if (!m[4] && verse1) return `${bk1}.${chap1}.${verse1}`;
+
+                const rawBook2 = (m[4] || rawBook1).trim();
+                const book2 = normalizeBook(rawBook2);
+                const chap2 = m[5];
+                const verse2 = m[6] || null;
+                const bk2 = bookKey(book2);
+
+                if (!verse1 && !verse2) return `${bk1}.${chap1}-${bk2}.${chap2}`;
+                if (verse1 && verse2)
+                    return `${bk1}.${chap1}.${verse1}-${bk2}.${chap2}.${verse2}`;
+                if (!verse1 && verse2)
+                    return `${bk1}.${chap1}-${bk2}.${chap2}.${verse2}`;
+                if (verse1 && !verse2)
+                    return `${bk1}.${chap1}.${verse1}-${bk2}.${chap1}.${chap2}`;
+            }
         }
 
-        verseText = verseText
-            .replace(/\s+/g, " ")              // collapse weird spacing
-            .replace(/\s+([,;:.!?])/g, "$1")   // remove space before punctuation
-            .replace(/\s+\)/g, ")")            // remove space before ')'
-            .replace(/\(\s+/g, "(")            // remove space after '('
-            .replace(/\s*,\s*$/g, "")          // remove trailing commas only
-            .trim();
+        const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;
+        if (bookOnlyPattern.test(text) && !/\d+\s*:/.test(text)) {
+            const lookup = text.toLowerCase();
+            const book = getBookMap()[lookup];
+            if (book) return book.replace(/\s+/g, "");
+            return null;
+        }
 
-        return verseText || null;
+        const hasSpacedDash = /\s+-\s+/.test(text);
+
+        let clean = text
+            .replace(/–/g, "-")
+            .replace(/\s*-\s*/g, "-")
+            .replace(/:/g, ".");
+
+        const bookRegex = /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)/;
+        const match = clean.match(bookRegex);
+        if (!match) return null;
+
+        const rawBook = match[0].trim();
+        const book = normalizeBook(rawBook);
+        const bk = bookKey(book);
+
+        let remainder = clean.replace(match[0], "").trim();
+        if (!remainder) return null;
+
+        if (!remainder.includes("-")) {
+            const parts = remainder.split(".");
+            if (parts.length === 1) return `${bk}.${parts[0]}`;
+            if (parts.length === 2) return `${bk}.${parts[0]}.${parts[1]}`;
+            return null;
+        }
+
+        const [left, right] = remainder.split("-");
+        const leftParts = left.split(".");
+        const rightParts = right.split(".");
+
+        if (hasSpacedDash && leftParts.length === 2 && rightParts.length === 1) {
+            const lChap = leftParts[0];
+            const lVerse = leftParts[1];
+            const rChap = rightParts[0];
+            const maxVerse = getMaxVerse(book, rChap);
+            return `${bk}.${lChap}.${lVerse}-${bk}.${rChap}.${maxVerse}`;
+        }
+
+        if (leftParts.length === 1 && rightParts.length === 1)
+            return `${bk}.${leftParts[0]}-${bk}.${rightParts[0]}`;
+
+        if (leftParts.length === 2 && rightParts.length === 1)
+            return `${bk}.${leftParts[0]}.${leftParts[1]}-${bk}.${leftParts[0]}.${rightParts[0]}`;
+
+        if (leftParts.length === 1 && rightParts.length === 2)
+            return `${bk}.${leftParts[0]}-${bk}.${rightParts[0]}.${rightParts[1]}`;
+
+        if (leftParts.length === 2 && rightParts.length === 2)
+            return `${bk}.${leftParts[0]}.${leftParts[1]}-${bk}.${rightParts[0]}.${rightParts[1]}`;
+
+        return null;
     }
+    urlRef_displayRef(urlRef) {
 
-    // EXPAND A SERVER REFERENCE INTO A LIST OF VERSE REFERENCES
-    expandServerRefToVerseList(serverRef) {
+        // Convert canonical "1Peter" → "1 Peter"
+        const canonicalToDisplay = (canonical) => {
+            return canonical.replace(/^([1-3])([A-Za-z].*)$/, "$1 $2");
+        };
+
+        const range = urlRef.split("-");
+        const left = range[0].split(".");
+        const right = range.length > 1 ? range[1].split(".") : null;
+
+        const book1 = canonicalToDisplay(left[0]);
+        const chap1 = left[1];
+        const verse1 = left[2] || null;
+
+        // BOOK ONLY (Genesis)
+        if (!chap1) return book1;
+
+        // SINGLE SIDE
+        if (!right) {
+            if (!verse1) return `${book1} ${chap1}`;      // Genesis 1
+            return `${book1} ${chap1}:${verse1}`;         // Genesis 1:1
+        }
+
+        // RANGE
+        const book2 = canonicalToDisplay(right[0]);
+        const chap2 = right[1];
+        const verse2 = right[2] || null;
+
+        // SAME BOOK, SAME CHAPTER, VERSE RANGE
+        if (book1 === book2 && chap1 === chap2 && verse1 && verse2) {
+            return `${book1} ${chap1}:${verse1}-${verse2}`;
+        }
+
+        // SAME BOOK, CHAPTER → CHAPTER
+        if (book1 === book2 && !verse1 && !verse2) {
+            return `${book1} ${chap1}-${chap2}`;
+        }
+
+        // CROSS-CHAPTER VERSE RANGE
+        if (verse1 && verse2) {
+            return `${book1} ${chap1}:${verse1} - ${book2} ${chap2}:${verse2}`;
+        }
+
+        // CHAPTER → VERSE (cross-chapter end)
+        if (!verse1 && verse2) {
+            return `${book1} ${chap1} - ${book2} ${chap2}:${verse2}`;
+        }
+
+        // SAME BOOK, SAME CHAPTER, VERSE → CHAPTER
+        if (verse1 && !verse2) {
+            return `${book1} ${chap1}:${verse1}-${chap2}`;
+        }
+
+        return urlRef;
+    }
+    urlRef_queryRef(urlRef) {
+
+        // urlRef is already normalized and STEP-compatible
+        urlRef = urlRef.trim();
+        if (urlRef === "") return [];
+
+        // Remove spaces (there shouldn't be any)
+        urlRef = urlRef.replace(/\s+/g, "");
+
+        // Book-only: match any STEP reference that starts with the book
+        if (!urlRef.includes(".")) {
+            return [`reference=${urlRef}`];
+        }
+
+        let refs = [];
+
+        // RANGE HANDLING
+        if (urlRef.includes("-")) {
+            const [left, right] = urlRef.split("-");
+            const lParts = left.split(".");
+            const rParts = right.split(".");
+
+            // CASE: Book.Chapter - Book.Chapter (same book)
+            if (lParts.length === 2 && rParts.length === 2 && lParts[0] === rParts[0]) {
+                const book = lParts[0];
+                const startChap = parseInt(lParts[1], 10);
+                const endChap = parseInt(rParts[1], 10);
+
+                if (!Number.isNaN(startChap) && !Number.isNaN(endChap) && startChap <= endChap) {
+                    for (let c = startChap; c <= endChap; c++) {
+                        refs.push(`${book}.${c}`);
+                    }
+                } else {
+                    refs = this.urlRef_verseListArray
+                        ? this.urlRef_verseListArray(urlRef)
+                        : [urlRef];
+                }
+            } else {
+                // CASE: Full verse range or cross-chapter range
+                refs = this.urlRef_verseListArray
+                    ? this.urlRef_verseListArray(urlRef)
+                    : [urlRef];
+            }
+
+        } else {
+            // SINGLE REFERENCE (chapter or verse)
+            refs.push(urlRef);
+        }
+
+        // Deduplicate
+        refs = Array.from(new Set(refs || []));
+        if (refs.length === 0) return [urlRef];
+
+        // Convert each ref into a full search token
+        return refs.map(r => `reference=${r}`);
+    }
+    urlRef_verseListArray(urlRef) {
         // Normalize: remove spaces from book part if any slipped through
-        serverRef = serverRef.replace(/\s+/g, "");
+        urlRef = urlRef.replace(/\s+/g, "");
 
-        if (!serverRef.includes("-")) {
-            const parts = serverRef.split(".");
+        if (!urlRef.includes("-")) {
+            const parts = urlRef.split(".");
             if (parts.length === 3) {
-                return [serverRef];
+                return [urlRef];
             }
             if (parts.length === 2) {
                 const [book, chapStr] = parts;
                 const chap = parseInt(chapStr, 10);
                 const maxVerse = this.getMaxVerse(book, chap);
-                if (!maxVerse) return [serverRef];
+                if (!maxVerse) return [urlRef];
                 const list = [];
                 for (let v = 1; v <= maxVerse; v++) {
                     list.push(`${book}.${chap}.${v}`);
                 }
                 return list;
             }
-            return [serverRef];
+            return [urlRef];
         }
 
-        const [startRef, endRef] = serverRef.split("-");
+        const [startRef, endRef] = urlRef.split("-");
         const sParts = startRef.split(".");
         const eParts = endRef.split(".");
 
@@ -1568,245 +1618,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return [startRef];
     }
 
-    //TURNS REFERENCE TEXT OF ANY FORMAT INTO FULL REFERENCE AND URL
-    parseAndExpandVerse(text) {
-
-        // --- STEP-style dotted reference handling (with abbreviation expansion) ---
-        {
-            const stepPattern = /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)\.(\d+)(?:\.(\d+))?(?:-([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)?\.(\d+)(?:\.(\d+))?)?$/;
-
-            const m = text.match(stepPattern);
-            if (m) {
-                // --- Normalize book1 ---
-                const rawBook1 = m[1].trim();
-                const lookup1 = rawBook1.replace(/\s+/g, " ").toLowerCase();
-                let book1 = this.getBookMap()[lookup1] || rawBook1;
-
-                // STEP fixes
-                const stepFix = {
-                    "Song of Solomon": "Song",
-                    "Song of Songs": "Song",
-                    "Canticles": "Song",
-                    "Song": "Song"
-                };
-                book1 = stepFix[book1] || book1;
-
-                const chap1 = m[2];
-                const verse1 = m[3] || null;
-
-                const bookKey1 = book1.replace(/\s+/g, "");
-
-                // --- Single chapter only: Genesis.1 ---
-                if (!m[4] && !verse1) {
-                    return {
-                        expandedText: `${book1} ${chap1}`,
-                        serverRef: `${bookKey1}.${chap1}`
-                    };
-                }
-
-                // --- Single verse: Genesis.1.2 ---
-                if (!m[4] && verse1) {
-                    return {
-                        expandedText: `${book1} ${chap1}:${verse1}`,
-                        serverRef: `${bookKey1}.${chap1}.${verse1}`
-                    };
-                }
-
-                // --- Normalize book2 (may be missing → inherit book1) ---
-                const rawBook2 = (m[4] || rawBook1).trim();
-                const lookup2 = rawBook2.replace(/\s+/g, " ").toLowerCase();
-                let book2 = this.getBookMap()[lookup2] || rawBook2;
-                book2 = stepFix[book2] || book2;
-
-                const chap2 = m[5];
-                const verse2 = m[6] || null;
-
-                const bookKey2 = book2.replace(/\s+/g, "");
-
-                // --- Chapter → Chapter: Genesis.1-Genesis.2 ---
-                if (!verse1 && !verse2) {
-                    return {
-                        expandedText: `${book1} ${chap1}-${chap2}`,
-                        serverRef: `${bookKey1}.${chap1}-${bookKey2}.${chap2}`
-                    };
-                }
-
-                // --- Full verse range: Genesis.1.1-Genesis.1.2 ---
-                if (verse1 && verse2) {
-                    return {
-                        expandedText: `${book1} ${chap1}:${verse1} - ${book2} ${chap2}:${verse2}`,
-                        serverRef: `${bookKey1}.${chap1}.${verse1}-${bookKey2}.${chap2}.${verse2}`
-                    };
-                }
-
-                // --- Chapter → Verse: Genesis.1-2.3 ---
-                if (!verse1 && verse2) {
-                    return {
-                        expandedText: `${book1} ${chap1} - ${book2} ${chap2}:${verse2}`,
-                        serverRef: `${bookKey1}.${chap1}-${bookKey2}.${chap2}.${verse2}`
-                    };
-                }
-
-                // --- Same-chapter verse range: Genesis.1.1-2 ---
-                if (verse1 && !verse2) {
-                    return {
-                        expandedText: `${book1} ${chap1}:${verse1}-${chap2}`,
-                        serverRef: `${bookKey1}.${chap1}.${verse1}-${bookKey2}.${chap1}.${chap2}`
-                    };
-                }
-            }
-        }
-
-        // 1. BOOK-ONLY HANDLING (optionally numbered, but NO chapter/verse)
-        const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;
-
-        // Only treat as book-only if:
-        // - It matches the book-only pattern
-        // - AND it does NOT contain any chapter/verse digits after the book name
-        // Only treat as book-only if it matches AND has no chapter/verse
-        if (bookOnlyPattern.test(text.trim()) && !/\d+\s*:/.test(text)) {
-            const lookupKey = text.trim().toLowerCase();
-            const book = this.getBookMap()[lookupKey];
-
-            if (book) {
-                return {
-                    expandedText: book,
-                    serverRef: book
-                };
-            }
-        }
-
-        // Detect spaced dash BEFORE normalization destroys spacing
-        const hasSpacedDash = /\s+-\s+/.test(text);
-
-        let clean = text
-            .replace(/–/g, "-")
-            .replace(/\s*-\s*/g, "-")
-            .replace(/:/g, ".");
-
-        const bookRegex = /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)/;
-        const match = clean.match(bookRegex);
-        if (!match) return { expandedText: text, serverRef: clean };
-
-        const rawBook = match[0].trim();
-        const lookupKey = rawBook.replace(/\s+/g, " ").toLowerCase();
-        const book = this.getBookMap()[lookupKey] || rawBook;
-
-        // ⭐ STEP Bible requires "Song" instead of "Song of Solomon"
-        const stepFix = {
-            "Song of Solomon": "Song",
-            "Song of Songs": "Song",
-            "Canticles": "Song",
-            "Song": "Song"
-        };
-        const fixedBook = stepFix[book] || book;
-
-        // STEP / verseCounts key: remove spaces from book name
-        const bookKey = book.replace(/\s+/g, "");
-
-        let remainder = clean.replace(match[0], "").trim();
-
-        if (!remainder.includes("-")) {
-            const parts = remainder.split(".");
-            if (parts.length === 1) {
-                return {
-                    expandedText: `${book} ${parts[0]}`,
-                    serverRef: `${bookKey}.${parts[0]}`
-                };
-            }
-            if (parts.length === 2) {
-                return {
-                    expandedText: `${book} ${parts[0]}:${parts[1]}`,
-                    serverRef: `${bookKey}.${parts[0]}.${parts[1]}`
-                };
-            }
-        }
-
-        const [left, right] = remainder.split("-");
-        const leftParts = left.split(".");
-        const rightParts = right.split(".");
-
-        // NEW RULE: spaced dash means cross-chapter (e.g. "Jer 4:7 - 8")
-        if (hasSpacedDash && leftParts.length === 2 && rightParts.length === 1) {
-            const lChap = leftParts[0];
-            const lVerse = leftParts[1];
-            const rChap = rightParts[0];
-
-            const maxVerse = this.getMaxVerse(book, rChap);
-
-            return {
-                expandedText: `${book} ${lChap}:${lVerse} - ${rChap}:${maxVerse}`,
-                serverRef: `${bookKey}.${lChap}.${lVerse}-${bookKey}.${rChap}.${maxVerse}`
-            };
-        }
-
-        if (leftParts.length === 1 && rightParts.length === 1) {
-            // CASE 1: CHAPTER → CHAPTER
-            // Example: "Jer 3-4"
-            // Meaning: Jeremiah chapters 3 through 4
-            return {
-                expandedText: `${book} ${leftParts[0]}-${rightParts[0]}`,
-                serverRef: `${bookKey}.${leftParts[0]}-${bookKey}.${rightParts[0]}`
-            };
-        }
-
-        if (leftParts.length === 2 && rightParts.length === 1) {
-            // CASE 2: SAME-CHAPTER VERSE RANGE
-            // Example: "Jer 3.1-8"
-            // Meaning: Jeremiah 3:1–8
-            return {
-                expandedText: `${book} ${leftParts[0]}:${leftParts[1]}-${rightParts[0]}`,
-                serverRef: `${bookKey}.${leftParts[0]}.${leftParts[1]}-${bookKey}.${leftParts[0]}.${rightParts[0]}`
-            };
-        }
-
-        if (leftParts.length === 1 && rightParts.length === 2) {
-            // CASE 3: CHAPTER → VERSE (CROSS-CHAPTER ENDING)
-            // Example: "Jer 3-4.8"
-            // Meaning: Jeremiah 3:1 through 4:8
-            return {
-                expandedText: `${book} ${leftParts[0]}-${rightParts[0]}:${rightParts[1]}`,
-                serverRef: `${bookKey}.${leftParts[0]}-${bookKey}.${rightParts[0]}.${rightParts[1]}`
-            };
-        }
-
-        if (leftParts.length === 2 && rightParts.length === 2) {
-            // CASE 4: VERSE → VERSE (FULL CROSS-CHAPTER RANGE)
-            // Example: "Jer 3.1-4.8"
-            // Meaning: Jeremiah 3:1–4:8
-            return {
-                expandedText: `${book} ${leftParts[0]}:${leftParts[1]} - ${rightParts[0]}:${rightParts[1]}`,
-                serverRef: `${bookKey}.${leftParts[0]}.${leftParts[1]}-${bookKey}.${rightParts[0]}.${rightParts[1]}`
-            };
-        }
-
-        return {
-            expandedText: text,
-            serverRef: `${bookKey}.${left}-${bookKey}.${right}`
-        };
-    }
-
-    //BUILDS A REGEX TO DETECT BOOK NAMES FROM TEXT LINE
-    buildReferenceRegex() {
-        const books = this.getAllBookPatterns();
-
-        // Book group
-        const bookGroup = `(?:${books.join("|")})`;
-
-        // Chapter/verse/range
-        const cv = `\\d+(?:[:.]\\d+)?`;
-        const range = `${cv}(?:\\s*-\\s*${cv})?`;
-
-        // Full pattern:
-        // - Book only
-        // - Book + chapter/verse/range
-        const pattern =
-            `${bookGroup}(?:\\s+${range})?`;
-
-        return new RegExp(pattern, "gi");
-    }
-
-    //RETURNS ALL POSSIBLE BOOK NAMES, ABBREVIATIONS INCLUDED
+    // BIBLE INFORMATION HELPERS =================================================================================
     getAllBookPatterns() {
         const map = this.getBookMap(); // flat lookup: "1 peter" → "1Peter"
         const keys = Object.keys(map);
@@ -1821,8 +1633,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         return escaped;
     }
-
-    //MAP OF ALL BOOK NAMES
     getBookMap() {
         const rawData = {
             "en": [
@@ -1847,7 +1657,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 { bookName: "Psalms", abbreviations: ["Ps", "Pss", "Psalm"] },
                 { bookName: "Proverbs", abbreviations: ["Prov", "Prv", "Pr"] },
                 { bookName: "Ecclesiastes", abbreviations: ["Qoheleth", "Eccl", "Eccles", "Ec", "Qoh"] },
-                { bookName: "Song of Songs", abbreviations: ["Song", "SS", "So", "Sg", "Song of Solomon"] },
+                { bookName: "Song", abbreviations: ["Song", "SS", "So", "Sg", "Song of Solomon"] },
                 { bookName: "Isaiah", abbreviations: ["Isa", "Is"] },
                 { bookName: "Jeremiah", abbreviations: ["Jer", "Je"] },
                 { bookName: "Lamentations", abbreviations: ["Lam", "La"] },
@@ -1885,8 +1695,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 { bookName: "Philemon", abbreviations: ["Phlm", "Philem", "Phm"] },
                 { bookName: "Hebrews", abbreviations: ["Heb", "He"] },
                 { bookName: "James", abbreviations: ["Jas", "Ja"] },
-                { bookName: "1 Peter", abbreviations: ["1 Pet", "1 Pt", "1P"] },
-                { bookName: "2 Peter", abbreviations: ["2 Pet", "2 Pt", "2P"] },
+                { bookName: "1 Peter", abbreviations: ["1 Pet", "1Pet", "1peter", "1 Pt", "1P"] },
+                { bookName: "2 Peter", abbreviations: ["2 Pet", "2Pet", "2peter", "2 Pt", "2P"] },
                 { bookName: "1 John", abbreviations: ["1 John", "1 Jn", "1 Jo", "1J"] },
                 { bookName: "2 John", abbreviations: ["2 John", "2 Jn", "2 Jo", "2J"] },
                 { bookName: "3 John", abbreviations: ["3 John", "3 Jn", "3 Jo", "3J"] },
@@ -1905,8 +1715,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         });
         return flatMap;
     }
-
-    //ALL MAX VERSE NUMBERS IN EVERY CHAPTER OF BIBLE
     getMaxVerse(book, chapter) {
         const verseCounts = {
             "Genesis": [0, 31, 25, 24, 26, 32, 22, 24, 22, 29, 32, 32, 20, 18, 24, 21, 16, 27, 33, 38, 18, 34, 24, 20, 67, 34, 35, 46, 22, 35, 43, 55, 32, 20, 31, 29, 43, 36, 30, 23, 23, 57, 38, 34, 34, 28, 34, 31, 22, 33],
@@ -1983,8 +1791,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         if (chapter < 1 || chapter >= arr.length) return null;
         return arr[chapter];
     }
-
-    //ALL BOOK OVERVIEWS
     getBookOverview(book) {
         const overviews = {
             // PENTATEUCH
@@ -2054,7 +1860,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. 1100–1000 BC (events earlier, in the time of the judges)",
                 synopsis: "A Moabite woman’s loyalty leads to blessing and her inclusion in the line of David and Christ."
             },
-            "1 Samuel": {
+            "1Samuel": {
                 name: "1 Samuel",
                 chapters: 31,
                 author: "Traditionally Samuel, with later prophets (Nathan, Gad)",
@@ -2062,7 +1868,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. 1050–1000 BC",
                 synopsis: "Transition from judges to monarchy: Samuel, Saul’s rise and fall, and David’s anointing."
             },
-            "2 Samuel": {
+            "2Samuel": {
                 name: "2 Samuel",
                 chapters: 24,
                 author: "Traditionally Nathan, Gad, and other court prophets",
@@ -2070,7 +1876,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. 1000–960 BC",
                 synopsis: "David’s reign, his victories, sins, family turmoil, and God’s covenant promise to his house."
             },
-            "1 Kings": {
+            "1Kings": {
                 name: "1 Kings",
                 chapters: 22,
                 author: "Unknown, traditionally a prophetic historian",
@@ -2078,7 +1884,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. 560–540 BC",
                 synopsis: "Solomon’s reign, the kingdom’s division, and the early history of Israel and Judah’s kings."
             },
-            "2 Kings": {
+            "2Kings": {
                 name: "2 Kings",
                 chapters: 25,
                 author: "Unknown, traditionally a prophetic historian",
@@ -2086,7 +1892,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. 560–540 BC",
                 synopsis: "The decline of Israel and Judah, leading to the fall of Samaria and Jerusalem and exile."
             },
-            "1 Chronicles": {
+            "1Chronicles": {
                 name: "1 Chronicles",
                 chapters: 29,
                 author: "Unknown, traditionally Ezra",
@@ -2094,7 +1900,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. 450–400 BC",
                 synopsis: "Genealogies and a retelling of David’s reign with focus on worship and the temple."
             },
-            "2 Chronicles": {
+            "2Chronicles": {
                 name: "2 Chronicles",
                 chapters: 36,
                 author: "Unknown, traditionally Ezra",
@@ -2362,7 +2168,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 56–57",
                 synopsis: "A systematic exposition of the gospel, justification by faith, and life in Christ."
             },
-            "1 Corinthians": {
+            "1Corinthians": {
                 name: "1 Corinthians",
                 chapters: 16,
                 author: "Paul",
@@ -2370,7 +2176,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 54–55",
                 synopsis: "Addresses church divisions, immorality, spiritual gifts, and the resurrection."
             },
-            "2 Corinthians": {
+            "2Corinthians": {
                 name: "2 Corinthians",
                 chapters: 13,
                 author: "Paul",
@@ -2410,7 +2216,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 60–62",
                 synopsis: "Affirms Christ’s supremacy over all creation and warns against false teaching."
             },
-            "1 Thessalonians": {
+            "1Thessalonians": {
                 name: "1 Thessalonians",
                 chapters: 5,
                 author: "Paul",
@@ -2418,7 +2224,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 50–51",
                 synopsis: "Encourages a young church in faith, love, hope, and readiness for Christ’s return."
             },
-            "2 Thessalonians": {
+            "2Thessalonians": {
                 name: "2 Thessalonians",
                 chapters: 3,
                 author: "Paul",
@@ -2426,7 +2232,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 51–52",
                 synopsis: "Clarifies teaching about the day of the Lord and exhorts believers to steadfastness and work."
             },
-            "1 Timothy": {
+            "1Timothy": {
                 name: "1 Timothy",
                 chapters: 6,
                 author: "Paul",
@@ -2434,7 +2240,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 62–64",
                 synopsis: "Instructions to Timothy on church leadership, sound doctrine, and godly living."
             },
-            "2 Timothy": {
+            "2Timothy": {
                 name: "2 Timothy",
                 chapters: 4,
                 author: "Paul",
@@ -2476,7 +2282,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 44–49",
                 synopsis: "Practical teaching on living out genuine faith through works and godly wisdom."
             },
-            "1 Peter": {
+            "1Peter": {
                 name: "1 Peter",
                 chapters: 5,
                 author: "Peter the apostle",
@@ -2484,7 +2290,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 62–64",
                 synopsis: "Encourages suffering believers with hope, holiness, and the example of Christ."
             },
-            "2 Peter": {
+            "2Peter": {
                 name: "2 Peter",
                 chapters: 3,
                 author: "Peter the apostle",
@@ -2492,7 +2298,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 64–67",
                 synopsis: "Warns against false teachers and reminds believers of Christ’s promised return."
             },
-            "1 John": {
+            "1John": {
                 name: "1 John",
                 chapters: 5,
                 author: "John the apostle",
@@ -2500,7 +2306,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 85–95",
                 synopsis: "Assures believers of eternal life and emphasizes love, obedience, and true doctrine."
             },
-            "2 John": {
+            "2John": {
                 name: "2 John",
                 chapters: 1,
                 author: "John the apostle",
@@ -2508,7 +2314,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 date: "c. AD 85–95",
                 synopsis: "A brief letter urging love and truth while rejecting false teachers."
             },
-            "3 John": {
+            "3John": {
                 name: "3 John",
                 chapters: 1,
                 author: "John the apostle",
@@ -2539,7 +2345,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return overviews[book] || null;
     }
 
-// SETTINGS MANAGEMENT HELPERS ====================================================================================
+    // SETTINGS MANAGEMENT HELPERS ================================================================================
     toggleVersion(version, enabled) {
         const list = this.settings.enabledVersions;
 
@@ -2620,7 +2426,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         new Notice("STEP Bible Links Updated.");
     }
-
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
         this.urlPrefix = this.settings.useLocalUrlPrefix
@@ -2634,6 +2439,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             : "https://www.stepbible.org/";
     }
 
+    // PLUGIN UNLOAD
     onunload() {
         if (this.activePopover && this.activePopover.parentNode) {
             this.activePopover.parentNode.removeChild(this.activePopover);

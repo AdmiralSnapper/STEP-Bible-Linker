@@ -30,8 +30,8 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
         containerEl.createEl("h2", { text: "STEP Bible Linker Settings" });
 
         new Setting(containerEl)
-            .setName("Auto-sync on navigation")
-            .setDesc("Automatically update the search panel when navigating inside STEP Bible.")
+            .setName("Auto-Search from Webviewer")
+            .setDesc("Automatically update the left search panel when navigating inside STEP Bible.")
             .addToggle(toggle => {
                 toggle
                     .setValue(this.plugin.settings.autoSyncOnNavigation)
@@ -42,7 +42,7 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
             });
 
         new Setting(containerEl)
-            .setName("Auto-close search panel")
+            .setName("Auto-Close Search Panel")
             .setDesc("Automatically close the search panel when switching to a non-STEP tab.")
             .addToggle(toggle => {
                 toggle
@@ -54,8 +54,8 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
             });
 
         new Setting(containerEl)
-            .setName("Use Local STEP Server")
-            .setDesc("Toggle between local STEP server and online STEP Bible.")
+            .setName("Use STEP localhost.")
+            .setDesc("Toggle between local STEP localhost and online STEP website. This will need to be installed on your computer and running.")
             .addToggle(toggle => {
                 toggle
                     .setValue(this.plugin.settings.useLocalStepServer)
@@ -783,7 +783,6 @@ class StepBibleSearchModal extends Modal {
     }
 }
 
-
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
@@ -805,15 +804,70 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         );
 
         // DETECT AND LINK INPUT REF AT CURSOR 
+        // this.addCommand({
+        //     id: 'auto-link-step-ref',
+        //     name: 'Link Reference at Cursor',
+        //     editorCallback: (editor) => {
+
+        //         const cursor = editor.getCursor();
+        //         const line = editor.getLine(cursor.line);
+
+        //         // NEW: use detectInputRef()
+        //         const detected = this.detectInputRef(line, cursor.ch);
+        //         if (!detected) return;
+
+        //         const { inputRef, start, end } = detected;
+
+        //         const before = line.slice(0, start);
+        //         const after = line.slice(end);
+
+        //         // Already linked?
+        //         if (before.endsWith("[") && after.startsWith("]")) return;
+
+        //         const urlRef = this.inputRef_urlRef(inputRef);
+        //         const displayRef = this.urlRef_displayRef(urlRef);
+        //         const url = this.urlRef_url(urlRef);
+
+        //         // Build the fully compiled STEP link
+        //         const stepLink = `([${displayRef}](${url}))`;
+        //         if (!stepLink) return;
+
+        //         // Replace with Obsidian-style link
+        //         const newLine = line.slice(0, start) + stepLink + line.slice(end);
+
+        //         editor.setLine(cursor.line, newLine);
+        //     }
+        // });
+
         this.addCommand({
             id: 'auto-link-step-ref',
-            name: 'Link Reference at Cursor',
+            name: 'Link/Unlink Reference at Cursor',
             editorCallback: (editor) => {
 
                 const cursor = editor.getCursor();
                 const line = editor.getLine(cursor.line);
 
-                // NEW: use detectInputRef()
+                // --- 1. Detect existing STEP link that contains reference= ---
+                // Format: ([DisplayRef](URL))
+                // URL must contain reference=Something
+                const stepLinkRegex = /\(\[([^\]]+)\]\(([^)]+reference=[^)]+)\)\)/g;
+
+                let match;
+                while ((match = stepLinkRegex.exec(line)) !== null) {
+                    const start = match.index;
+                    const end = start + match[0].length;
+
+                    // Cursor inside the link?
+                    if (cursor.ch >= start && cursor.ch <= end) {
+                        const displayRef = match[1];
+
+                        const newLine = line.slice(0, start) + displayRef + line.slice(end);
+                        editor.setLine(cursor.line, newLine);
+                        return;
+                    }
+                }
+
+                // --- 2. Normal behavior: detect raw inputRef ---
                 const detected = this.detectInputRef(line, cursor.ch);
                 if (!detected) return;
 
@@ -829,14 +883,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const displayRef = this.urlRef_displayRef(urlRef);
                 const url = this.urlRef_url(urlRef);
 
-                // Build the fully compiled STEP link
                 const stepLink = `([${displayRef}](${url}))`;
                 if (!stepLink) return;
 
-                // Replace with Obsidian-style link
                 const newLine = line.slice(0, start) + stepLink + line.slice(end);
-
                 editor.setLine(cursor.line, newLine);
+
+                // editor.setCursor({
+                //     line: cursor.line,
+                //     ch: start + displayRef.length
+                // });
             }
         });
 
@@ -1127,7 +1183,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 requestAnimationFrame(() => {
                     if (pop.scrollHeight > pop.clientHeight) {
-                        pop.style.paddingBottom = "24px";
+                        pop.style.paddingBottom = "150px";
                     }
                 });
 
@@ -1435,7 +1491,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     }
     urlRef_displayRef(urlRef) {
 
-        // Convert canonical "1Peter" → "1 Peter"
         const canonicalToDisplay = (canonical) => {
             return canonical.replace(/^([1-3])([A-Za-z].*)$/, "$1 $2");
         };
@@ -1448,16 +1503,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const chap1 = left[1];
         const verse1 = left[2] || null;
 
-        // BOOK ONLY (Genesis)
         if (!chap1) return book1;
 
-        // SINGLE SIDE
         if (!right) {
-            if (!verse1) return `${book1} ${chap1}`;      // Genesis 1
-            return `${book1} ${chap1}:${verse1}`;         // Genesis 1:1
+            if (!verse1) return `${book1} ${chap1}`;
+            return `${book1} ${chap1}:${verse1}`;
         }
 
-        // RANGE
         const book2 = canonicalToDisplay(right[0]);
         const chap2 = right[1];
         const verse2 = right[2] || null;
@@ -1467,14 +1519,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             return `${book1} ${chap1}:${verse1}-${verse2}`;
         }
 
+        // CROSS-CHAPTER VERSE RANGE (this must come early)
+        if (book1 === book2 && verse1 && verse2 && chap1 !== chap2) {
+            return `${book1} ${chap1}:${verse1}-${chap2}:${verse2}`;
+        }
+
         // SAME BOOK, CHAPTER → CHAPTER
         if (book1 === book2 && !verse1 && !verse2) {
             return `${book1} ${chap1}-${chap2}`;
-        }
-
-        // CROSS-CHAPTER VERSE RANGE
-        if (verse1 && verse2) {
-            return `${book1} ${chap1}:${verse1} - ${book2} ${chap2}:${verse2}`;
         }
 
         // CHAPTER → VERSE (cross-chapter end)
@@ -1483,7 +1535,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         }
 
         // SAME BOOK, SAME CHAPTER, VERSE → CHAPTER
-        if (verse1 && !verse2) {
+        if (book1 === book2 && verse1 && !verse2) {
             return `${book1} ${chap1}:${verse1}-${chap2}`;
         }
 

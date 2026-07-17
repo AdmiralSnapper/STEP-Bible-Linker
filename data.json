@@ -3,6 +3,7 @@
   "autoCloseSearchPanel": true,
   "enabledVersions": [
     "ESV",
+    "SBLG",
     "THOT"
   ],
   "useLocalUrlPrefix": true,

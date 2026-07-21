@@ -369,7 +369,7 @@ class StepSearchView extends ItemView {
         this.hideLoading();
 
         if (matchedFiles.length === 0) {
-            const msg = this.resultsEl.createEl("div", { text: "No matches found." });
+            const msg = this.resultsEl.createEl("div", { text: "No notes found." });
             msg.style.color = "#414141"; 
             msg.style.fontSize = "0.75em";
         } else {
@@ -804,41 +804,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         );
 
         // DETECT AND LINK INPUT REF AT CURSOR 
-        // this.addCommand({
-        //     id: 'auto-link-step-ref',
-        //     name: 'Link Reference at Cursor',
-        //     editorCallback: (editor) => {
-
-        //         const cursor = editor.getCursor();
-        //         const line = editor.getLine(cursor.line);
-
-        //         // NEW: use detectInputRef()
-        //         const detected = this.detectInputRef(line, cursor.ch);
-        //         if (!detected) return;
-
-        //         const { inputRef, start, end } = detected;
-
-        //         const before = line.slice(0, start);
-        //         const after = line.slice(end);
-
-        //         // Already linked?
-        //         if (before.endsWith("[") && after.startsWith("]")) return;
-
-        //         const urlRef = this.inputRef_urlRef(inputRef);
-        //         const displayRef = this.urlRef_displayRef(urlRef);
-        //         const url = this.urlRef_url(urlRef);
-
-        //         // Build the fully compiled STEP link
-        //         const stepLink = `([${displayRef}](${url}))`;
-        //         if (!stepLink) return;
-
-        //         // Replace with Obsidian-style link
-        //         const newLine = line.slice(0, start) + stepLink + line.slice(end);
-
-        //         editor.setLine(cursor.line, newLine);
-        //     }
-        // });
-
         this.addCommand({
             id: 'auto-link-step-ref',
             name: 'Link/Unlink Reference at Cursor',
@@ -847,9 +812,36 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const cursor = editor.getCursor();
                 const line = editor.getLine(cursor.line);
 
-                // --- 1. Detect existing STEP link that contains reference= ---
-                // Format: ([DisplayRef](URL))
-                // URL must contain reference=Something
+                // --- 1. First: detect raw inputRef and link it ---
+                const detected = this.detectInputRef(line, cursor.ch);
+
+                if (detected) {
+                    const { inputRef, start, end } = detected;
+
+                    const before = line.slice(0, start);
+                    const after = line.slice(end);
+
+                    // Already linked?
+                    if (!(before.endsWith("[") && after.startsWith("]"))) {
+                        const urlRef = this.inputRef_urlRef(inputRef);
+                        const displayRef = this.urlRef_displayRef(urlRef);
+                        const url = this.urlRef_url(urlRef);
+
+                        const stepLink = `([${displayRef}](${url}))`;
+
+                        const newLine = line.slice(0, start) + stepLink + line.slice(end);
+                        editor.setLine(cursor.line, newLine);
+
+                        editor.setCursor({
+                            line: cursor.line,
+                            ch: start + stepLink.length
+                        });
+                    }
+
+                    return; // IMPORTANT: stop here if linking happened
+                }
+
+                // --- 2. If no raw ref detected: check for existing STEP link and unlink it ---
                 const stepLinkRegex = /\(\[([^\]]+)\]\(([^)]+reference=[^)]+)\)\)/g;
 
                 let match;
@@ -863,36 +855,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         const newLine = line.slice(0, start) + displayRef + line.slice(end);
                         editor.setLine(cursor.line, newLine);
+
+                        editor.setCursor({
+                            line: cursor.line,
+                            ch: start + displayRef.length
+                        });
+
                         return;
                     }
                 }
-
-                // --- 2. Normal behavior: detect raw inputRef ---
-                const detected = this.detectInputRef(line, cursor.ch);
-                if (!detected) return;
-
-                const { inputRef, start, end } = detected;
-
-                const before = line.slice(0, start);
-                const after = line.slice(end);
-
-                // Already linked?
-                if (before.endsWith("[") && after.startsWith("]")) return;
-
-                const urlRef = this.inputRef_urlRef(inputRef);
-                const displayRef = this.urlRef_displayRef(urlRef);
-                const url = this.urlRef_url(urlRef);
-
-                const stepLink = `([${displayRef}](${url}))`;
-                if (!stepLink) return;
-
-                const newLine = line.slice(0, start) + stepLink + line.slice(end);
-                editor.setLine(cursor.line, newLine);
-
-                // editor.setCursor({
-                //     line: cursor.line,
-                //     ch: start + displayRef.length
-                // });
             }
         });
 

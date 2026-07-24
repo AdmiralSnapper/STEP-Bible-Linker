@@ -2,9 +2,7 @@
   "autoSyncOnNavigation": true,
   "autoCloseSearchPanel": true,
   "enabledVersions": [
-    "ESV",
-    "SBLG",
-    "THOT"
+    "ESV"
   ],
   "useLocalUrlPrefix": true,
   "useLocalStepServer": true

@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl } = require('obsidian');
+const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl, Notice } = require('obsidian');
 
 //SETTINGS ======================================================================
 /**
@@ -1314,255 +1314,72 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return `${onlineBase}q=${match[1]}`;
     }
 
-    // CONVERTERS  =============================================================================================
-    // inputRef_urlRef(inputRef) {
-
-    //     const getBookMap = () => this.getBookMap();
-    //     const getMaxVerse = (book, chap) => this.getMaxVerse(book, chap);
-    //     const getMaxChapter = (book) => this.getMaxChapter(book);
-
-    //     const normalizeBook = (rawBook) => {
-    //         const lookup = rawBook.replace(/\s+/g, " ").toLowerCase();
-    //         const book = getBookMap()[lookup] || rawBook;
-    //         return book;
-    //     };
-
-    //     const bookKey = (book) => book.replace(/\s+/g, "");
-
-    //     const fail = (msg) => {
-    //         new Notice(msg);
-    //         return null;
-    //     };
-
-    //     const checkChapterRange = (book, chap1, chap2) => {
-    //         chap1 = parseInt(chap1);
-    //         chap2 = parseInt(chap2);
-
-    //         if (chap1 > chap2)
-    //             return fail("Invalid range");
-
-    //         const maxChap = getMaxChapter(book);
-    //         if (!maxChap || chap1 > maxChap || chap2 > maxChap)
-    //             return fail("Reference exceeds possible range");
-
-    //         return true;
-    //     };
-
-    //     const checkVerseRange = (book, chap1, verse1, chap2, verse2) => {
-    //         chap1 = parseInt(chap1);
-    //         chap2 = parseInt(chap2);
-
-    //         if (verse1 !== null) verse1 = parseInt(verse1);
-    //         if (verse2 !== null) verse2 = parseInt(verse2);
-
-    //         if (chap1 === chap2 && verse1 !== null && verse2 !== null) {
-    //             if (verse1 > verse2)
-    //                 return fail("Invalid range");
-    //         }
-
-    //         const max1 = getMaxVerse(book, chap1);
-    //         const max2 = getMaxVerse(book, chap2);
-
-    //         if (!max1 || !max2)
-    //             return fail("Regex has allowed error");
-
-    //         if (verse1 !== null && verse1 > max1)
-    //             return fail("Reference exceeds possible range");
-
-    //         if (verse2 !== null && verse2 > max2)
-    //             return fail("Reference exceeds possible range");
-
-    //         return true;
-    //     };
-
-    //     // --- PREPROCESS "e" EXPANSION BEFORE ANY PARSING ---
-
-    //     if (inputRef.includes("e")) {
-
-    //         const book = normalizeBook(inputRef.split(/\s+/)[0]);
-    //         let remainder = inputRef.slice(book.length).trim();
-
-    //         // Expand chapter.e → chapter.maxVerse
-    //         remainder = remainder.replace(/(\d+)[.:]e\b/g, (full, chap) => {
-    //             return `${chap}.${getMaxVerse(book, parseInt(chap))}`;
-    //         });
-
-    //         // Expand standalone "e"
-    //         remainder = remainder.replace(/\be\b/g, (full, offset, fullString) => {
-
-    //             // Use fullString (the remainder), NOT pre
-    //             const prev = fullString[offset - 1];
-
-    //             // If preceded by "-", treat as verse-level e
-    //             // If preceded by "-", treat as verse-level e
-    //             if (prev === "-") {
-
-    //                 const beforeDash = fullString.slice(0, offset);
-
-    //                 // If previous half contains "." or ":", then this e is verse-level
-    //                 if (/[.:]/.test(beforeDash)) {
-
-    //                     // Extract ONLY the chapter (before the dot or colon)
-    //                     const chapterPart = beforeDash.split(/[.:]/)[0].match(/\d+$/);
-    //                     if (chapterPart) {
-    //                         const chap = parseInt(chapterPart[0]);
-    //                         return getMaxVerse(book, chap);
-    //                     }
-    //                 }
-
-    //                 // Otherwise: chapter-level e
-    //                 return getMaxChapter(book);
-    //             }
-
-    //             // If preceded by "." or ":", verse-level e
-    //             if (prev === "." || prev === ":") {
-    //                 const chapMatch = fullString.slice(0, offset).match(/(\d+)[.:]$/);
-    //                 if (chapMatch) {
-    //                     const chap = parseInt(chapMatch[1]);
-    //                     return getMaxVerse(book, chap);
-    //                 }
-    //             }
-
-    //             // Otherwise chapter-level e
-    //             return getMaxChapter(book);
-    //         });
-
-    //         inputRef = `${book}${remainder}`.trim();
-    //     }
-
-    //     let text = inputRef;
-
-    //     {
-    //         const stepPattern =
-    //             /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)\.(\d+)(?:\.(\d+))?(?:-([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)?\.(\d+)(?:\.(\d+))?)?$/;
-
-    //         const m = text.match(stepPattern);
-    //         if (m) {
-
-    //             new Notice("match found");
-    //             const rawBook1 = m[1].trim();
-    //             const book1 = normalizeBook(rawBook1);
-    //             const chap1 = m[2];
-    //             const verse1 = m[3] || null;
-    //             const bk1 = bookKey(book1);
-
-    //             if (!m[4] && !verse1) return `${bk1}.${chap1}`;
-    //             if (!m[4] && verse1) return `${bk1}.${chap1}.${verse1}`;
-
-    //             const rawBook2 = (m[4] || rawBook1).trim();
-    //             const book2 = normalizeBook(rawBook2);
-    //             const chap2 = m[5];
-    //             const verse2 = m[6] || null;
-    //             const bk2 = bookKey(book2);
-
-    //             if (!checkChapterRange(book1, chap1, chap2)) return null;
-    //             if (!checkVerseRange(book1, chap1, verse1, chap2, verse2)) return null;
-
-    //             if (!verse1 && !verse2)
-    //                 return `${bk1}.${chap1}-${bk2}.${chap2}`;
-
-    //             if (verse1 && verse2)
-    //                 return `${bk1}.${chap1}.${verse1}-${bk2}.${chap2}.${verse2}`;
-
-    //             if (!verse1 && verse2)
-    //                 return `${bk1}.${chap1}-${bk2}.${chap2}.${verse2}`;
-
-    //             if (verse1 && !verse2)
-    //                 return `${bk1}.${chap1}.${verse1}-${bk2}.${chap1}.${chap2}`;
-    //         }
-    //     }
-
-    //     const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;
-    //     if (bookOnlyPattern.test(text) && !/\d+\s*:/.test(text)) {
-    //         const lookup = text.toLowerCase();
-    //         const book = getBookMap()[lookup];
-    //         if (book) return book.replace(/\s+/g, "");
-    //         return null;
-    //     }
-
-    //     const hasSpacedDash = /\s+-\s+/.test(text);
-
-    //     let clean = text
-    //         .replace(/–/g, "-")
-    //         .replace(/\s*-\s*/g, "-")
-    //         .replace(/:/g, ".");
-
-    //     const bookRegex = /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)/;
-    //     const match = clean.match(bookRegex);
-    //     if (!match) return null;
-
-    //     const rawBook = match[0].trim();
-    //     const book = normalizeBook(rawBook);
-    //     const bk = bookKey(book);
-
-    //     let remainder = clean.replace(match[0], "").trim();
-    //     if (!remainder) return null;
-
-    //     if (!remainder.includes("-")) {
-    //         const parts = remainder.split(".");
-    //         if (parts.length === 1) {
-    //             if (!checkChapterRange(book, parts[0], parts[0])) return null;
-    //             return `${bk}.${parts[0]}`;
-    //         }
-    //         if (parts.length === 2) {
-    //             if (!checkChapterRange(book, parts[0], parts[0])) return null;
-    //             if (!checkVerseRange(book, parts[0], parts[1], parts[0], parts[1])) return null;
-    //             return `${bk}.${parts[0]}.${parts[1]}`;
-    //         }
-    //         return null;
-    //     }
-
-    //     const [left, right] = remainder.split("-");
-    //     const leftParts = left.split(".");
-    //     const rightParts = right.split(".");
-
-    //     if (leftParts.length === 1 && rightParts.length === 1) {
-    //         if (!checkChapterRange(book, leftParts[0], rightParts[0])) return null;
-    //         return `${bk}.${leftParts[0]}-${bk}.${rightParts[0]}`;
-    //     }
-
-    //     if (leftParts.length === 2 && rightParts.length === 2) {
-    //         if (!checkChapterRange(book, leftParts[0], rightParts[0])) return null;
-    //         if (!checkVerseRange(book, leftParts[0], leftParts[1], rightParts[0], rightParts[1])) return null;
-    //         return `${bk}.${leftParts[0]}.${leftParts[1]}-${bk}.${rightParts[0]}.${rightParts[1]}`;
-    //     }
-
-    //     if (leftParts.length === 2 && rightParts.length === 1) {
-    //         if (!checkChapterRange(book, leftParts[0], rightParts[0])) return null;
-    //         if (!checkVerseRange(book, leftParts[0], leftParts[1], rightParts[0], null)) return null;
-    //         return `${bk}.${leftParts[0]}.${leftParts[1]}-${bk}.${leftParts[0]}.${rightParts[0]}`;
-    //     }
-
-    //     if (leftParts.length === 1 && rightParts.length === 2) {
-    //         if (!checkChapterRange(book, leftParts[0], rightParts[0])) return null;
-    //         if (!checkVerseRange(book, leftParts[0], null, rightParts[0], rightParts[1])) return null;
-    //         return `${bk}.${leftParts[0]}-${bk}.${rightParts[0]}.${rightParts[1]}`;
-    //     }
-
-    //     return null;
-    // }
+    // CONVERTERS =============================================================================================
     inputRef_urlRef(inputRef) {
 
         const getBookMap = () => this.getBookMap();
         const getMaxVerse = (book, chap) => this.getMaxVerse(book, chap);
-
-        const STEP_FIX = {
-            "Song of Solomon": "Song",
-            "Song of Songs": "Song",
-            "Canticles": "Song",
-            "Song": "Song"
-        };
+        const getMaxChapter = (book) => this.getMaxChapter(book);
 
         const normalizeBook = (rawBook) => {
             const lookup = rawBook.replace(/\s+/g, " ").toLowerCase();
-            const book = getBookMap()[lookup] || rawBook;
-            return STEP_FIX[book] || book;
+            return getBookMap()[lookup] || null;
         };
 
         const bookKey = (book) => book.replace(/\s+/g, "");
 
+        const validateChapVerse = (book, chap, verse = null) => {
+            const maxChap = getMaxChapter(book);
+            if (!maxChap) {
+                new Notice(`Unknown chapter limits for "${book}".`);
+                return false;
+            }
+            if (isNaN(chap) || chap < 1) {
+                new Notice(`Invalid chapter "${chap}". Chapters must be 1 or greater.`);
+                return false;
+            }
+            if (chap > maxChap) {
+                new Notice(`${book} only has ${maxChap} chapter${maxChap === 1 ? '' : 's'} (${chap} entered).`);
+                return false;
+            }
+            if (verse !== null) {
+                const maxV = getMaxVerse(book, chap);
+                if (maxV === null) {
+                    new Notice(`Unknown verse limits for ${book} ${chap}.`);
+                    return false;
+                }
+                if (isNaN(verse) || verse < 1) {
+                    new Notice(`Invalid verse "${verse}". Verses must be 1 or greater.`);
+                    return false;
+                }
+                if (verse > maxV) {
+                    new Notice(`${book} ${chap} only has ${maxV} verses (${verse} entered).`);
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const validateRange = (book1, c1, v1, book2, c2, v2) => {
+            if (!validateChapVerse(book1, c1, v1)) return false;
+            if (!validateChapVerse(book2, c2, v2)) return false;
+
+            if (book1 === book2) {
+                if (c2 < c1) {
+                    new Notice(`Invalid range: end chapter (${c2}) is before start chapter (${c1}).`);
+                    return false;
+                }
+                if (c1 === c2 && v1 !== null && v2 !== null && v2 < v1) {
+                    new Notice(`Invalid range: end verse (${v2}) is before start verse (${v1}).`);
+                    return false;
+                }
+            }
+            return true;
+        };
+
         const text = inputRef.trim();
 
+        // 1. STEP format check (e.g., Gen.1.1-Gen.1.5 or Gen.1.1-2)
         {
             const stepPattern =
                 /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)\.(\d+)(?:\.(\d+))?(?:-([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)?\.(\d+)(?:\.(\d+))?)?$/;
@@ -1571,34 +1388,54 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (m) {
                 const rawBook1 = m[1].trim();
                 const book1 = normalizeBook(rawBook1);
-                const chap1 = m[2];
-                const verse1 = m[3] || null;
+                if (!book1) {
+                    new Notice(`Unrecognized book name: "${rawBook1}".`);
+                    return null;
+                }
+                const chap1 = parseInt(m[2], 10);
+                const verse1 = m[3] ? parseInt(m[3], 10) : null;
                 const bk1 = bookKey(book1);
 
-                if (!m[4] && !verse1) return `${bk1}.${chap1}`;
-                if (!m[4] && verse1) return `${bk1}.${chap1}.${verse1}`;
+                if (!m[4] && !m[5]) {
+                    if (!validateChapVerse(book1, chap1, verse1)) return null;
+                    return verse1 ? `${bk1}.${chap1}.${verse1}` : `${bk1}.${chap1}`;
+                }
 
                 const rawBook2 = (m[4] || rawBook1).trim();
                 const book2 = normalizeBook(rawBook2);
-                const chap2 = m[5];
-                const verse2 = m[6] || null;
+                if (!book2) {
+                    new Notice(`Unrecognized book name: "${rawBook2}".`);
+                    return null;
+                }
+                const chap2 = parseInt(m[5], 10);
+                const verse2 = m[6] ? parseInt(m[6], 10) : null;
                 const bk2 = bookKey(book2);
 
-                if (!verse1 && !verse2) return `${bk1}.${chap1}-${bk2}.${chap2}`;
-                if (verse1 && verse2)
+                if (!verse1 && !verse2) {
+                    if (!validateRange(book1, chap1, null, book2, chap2, null)) return null;
+                    return `${bk1}.${chap1}-${bk2}.${chap2}`;
+                }
+                if (verse1 && verse2) {
+                    if (!validateRange(book1, chap1, verse1, book2, chap2, verse2)) return null;
                     return `${bk1}.${chap1}.${verse1}-${bk2}.${chap2}.${verse2}`;
-                if (!verse1 && verse2)
+                }
+                if (!verse1 && verse2) {
+                    if (!validateRange(book1, chap1, 1, book2, chap2, verse2)) return null;
                     return `${bk1}.${chap1}-${bk2}.${chap2}.${verse2}`;
-                if (verse1 && !verse2)
+                }
+                if (verse1 && !verse2) {
+                    if (!validateRange(book1, chap1, verse1, book2, chap1, chap2)) return null;
                     return `${bk1}.${chap1}.${verse1}-${bk2}.${chap1}.${chap2}`;
+                }
             }
         }
 
+        // 2. Book only check
         const bookOnlyPattern = /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*$/;
         if (bookOnlyPattern.test(text) && !/\d+\s*:/.test(text)) {
-            const lookup = text.toLowerCase();
-            const book = getBookMap()[lookup];
+            const book = normalizeBook(text);
             if (book) return book.replace(/\s+/g, "");
+            new Notice(`Unrecognized book name: "${text}".`);
             return null;
         }
 
@@ -1611,48 +1448,88 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         const bookRegex = /^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)/;
         const match = clean.match(bookRegex);
-        if (!match) return null;
+        if (!match) {
+            new Notice(`Could not parse Bible reference from "${text}".`);
+            return null;
+        }
 
         const rawBook = match[0].trim();
         const book = normalizeBook(rawBook);
+        if (!book) {
+            new Notice(`Unrecognized book name: "${rawBook}".`);
+            return null;
+        }
         const bk = bookKey(book);
 
         let remainder = clean.replace(match[0], "").trim();
-        if (!remainder) return null;
+        if (!remainder) {
+            return bk;
+        }
 
         if (!remainder.includes("-")) {
-            const parts = remainder.split(".");
-            if (parts.length === 1) return `${bk}.${parts[0]}`;
-            if (parts.length === 2) return `${bk}.${parts[0]}.${parts[1]}`;
+            const parts = remainder.split(".").map(p => parseInt(p, 10));
+            if (parts.length === 1) {
+                if (!validateChapVerse(book, parts[0])) return null;
+                return `${bk}.${parts[0]}`;
+            }
+            if (parts.length === 2) {
+                if (!validateChapVerse(book, parts[0], parts[1])) return null;
+                return `${bk}.${parts[0]}.${parts[1]}`;
+            }
+            new Notice(`Invalid passage format: "${text}".`);
             return null;
         }
 
         const [left, right] = remainder.split("-");
-        const leftParts = left.split(".");
-        const rightParts = right.split(".");
+        const leftParts = left.split(".").map(p => parseInt(p, 10));
+        const rightParts = right.split(".").map(p => parseInt(p, 10));
 
         if (hasSpacedDash && leftParts.length === 2 && rightParts.length === 1) {
             const lChap = leftParts[0];
             const lVerse = leftParts[1];
             const rChap = rightParts[0];
             const maxVerse = getMaxVerse(book, rChap);
+            if (!validateRange(book, lChap, lVerse, book, rChap, maxVerse)) return null;
             return `${bk}.${lChap}.${lVerse}-${bk}.${rChap}.${maxVerse}`;
         }
 
-        if (leftParts.length === 1 && rightParts.length === 1)
-            return `${bk}.${leftParts[0]}-${bk}.${rightParts[0]}`;
+        if (leftParts.length === 1 && rightParts.length === 1) {
+            const lChap = leftParts[0];
+            const rChap = rightParts[0];
+            if (!validateRange(book, lChap, null, book, rChap, null)) return null;
+            return `${bk}.${lChap}-${bk}.${rChap}`;
+        }
 
-        if (leftParts.length === 2 && rightParts.length === 1)
-            return `${bk}.${leftParts[0]}.${leftParts[1]}-${bk}.${leftParts[0]}.${rightParts[0]}`;
+        if (leftParts.length === 2 && rightParts.length === 1) {
+            const lChap = leftParts[0];
+            const lVerse = leftParts[1];
+            const rVerse = rightParts[0];
+            if (!validateRange(book, lChap, lVerse, book, lChap, rVerse)) return null;
+            return `${bk}.${lChap}.${lVerse}-${bk}.${lChap}.${rVerse}`;
+        }
 
-        if (leftParts.length === 1 && rightParts.length === 2)
-            return `${bk}.${leftParts[0]}-${bk}.${rightParts[0]}.${rightParts[1]}`;
+        if (leftParts.length === 1 && rightParts.length === 2) {
+            const lChap = leftParts[0];
+            const rChap = rightParts[0];
+            const rVerse = rightParts[1];
+            if (!validateRange(book, lChap, null, book, rChap, rVerse)) return null;
+            return `${bk}.${lChap}-${bk}.${rChap}.${rVerse}`;
+        }
 
-        if (leftParts.length === 2 && rightParts.length === 2)
-            return `${bk}.${leftParts[0]}.${leftParts[1]}-${bk}.${rightParts[0]}.${rightParts[1]}`;
+        if (leftParts.length === 2 && rightParts.length === 2) {
+            const lChap = leftParts[0];
+            const lVerse = leftParts[1];
+            const rChap = rightParts[0];
+            const rVerse = rightParts[1];
+            if (!validateRange(book, lChap, lVerse, book, rChap, rVerse)) return null;
+            return `${bk}.${lChap}.${lVerse}-${bk}.${rChap}.${rVerse}`;
+        }
 
+        new Notice(`Invalid reference range format: "${text}".`);
         return null;
     }
+
+
 
     urlRef_displayRef(urlRef) {
 
@@ -1706,8 +1583,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         return urlRef;
     }
-
-
     url_urlRef(url) {
         const match = url.match(/reference=([^&]+)/);
         if (!match) return null;

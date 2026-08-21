@@ -1215,28 +1215,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     }
     buildInputRefRegex() {
         const books = this.getAllBookPatterns();
-
-        // Book group
         const bookGroup = `(?:${books.join("|")})`;
 
-        // A chapter or chapter.verse or chapter.e or chapter.verse-e
+        // Chapter, Chapter.Verse, or Chapter.e
         const cv = `\\d+(?:[.:](?:\\d+|e))?`;
 
-        // Allow ranges:
-        //   3-e
-        //   3.16-e
-        //   3.16-4.e
-        //   3-4
-        //   3.16-4.20
-        const cvOrE = `(?:${cv}|e)`;
-        const range = `${cvOrE}(?:\\s*-\\s*${cvOrE})?`;
+        // Right-hand side of range: cv, or standalone 'e'
+        const range = `${cv}(?:\\s*-\\s*(?:${cv}|e))?`;
 
-        // Allow Bookname3.1 or Bookname 3.1 or Bookname 3.1-e
-        const pattern = `${bookGroup}(?:\\s*${range})?`;
+        const pattern = `\\b${bookGroup}\\b(?:\\s*${range})?`;
 
         return new RegExp(pattern, "gi");
     }
-
 
     
     // SEARCH HELPERS =========================================================================================
@@ -1328,6 +1318,38 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         const bookKey = (book) => book.replace(/\s+/g, "");
 
+        let text = inputRef.trim();
+
+        // --- PREPROCESS 'e' (End of chapter or end of book) ---
+        const bookMatch = text.match(/^([1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)/);
+        if (bookMatch) {
+            const rawBook = bookMatch[0].trim();
+            const resolvedBook = normalizeBook(rawBook);
+            if (resolvedBook) {
+                let rest = text.substring(bookMatch[0].length).trim();
+
+                // Replace 4.e -> 4.<maxVerse>
+                rest = rest.replace(/(\d+)[.:]e\b/gi, (_, chap) => {
+                    const maxV = getMaxVerse(resolvedBook, parseInt(chap, 10));
+                    return maxV ? `${chap}.${maxV}` : `${chap}.e`;
+                });
+
+                // Replace 3.16-e -> 3.16-<maxVerse>
+                rest = rest.replace(/(\d+)[.:](\d+)\s*-\s*e\b/gi, (_, chap, verse) => {
+                    const maxV = getMaxVerse(resolvedBook, parseInt(chap, 10));
+                    return maxV ? `${chap}.${verse}-${maxV}` : `${chap}.${verse}-e`;
+                });
+
+                // Replace 3-e -> 3-<maxChapter>
+                rest = rest.replace(/(\d+)\s*-\s*e\b/gi, (_, chap) => {
+                    const maxC = getMaxChapter(resolvedBook);
+                    return maxC ? `${chap}-${maxC}` : `${chap}-e`;
+                });
+
+                text = `${rawBook} ${rest}`.trim();
+            }
+        }
+
         const validateChapVerse = (book, chap, verse = null) => {
             const maxChap = getMaxChapter(book);
             if (!maxChap) {
@@ -1377,8 +1399,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             return true;
         };
 
-        const text = inputRef.trim();
-
         // 1. STEP format check (e.g., Gen.1.1-Gen.1.5 or Gen.1.1-2)
         {
             const stepPattern =
@@ -1421,7 +1441,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
                 if (!verse1 && verse2) {
                     if (!validateRange(book1, chap1, 1, book2, chap2, verse2)) return null;
-                    return `${bk1}.${chap1}-${bk2}.${chap2}.${verse2}`;
+                    return `${bk1}.${chap1}.1-${bk2}.${chap2}.${verse2}`;
                 }
                 if (verse1 && !verse2) {
                     if (!validateRange(book1, chap1, verse1, book2, chap1, chap2)) return null;
@@ -1438,8 +1458,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             new Notice(`Unrecognized book name: "${text}".`);
             return null;
         }
-
-        const hasSpacedDash = /\s+-\s+/.test(text);
 
         let clean = text
             .replace(/–/g, "-")
@@ -1484,15 +1502,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const leftParts = left.split(".").map(p => parseInt(p, 10));
         const rightParts = right.split(".").map(p => parseInt(p, 10));
 
-        if (hasSpacedDash && leftParts.length === 2 && rightParts.length === 1) {
-            const lChap = leftParts[0];
-            const lVerse = leftParts[1];
-            const rChap = rightParts[0];
-            const maxVerse = getMaxVerse(book, rChap);
-            if (!validateRange(book, lChap, lVerse, book, rChap, maxVerse)) return null;
-            return `${bk}.${lChap}.${lVerse}-${bk}.${rChap}.${maxVerse}`;
-        }
-
+        // Gen 1 - 3 -> Gen.1-Gen.3
         if (leftParts.length === 1 && rightParts.length === 1) {
             const lChap = leftParts[0];
             const rChap = rightParts[0];
@@ -1500,6 +1510,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             return `${bk}.${lChap}-${bk}.${rChap}`;
         }
 
+        // Gen 1:1 - 5 -> Gen.1.1-Gen.1.5
         if (leftParts.length === 2 && rightParts.length === 1) {
             const lChap = leftParts[0];
             const lVerse = leftParts[1];
@@ -1508,14 +1519,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             return `${bk}.${lChap}.${lVerse}-${bk}.${lChap}.${rVerse}`;
         }
 
+        // Gen 3 - 4.5 -> Gen.3.1-Gen.4.5
         if (leftParts.length === 1 && rightParts.length === 2) {
             const lChap = leftParts[0];
             const rChap = rightParts[0];
             const rVerse = rightParts[1];
-            if (!validateRange(book, lChap, null, book, rChap, rVerse)) return null;
-            return `${bk}.${lChap}-${bk}.${rChap}.${rVerse}`;
+            if (!validateRange(book, lChap, 1, book, rChap, rVerse)) return null;
+            return `${bk}.${lChap}.1-${bk}.${rChap}.${rVerse}`;
         }
 
+        // Gen 1.1 - 2.5 -> Gen.1.1-Gen.2.5
         if (leftParts.length === 2 && rightParts.length === 2) {
             const lChap = leftParts[0];
             const lVerse = leftParts[1];
@@ -1528,6 +1541,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         new Notice(`Invalid reference range format: "${text}".`);
         return null;
     }
+
 
 
 

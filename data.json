@@ -1,5 +1,5 @@
 {
-  "autoSyncOnNavigation": true,
+  "autoSyncOnNavigation": false,
   "autoCloseSearchPanel": false,
   "useLocalStepServer": true,
   "globalVersions": [
@@ -9,8 +9,7 @@
     "LXX"
   ],
   "localVersions": [
-    "ESV",
-    "LXX"
+    "ESV"
   ],
   "useLocalUrlPrefix": true,
   "enabledVersions": [
@@ -20,7 +19,8 @@
     "LXX"
   ],
   "lastSyncedVersions": [
-    "ESV",
-    "LXX"
-  ]
+    "ESV"
+  ],
+  "lastSyncedServerMode": true,
+  "searchModalSettingsOpen": false
 }

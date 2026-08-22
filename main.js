@@ -714,9 +714,15 @@ class StepBibleSearchModal extends Modal {
         this.prefill = prefill;
         this._isSubmitting = false;
 
-        // Track last synced vault versions (default to localVersions if not set)
+        // Track last synced vault states (default to current if not set)
         if (!this.plugin.settings.lastSyncedVersions) {
             this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
+        }
+        if (this.plugin.settings.lastSyncedServerMode === undefined) {
+            this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
+        }
+        if (this.plugin.settings.searchModalSettingsOpen === undefined) {
+            this.plugin.settings.searchModalSettingsOpen = true;
         }
     }
 
@@ -748,13 +754,18 @@ class StepBibleSearchModal extends Modal {
         contentEl.style.gap = "10px";
         contentEl.style.padding = "16px";
 
-        // 1. Reference Search Input Box
-        const input = contentEl.createEl("input", {
+        // 1. INPUT & TOGGLE ICON ROW ================================================================
+        const inputRow = contentEl.createEl("div");
+        inputRow.style.display = "flex";
+        inputRow.style.alignItems = "center";
+        inputRow.style.gap = "8px";
+
+        const input = inputRow.createEl("input", {
             type: "text",
             placeholder: "Enter Reference (e.g. John 3.16)"
         });
 
-        input.style.width = "100%";
+        input.style.flex = "1";
         input.style.margin = "0";
         input.style.padding = "10px 10px";
         input.style.fontSize = "14px";
@@ -767,50 +778,130 @@ class StepBibleSearchModal extends Modal {
             input.select();
         }
 
-        // 2. Version Control & Changed Indicator Row
-        const buttonsRow = contentEl.createEl("div");
-        buttonsRow.style.display = "flex";
-        buttonsRow.style.justifyContent = "space-between";
-        buttonsRow.style.alignItems = "center";
-        buttonsRow.style.gap = "8px";
+        const isCurrentlyOpen = this.plugin.settings.searchModalSettingsOpen;
 
-        const pillsContainer = buttonsRow.createEl("div");
-        pillsContainer.style.display = "flex";
-        pillsContainer.style.flexWrap = "wrap";
-        pillsContainer.style.gap = "6px";
+        // Settings Toggle Button (Gear Icon)
+        const toggleBtn = inputRow.createEl("button");
+        toggleBtn.tabIndex = -1;
+        toggleBtn.style.height = "38px";
+        toggleBtn.style.width = "38px";
+        toggleBtn.style.display = "flex";
+        toggleBtn.style.alignItems = "center";
+        toggleBtn.style.justifyContent = "center";
+        toggleBtn.style.fontSize = "16px";
+        toggleBtn.style.cursor = "pointer";
+        toggleBtn.style.borderRadius = "4px";
+        toggleBtn.style.border = "1px solid var(--background-modifier-border)";
+        toggleBtn.style.backgroundColor = isCurrentlyOpen
+            ? "var(--interactive-accent)"
+            : "var(--background-secondary)";
+        toggleBtn.style.color = isCurrentlyOpen
+            ? "var(--text-on-accent)"
+            : "var(--text-muted)";
+        toggleBtn.style.userSelect = "none";
+        toggleBtn.style.outline = "none";
+        toggleBtn.style.transition = "all 0.25s cubic-bezier(0.4, 0, 0.2, 1)";
 
-        const changedIndicator = buttonsRow.createEl("span", { text: "" });
-        changedIndicator.style.flexShrink = "0";
-        changedIndicator.style.fontSize = "11px";
-        changedIndicator.style.fontWeight = "bold";
-        changedIndicator.style.color = "var(--text-accent)";
-        changedIndicator.style.userSelect = "none";
+        const gearIcon = toggleBtn.createEl("span", { text: "⚙" });
+        gearIcon.style.display = "inline-block";
+        gearIcon.style.transition = "transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)";
+        gearIcon.style.transform = isCurrentlyOpen ? "rotate(90deg)" : "rotate(0deg)";
 
-        const isOutOfSync = () => {
+        // 2. ANIMATED COLLAPSIBLE WRAPPER ==========================================================
+        const animWrapper = contentEl.createEl("div");
+        animWrapper.style.display = "grid";
+        animWrapper.style.gridTemplateRows = isCurrentlyOpen ? "1fr" : "0fr";
+        animWrapper.style.transition = "grid-template-rows 0.25s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease";
+        animWrapper.style.opacity = isCurrentlyOpen ? "1" : "0";
+
+        const settingsDrawer = animWrapper.createEl("div");
+        settingsDrawer.style.overflow = "hidden";
+        settingsDrawer.style.display = "flex";
+        settingsDrawer.style.flexDirection = "column";
+        settingsDrawer.style.gap = "12px";
+        settingsDrawer.style.paddingTop = isCurrentlyOpen ? "6px" : "0px";
+        settingsDrawer.style.transition = "padding 0.25s ease";
+
+        toggleBtn.onmousedown = (e) => e.preventDefault();
+
+        toggleBtn.onclick = async (e) => {
+            e.preventDefault();
+            const isOpen = !this.plugin.settings.searchModalSettingsOpen;
+            this.plugin.settings.searchModalSettingsOpen = isOpen;
+
+            animWrapper.style.gridTemplateRows = isOpen ? "1fr" : "0fr";
+            animWrapper.style.opacity = isOpen ? "1" : "0";
+            settingsDrawer.style.paddingTop = isOpen ? "6px" : "0px";
+
+            toggleBtn.style.backgroundColor = isOpen
+                ? "var(--interactive-accent)"
+                : "var(--background-secondary)";
+            toggleBtn.style.color = isOpen
+                ? "var(--text-on-accent)"
+                : "var(--text-muted)";
+            gearIcon.style.transform = isOpen ? "rotate(90deg)" : "rotate(0deg)";
+
+            await this.plugin.saveSettings();
+            input.focus();
+        };
+
+        const isVersionsOutOfSync = () => {
             const local = this.plugin.settings.localVersions || [];
             const synced = this.plugin.settings.lastSyncedVersions || [];
             if (local.length !== synced.length) return true;
             return local.some((v, i) => v !== synced[i]);
         };
 
-        const renderControls = () => {
-            pillsContainer.empty();
+        const isServerOutOfSync = () => {
+            return this.plugin.settings.useLocalStepServer !== this.plugin.settings.lastSyncedServerMode;
+        };
+
+        // =========================================================================
+        // SECTION 1: VERSIONS
+        // =========================================================================
+        const versionsSection = settingsDrawer.createEl("div");
+        versionsSection.style.display = "flex";
+        versionsSection.style.flexDirection = "column";
+        versionsSection.style.gap = "6px";
+
+        const versionsTitle = versionsSection.createEl("span", { text: "Versions" });
+        versionsTitle.style.fontSize = "12px";
+        versionsTitle.style.fontWeight = "bold";
+        versionsTitle.style.color = "var(--text-muted)";
+
+        const versionsRow = versionsSection.createEl("div");
+        versionsRow.style.display = "flex";
+        versionsRow.style.justifyContent = "space-between";
+        versionsRow.style.alignItems = "center";
+        versionsRow.style.gap = "8px";
+
+        const versionPillsContainer = versionsRow.createEl("div");
+        versionPillsContainer.style.display = "flex";
+        versionPillsContainer.style.flexWrap = "wrap";
+        versionPillsContainer.style.gap = "6px";
+
+        const changedIndicator = versionsRow.createEl("span", { text: "" });
+        changedIndicator.style.flexShrink = "0";
+        changedIndicator.style.fontSize = "11px";
+        changedIndicator.style.fontWeight = "bold";
+        changedIndicator.style.color = "var(--text-accent)";
+        changedIndicator.style.userSelect = "none";
+
+        const renderVersionPills = () => {
+            versionPillsContainer.empty();
 
             const globalList = this.plugin.settings.globalVersions || [];
             const localList = this.plugin.settings.localVersions || [];
 
-            // Update Changed indicator
-            if (isOutOfSync()) {
+            if (isVersionsOutOfSync()) {
                 changedIndicator.setText("● Changed");
             } else {
                 changedIndicator.setText("");
             }
 
-            // Render Version Pills
             globalList.forEach(version => {
                 const isActive = localList.includes(version);
-
-                const btn = pillsContainer.createEl("button", { text: version });
+                const btn = versionPillsContainer.createEl("button", { text: version });
 
                 btn.tabIndex = -1;
                 btn.style.padding = "4px 10px";
@@ -845,13 +936,168 @@ class StepBibleSearchModal extends Modal {
                     }
 
                     await this.plugin.saveSettings();
-                    renderControls();
+                    renderVersionPills();
                     input.focus();
                 };
             });
         };
 
-        renderControls();
+        renderVersionPills();
+
+        // =========================================================================
+        // SECTION 2: SEARCH PANEL
+        // =========================================================================
+        const searchPanelSection = settingsDrawer.createEl("div");
+        searchPanelSection.style.display = "flex";
+        searchPanelSection.style.flexDirection = "column";
+        searchPanelSection.style.gap = "6px";
+
+        const searchPanelTitle = searchPanelSection.createEl("span", { text: "Search Panel" });
+        searchPanelTitle.style.fontSize = "12px";
+        searchPanelTitle.style.fontWeight = "bold";
+        searchPanelTitle.style.color = "var(--text-muted)";
+
+        const searchPanelPillsContainer = searchPanelSection.createEl("div");
+        searchPanelPillsContainer.style.display = "flex";
+        searchPanelPillsContainer.style.flexWrap = "wrap";
+        searchPanelPillsContainer.style.gap = "6px";
+
+        const renderSearchPanelPills = () => {
+            searchPanelPillsContainer.empty();
+
+            const panelControls = [
+                {
+                    name: "Auto Search",
+                    get: () => this.plugin.settings.autoSyncOnNavigation,
+                    set: async (val) => {
+                        this.plugin.settings.autoSyncOnNavigation = val;
+                        await this.plugin.saveSettings();
+                    }
+                },
+                {
+                    name: "Auto Close",
+                    get: () => this.plugin.settings.autoCloseSearchPanel,
+                    set: async (val) => {
+                        this.plugin.settings.autoCloseSearchPanel = val;
+                        await this.plugin.saveSettings();
+                    }
+                }
+            ];
+
+            panelControls.forEach(ctrl => {
+                const isActive = ctrl.get();
+                const btn = searchPanelPillsContainer.createEl("button", { text: ctrl.name });
+
+                btn.tabIndex = -1;
+                btn.style.padding = "4px 10px";
+                btn.style.fontSize = "12px";
+                btn.style.fontWeight = "bold";
+                btn.style.borderRadius = "12px";
+                btn.style.cursor = "pointer";
+                btn.style.border = "none";
+                btn.style.userSelect = "none";
+                btn.style.outline = "none";
+                btn.style.transition = "all 0.15s ease-in-out";
+
+                if (isActive) {
+                    btn.style.backgroundColor = "var(--interactive-accent)";
+                    btn.style.color = "var(--text-on-accent)";
+                } else {
+                    btn.style.backgroundColor = "var(--background-modifier-border)";
+                    btn.style.color = "var(--text-muted)";
+                    btn.style.opacity = "0.7";
+                }
+
+                btn.onmousedown = (e) => e.preventDefault();
+
+                btn.onclick = async (e) => {
+                    e.preventDefault();
+                    await ctrl.set(!isActive);
+                    renderSearchPanelPills();
+                    input.focus();
+                };
+            });
+        };
+
+        renderSearchPanelPills();
+
+        // =========================================================================
+        // SECTION 3: SERVER
+        // =========================================================================
+        const serverSection = settingsDrawer.createEl("div");
+        serverSection.style.display = "flex";
+        serverSection.style.flexDirection = "column";
+        serverSection.style.gap = "6px";
+
+        const serverTitle = serverSection.createEl("span", { text: "Server" });
+        serverTitle.style.fontSize = "12px";
+        serverTitle.style.fontWeight = "bold";
+        serverTitle.style.color = "var(--text-muted)";
+
+        const serverRow = serverSection.createEl("div");
+        serverRow.style.display = "flex";
+        serverRow.style.justifyContent = "space-between";
+        serverRow.style.alignItems = "center";
+
+        const serverPillContainer = serverRow.createEl("div");
+
+        const localStatusIndicator = serverRow.createEl("span", { text: "" });
+        localStatusIndicator.style.fontSize = "11px";
+        localStatusIndicator.style.fontWeight = "bold";
+        localStatusIndicator.style.userSelect = "none";
+
+        const checkLocalServerStatus = async () => {
+            const isRunning = await this.plugin.isLocalStepRunning();
+            if (isRunning) {
+                localStatusIndicator.setText("● Localhost Running");
+                localStatusIndicator.style.color = "#4caf50";
+            } else {
+                localStatusIndicator.setText("● Localhost Offline");
+                localStatusIndicator.style.color = "var(--text-muted)";
+            }
+        };
+
+        checkLocalServerStatus();
+
+        const renderServerPill = () => {
+            serverPillContainer.empty();
+
+            const isActive = this.plugin.settings.useLocalStepServer;
+            const btn = serverPillContainer.createEl("button", { text: "Localhost" });
+
+            btn.tabIndex = -1;
+            btn.style.padding = "4px 10px";
+            btn.style.fontSize = "12px";
+            btn.style.fontWeight = "bold";
+            btn.style.borderRadius = "12px";
+            btn.style.cursor = "pointer";
+            btn.style.border = "none";
+            btn.style.userSelect = "none";
+            btn.style.outline = "none";
+            btn.style.transition = "all 0.15s ease-in-out";
+
+            if (isActive) {
+                btn.style.backgroundColor = "var(--interactive-accent)";
+                btn.style.color = "var(--text-on-accent)";
+            } else {
+                btn.style.backgroundColor = "var(--background-modifier-border)";
+                btn.style.color = "var(--text-muted)";
+                btn.style.opacity = "0.7";
+            }
+
+            btn.onmousedown = (e) => e.preventDefault();
+
+            btn.onclick = async (e) => {
+                e.preventDefault();
+                this.plugin.settings.useLocalStepServer = !isActive;
+                await this.plugin.saveSettings();
+                await checkLocalServerStatus();
+                renderServerPill();
+                input.focus();
+            };
+        };
+
+        renderServerPill();
 
         const resetInputState = () => {
             this._isSubmitting = false;
@@ -890,21 +1136,24 @@ class StepBibleSearchModal extends Modal {
                 }
 
                 const url = this.plugin.urlRef_url(urlRef);
-                const shouldRewrite = isOutOfSync();
+                const shouldRewrite = isVersionsOutOfSync() || isServerOutOfSync();
 
-                // 1. Open the URL immediately
                 if (url) {
                     await this.openStepUrl(url);
                 }
 
-                // 2. Close modal immediately
                 this.close();
 
-                // 3. Perform vault rewrite in background if versions changed
                 if (shouldRewrite) {
                     setTimeout(async () => {
-                        await this.plugin.rewriteStepLinks();
-                        this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
+                        if (isServerOutOfSync()) {
+                            await this.plugin.toggleLocaltoOnline();
+                            this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
+                        }
+                        if (isVersionsOutOfSync()) {
+                            await this.plugin.rewriteStepLinks();
+                            this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
+                        }
                         await this.plugin.saveSettings();
                     }, 50);
                 }
@@ -923,6 +1172,9 @@ class StepBibleSearchModal extends Modal {
         this.contentEl.empty();
     }
 }
+
+
+
 
 
 
@@ -1683,10 +1935,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         new Notice(`Invalid reference range format: "${text}".`);
         return null;
     }
-
-
-
-
     urlRef_displayRef(urlRef) {
 
         const canonicalToDisplay = (canonical) => {

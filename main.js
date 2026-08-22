@@ -698,6 +698,7 @@ class StepBibleSearchModal extends Modal {
         super(app);
         this.plugin = plugin;
         this.prefill = prefill;
+        this._isSubmitting = false;
     }
 
     async openStepUrl(url) {
@@ -745,30 +746,51 @@ class StepBibleSearchModal extends Modal {
             input.select();
         }
 
+        const resetInputState = () => {
+            this._isSubmitting = false;
+            input.disabled = false;
+            input.style.opacity = "1";
+            input.style.cursor = "text";
+            input.focus();
+        };
+
         this._keydownHandler = async (evt) => {
             if (evt.key === "Enter") {
                 evt.preventDefault();
                 evt.stopPropagation();
 
+                if (this._isSubmitting) return;
+
+                // Grey out and disable input
+                this._isSubmitting = true;
+                input.disabled = true;
+                input.style.opacity = "0.5";
+                input.style.cursor = "not-allowed";
+
                 const inputRef = (input.value || "").trim();
                 const regex = this.plugin.buildInputRefRegex();
                 const match = inputRef.match(regex);
 
-                //Check if input ref matches regex
+                // Check if input ref matches regex
                 if (!match || match[0].trim() !== inputRef) {
                     new Notice("Not a valid Bible reference.");
+                    resetInputState();
                     return;
                 }
 
                 const urlRef = this.plugin.inputRef_urlRef(inputRef);
+                if (!urlRef) {
+                    resetInputState();
+                    return;
+                }
+
                 const url = this.plugin.urlRef_url(urlRef);
 
-                //If no url was produced, fail silently. A warning will appear called by inputRef_urlRef()
-                if (!urlRef) return;
-
-                if (url) await this.openStepUrl(url);
-
-                this.close();
+                try {
+                    if (url) await this.openStepUrl(url);
+                } finally {
+                    this.close();
+                }
             }
         };
 
@@ -784,6 +806,7 @@ class StepBibleSearchModal extends Modal {
         this.contentEl.empty();
     }
 }
+
 
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {

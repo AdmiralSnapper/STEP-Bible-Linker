@@ -1550,7 +1550,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     this.attachWebviewListeners(webviewEl);
                     if (this.settings.autoSyncOnNavigation) {
                         const url = leaf.view.url || webviewEl.getURL?.();
-                        if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: false });
+                        if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                     }
                     await this.autoCollapseStepToolbar(webviewEl);
                 }

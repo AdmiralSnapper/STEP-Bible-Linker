@@ -714,6 +714,12 @@ class StepBibleSearchModal extends Modal {
         this.prefill = prefill;
         this._isSubmitting = false;
 
+        // Draft state (only applied when Enter is pressed)
+        this._draftLocalVersions = [...(this.plugin.settings.localVersions || [])];
+        this._draftLocalStepServer = this.plugin.settings.useLocalStepServer;
+        this._draftAutoSync = this.plugin.settings.autoSyncOnNavigation;
+        this._draftAutoClose = this.plugin.settings.autoCloseSearchPanel;
+
         // Track last synced vault states (default to current if not set)
         if (!this.plugin.settings.lastSyncedVersions) {
             this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
@@ -742,6 +748,38 @@ class StepBibleSearchModal extends Modal {
             }
         }
 
+        // 1. Look for an existing webviewer tab inside Obsidian
+        const leaves = this.app.workspace.getLeavesOfType("webviewer");
+        if (leaves.length > 0) {
+            const leaf = leaves[0];
+            this.app.workspace.revealLeaf(leaf);
+
+            const view = leaf.view;
+            if (view) {
+                if (view.webview?.loadURL) {
+                    view.webview.loadURL(url);
+                    return;
+                }
+                if (typeof view.navigate === "function") {
+                    view.navigate(url);
+                    return;
+                }
+            }
+        }
+
+        // 2. Open inside Obsidian's workspace tab
+        const leaf = this.app.workspace.getLeaf("tab");
+        if (leaf && typeof leaf.setViewState === "function") {
+            await leaf.setViewState({
+                type: "webviewer",
+                active: true,
+                state: { url }
+            });
+            this.app.workspace.revealLeaf(leaf);
+            return;
+        }
+
+        // 3. Fallback
         window.open(url, "_blank");
     }
 
@@ -819,8 +857,29 @@ class StepBibleSearchModal extends Modal {
         settingsDrawer.style.display = "flex";
         settingsDrawer.style.flexDirection = "column";
         settingsDrawer.style.gap = "12px";
-        settingsDrawer.style.paddingTop = isCurrentlyOpen ? "6px" : "0px";
-        settingsDrawer.style.transition = "padding 0.25s ease";
+        settingsDrawer.style.padding = isCurrentlyOpen ? "12px" : "0px 12px";
+        settingsDrawer.style.borderRadius = "6px";
+        settingsDrawer.style.border = "1.5px solid var(--background-modifier-border)";
+        settingsDrawer.style.backgroundColor = "transparent";
+        settingsDrawer.style.transition = "border-color 0.2s ease, padding 0.25s ease";
+
+        const hasAnyDraftChanges = () => {
+            const local = this._draftLocalVersions;
+            const savedLocal = this.plugin.settings.localVersions || [];
+            const versionsChanged = local.length !== savedLocal.length || local.some((v, i) => v !== savedLocal[i]);
+            const serverChanged = this._draftLocalStepServer !== this.plugin.settings.useLocalStepServer;
+            const autoSyncChanged = this._draftAutoSync !== this.plugin.settings.autoSyncOnNavigation;
+            const autoCloseChanged = this._draftAutoClose !== this.plugin.settings.autoCloseSearchPanel;
+            return versionsChanged || serverChanged || autoSyncChanged || autoCloseChanged;
+        };
+
+        const updateDrawerBorder = () => {
+            if (hasAnyDraftChanges()) {
+                settingsDrawer.style.borderColor = "var(--interactive-accent)";
+            } else {
+                settingsDrawer.style.borderColor = "var(--background-modifier-border)";
+            }
+        };
 
         toggleBtn.onmousedown = (e) => e.preventDefault();
 
@@ -831,7 +890,7 @@ class StepBibleSearchModal extends Modal {
 
             animWrapper.style.gridTemplateRows = isOpen ? "1fr" : "0fr";
             animWrapper.style.opacity = isOpen ? "1" : "0";
-            settingsDrawer.style.paddingTop = isOpen ? "6px" : "0px";
+            settingsDrawer.style.padding = isOpen ? "12px" : "0px 12px";
 
             toggleBtn.style.backgroundColor = isOpen
                 ? "var(--interactive-accent)"
@@ -846,14 +905,14 @@ class StepBibleSearchModal extends Modal {
         };
 
         const isVersionsOutOfSync = () => {
-            const local = this.plugin.settings.localVersions || [];
+            const local = this._draftLocalVersions;
             const synced = this.plugin.settings.lastSyncedVersions || [];
             if (local.length !== synced.length) return true;
             return local.some((v, i) => v !== synced[i]);
         };
 
         const isServerOutOfSync = () => {
-            return this.plugin.settings.useLocalStepServer !== this.plugin.settings.lastSyncedServerMode;
+            return this._draftLocalStepServer !== this.plugin.settings.lastSyncedServerMode;
         };
 
         // =========================================================================
@@ -891,7 +950,7 @@ class StepBibleSearchModal extends Modal {
             versionPillsContainer.empty();
 
             const globalList = this.plugin.settings.globalVersions || [];
-            const localList = this.plugin.settings.localVersions || [];
+            const localList = this._draftLocalVersions;
 
             if (isVersionsOutOfSync()) {
                 changedIndicator.setText("● Changed");
@@ -925,18 +984,18 @@ class StepBibleSearchModal extends Modal {
 
                 btn.onmousedown = (e) => e.preventDefault();
 
-                btn.onclick = async (e) => {
+                btn.onclick = (e) => {
                     e.preventDefault();
 
                     if (isActive) {
-                        this.plugin.settings.localVersions = this.plugin.settings.localVersions.filter(v => v !== version);
+                        this._draftLocalVersions = this._draftLocalVersions.filter(v => v !== version);
                     } else {
-                        const updated = [...this.plugin.settings.localVersions, version];
-                        this.plugin.settings.localVersions = globalList.filter(v => updated.includes(v));
+                        const updated = [...this._draftLocalVersions, version];
+                        this._draftLocalVersions = globalList.filter(v => updated.includes(v));
                     }
 
-                    await this.plugin.saveSettings();
                     renderVersionPills();
+                    updateDrawerBorder();
                     input.focus();
                 };
             });
@@ -968,19 +1027,13 @@ class StepBibleSearchModal extends Modal {
             const panelControls = [
                 {
                     name: "Auto Search",
-                    get: () => this.plugin.settings.autoSyncOnNavigation,
-                    set: async (val) => {
-                        this.plugin.settings.autoSyncOnNavigation = val;
-                        await this.plugin.saveSettings();
-                    }
+                    get: () => this._draftAutoSync,
+                    set: (val) => { this._draftAutoSync = val; }
                 },
                 {
                     name: "Auto Close",
-                    get: () => this.plugin.settings.autoCloseSearchPanel,
-                    set: async (val) => {
-                        this.plugin.settings.autoCloseSearchPanel = val;
-                        await this.plugin.saveSettings();
-                    }
+                    get: () => this._draftAutoClose,
+                    set: (val) => { this._draftAutoClose = val; }
                 }
             ];
 
@@ -1010,10 +1063,11 @@ class StepBibleSearchModal extends Modal {
 
                 btn.onmousedown = (e) => e.preventDefault();
 
-                btn.onclick = async (e) => {
+                btn.onclick = (e) => {
                     e.preventDefault();
-                    await ctrl.set(!isActive);
+                    ctrl.set(!isActive);
                     renderSearchPanelPills();
+                    updateDrawerBorder();
                     input.focus();
                 };
             });
@@ -1062,7 +1116,7 @@ class StepBibleSearchModal extends Modal {
         const renderServerPill = () => {
             serverPillContainer.empty();
 
-            const isActive = this.plugin.settings.useLocalStepServer;
+            const isActive = this._draftLocalStepServer;
             const btn = serverPillContainer.createEl("button", { text: "Localhost" });
 
             btn.tabIndex = -1;
@@ -1087,20 +1141,64 @@ class StepBibleSearchModal extends Modal {
 
             btn.onmousedown = (e) => e.preventDefault();
 
-            btn.onclick = async (e) => {
+            btn.onclick = (e) => {
                 e.preventDefault();
-                this.plugin.settings.useLocalStepServer = !isActive;
-                await this.plugin.saveSettings();
-                await checkLocalServerStatus();
+                this._draftLocalStepServer = !isActive;
                 renderServerPill();
+                updateDrawerBorder();
                 input.focus();
             };
         };
 
         renderServerPill();
 
+        // Helper Confirmation Text at the bottom
+        const helperText = settingsDrawer.createEl("div", {
+            text: "Press enter to confirm changes and/or search reference"
+        });
+        helperText.style.textAlign = "center";
+        helperText.style.fontSize = "11px";
+        helperText.style.color = "var(--text-muted)";
+        helperText.style.marginTop = "4px";
+        helperText.style.userSelect = "none";
+
+        updateDrawerBorder();
+
+        const buildUrlWithDraftVersions = (urlRef) => {
+            const versionPart = this._draftLocalVersions
+                .map(v => `version=${v}`)
+                .join("@");
+            const prefix = this._draftLocalStepServer
+                ? "http://localhost:8989/"
+                : "https://www.stepbible.org/";
+            return `${prefix}?q=${versionPart}@reference=${urlRef}&options=GNVUH&display=COLUMN`;
+        };
+
+        const commitDraftAndSync = async () => {
+            const versionsChanged = isVersionsOutOfSync();
+            const serverChanged = isServerOutOfSync();
+
+            this.plugin.settings.localVersions = [...this._draftLocalVersions];
+            this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
+            this.plugin.settings.autoSyncOnNavigation = this._draftAutoSync;
+            this.plugin.settings.autoCloseSearchPanel = this._draftAutoClose;
+            await this.plugin.saveSettings();
+
+            if (serverChanged) {
+                await this.plugin.toggleLocaltoOnline();
+                this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
+            }
+            if (versionsChanged) {
+                await this.plugin.rewriteStepLinks();
+                this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
+            }
+            await this.plugin.saveSettings();
+        };
+
         const resetInputState = () => {
             this._isSubmitting = false;
+            contentEl.style.opacity = "1";
+            contentEl.style.pointerEvents = "auto";
             input.disabled = false;
             input.style.opacity = "1";
             input.style.cursor = "text";
@@ -1115,11 +1213,30 @@ class StepBibleSearchModal extends Modal {
                 if (this._isSubmitting) return;
 
                 this._isSubmitting = true;
+                const inputRef = (input.value || "").trim();
+
+                // 1. If NO reference: Grey out modal until links update
+                if (!inputRef) {
+                    contentEl.style.opacity = "0.5";
+                    contentEl.style.pointerEvents = "none";
+                    helperText.setText("⏳ Updating vault links...");
+
+                    try {
+                        await commitDraftAndSync();
+                        updateDrawerBorder();
+                        renderVersionPills();
+                    } finally {
+                        helperText.setText("Press enter to confirm changes and/or search reference");
+                        resetInputState();
+                    }
+                    return;
+                }
+
+                // 2. If reference IS entered: Search first, close modal, update in background
                 input.disabled = true;
                 input.style.opacity = "0.5";
                 input.style.cursor = "not-allowed";
 
-                const inputRef = (input.value || "").trim();
                 const regex = this.plugin.buildInputRefRegex();
                 const match = inputRef.match(regex);
 
@@ -1135,24 +1252,34 @@ class StepBibleSearchModal extends Modal {
                     return;
                 }
 
-                const url = this.plugin.urlRef_url(urlRef);
-                const shouldRewrite = isVersionsOutOfSync() || isServerOutOfSync();
+                const url = buildUrlWithDraftVersions(urlRef);
+                const versionsChanged = isVersionsOutOfSync();
+                const serverChanged = isServerOutOfSync();
 
+                // 1. Search & Open URL inside Obsidian tab
                 if (url) {
                     await this.openStepUrl(url);
                 }
 
+                // 2. Close modal immediately
                 this.close();
 
-                if (shouldRewrite) {
+                // 3. Save settings & update vault in background
+                this.plugin.settings.localVersions = [...this._draftLocalVersions];
+                this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
+                this.plugin.settings.autoSyncOnNavigation = this._draftAutoSync;
+                this.plugin.settings.autoCloseSearchPanel = this._draftAutoClose;
+                await this.plugin.saveSettings();
+
+                if (versionsChanged || serverChanged) {
                     setTimeout(async () => {
-                        if (isServerOutOfSync()) {
+                        if (serverChanged) {
                             await this.plugin.toggleLocaltoOnline();
                             this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
                         }
-                        if (isVersionsOutOfSync()) {
+                        if (versionsChanged) {
                             await this.plugin.rewriteStepLinks();
-                            this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
+                            this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
                         }
                         await this.plugin.saveSettings();
                     }, 50);
@@ -1172,10 +1299,6 @@ class StepBibleSearchModal extends Modal {
         this.contentEl.empty();
     }
 }
-
-
-
-
 
 
 
@@ -1323,6 +1446,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 webviewEl.addEventListener("did-finish-load", async () => {
                     const currentUrl = webviewEl.getURL();
                     await this.searchWebviewUrl(currentUrl, webviewEl);
+                    await this.autoCollapseStepToolbar(webviewEl);
                 });
 
                 webviewEl.addEventListener("did-navigate-in-page", async () => {
@@ -1782,11 +1906,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             if (book1 === book2) {
                 if (c2 < c1) {
-                    new Notice(`Invalid range: end chapter (${c2}) is before start chapter (${c1}).`);
+                    new Notice(`Invalid range: End chapter (${c2}) is before start chapter (${c1}).`);
                     return false;
                 }
                 if (c1 === c2 && v1 !== null && v2 !== null && v2 < v1) {
-                    new Notice(`Invalid range: end verse (${v2}) is before start verse (${v1}).`);
+                    new Notice(`Invalid range: End verse (${v2}) is before start verse (${v1}).`);
                     return false;
                 }
             }
@@ -3012,6 +3136,48 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return overviews[book] || null;
     }
 
+
+    async autoCollapseStepToolbar(webviewEl) {
+        if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
+
+        Notice("reached autoCollapseStepToolbar");
+
+        try {
+            await webviewEl.executeJavaScript(`
+                (function() {
+                    const tryCollapse = () => {
+                        const navbar = document.getElementById("stepnavbar");
+                        const resizeBtn = document.querySelector(".resizePanel") || 
+                                          document.querySelector(".glyphicon-resize-full")?.closest("a, button, div, span");
+
+                        // If navbar is visible (display != 'none') and button is present, click it
+                        if (navbar && navbar.style.display !== "none" && resizeBtn) {
+                            resizeBtn.click();
+                            return true;
+                        } else if (navbar && navbar.style.display === "none") {
+                            return true; // Already collapsed!
+                        }
+                        return false;
+                    };
+
+                    // Try immediately
+                    if (!tryCollapse()) {
+                        // Poll for up to 3 seconds until STEP finishes rendering its UI components
+                        let attempts = 0;
+                        const interval = setInterval(() => {
+                            attempts++;
+                            if (tryCollapse() || attempts > 30) {
+                                clearInterval(interval);
+                            }
+                        }, 100);
+                    }
+                })();
+            `);
+        } catch (err) {
+            // Webview might still be loading or destroyed
+        }
+    }
+
     async rewriteStepLinks() {
         const files = this.app.vault.getMarkdownFiles();
 
@@ -3043,7 +3209,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         }
 
-        new Notice("Bible Versions Updated");
+        new Notice("Updated Versions in Links");
     }
     async toggleLocaltoOnline() {
         const vault = this.app.vault;
@@ -3076,7 +3242,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         this.urlPrefix = targetPrefix;
 
-        new Notice("Bible Links Updated");
+        new Notice("Links Updated to " + (targetPrefix === localPrefix ? "Local" : "Online") + " Server");
     }
     async loadSettings() {
         const loadedData = await this.loadData() || {};

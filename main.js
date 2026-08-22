@@ -324,7 +324,15 @@ class StepSearchView extends ItemView {
         this.hoverBox.style.lineHeight = "1.4";
     }
 
-    updateQuery(queryRef, displayRef) {
+    updateQuery(queryRef, displayRef, force = false) {
+        const queryKey = Array.isArray(queryRef) ? queryRef.join("|") : String(queryRef);
+
+        if (!force && this._currentSearchKey === queryKey) {
+            return;
+        }
+
+        this._currentSearchKey = queryKey;
+
         // Update the query box to contain the formatted reference
         if (this.queryBox) {
             this.queryBox.value = displayRef;
@@ -333,6 +341,7 @@ class StepSearchView extends ItemView {
         // Run a search based on the query array.
         this.runSearch(queryRef);
     }
+
 
     async runSearch(queryRef) {
         if (this.searchInProgress) {
@@ -728,19 +737,36 @@ class StepBibleSearchModal extends Modal {
         if (this.plugin.settings.lastSyncedServerMode === undefined) {
             this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
         }
-        if (this.plugin.settings.searchModalSettingsOpen === undefined) {
-            this.plugin.settings.searchModalSettingsOpen = true;
-        }
     }
 
     hasAnyDraftChanges() {
         const local = this._draftLocalVersions;
-        const savedLocal = this.plugin.settings.localVersions || [];
-        const versionsChanged = local.length !== savedLocal.length || local.some((v, i) => v !== savedLocal[i]);
+        const currentLocal = this.plugin.settings.localVersions || [];
+        const versionsChanged = local.length !== currentLocal.length || local.some((v, i) => v !== currentLocal[i]);
         const serverChanged = this._draftLocalStepServer !== this.plugin.settings.useLocalStepServer;
         const autoSyncChanged = this._draftAutoSync !== this.plugin.settings.autoSyncOnNavigation;
         const autoCloseChanged = this._draftAutoClose !== this.plugin.settings.autoCloseSearchPanel;
         return versionsChanged || serverChanged || autoSyncChanged || autoCloseChanged;
+    }
+
+    async triggerSyncIfWebviewerActive() {
+        const activeLeaf = this.app.workspace.activeLeaf;
+        let view = activeLeaf?.view;
+
+        if (view?.getViewType?.() !== "webviewer") {
+            const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
+            if (webLeaves.length > 0) {
+                view = webLeaves[0].view;
+            }
+        }
+
+        if (view && view.getViewType?.() === "webviewer") {
+            const webviewEl = view.webview;
+            const url = view.url || webviewEl?.getURL?.();
+            if (url && (url.includes("stepbible.org") || url.includes("localhost:8989")) && webviewEl) {
+                await this.plugin.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: true, ignoreDuplicate: false });
+            }
+        }
     }
 
     async openStepUrl(url) {
@@ -759,33 +785,15 @@ class StepBibleSearchModal extends Modal {
             }
         }
 
-        let targetLeaf = null;
-
-        // 1. Look for an existing webviewer tab inside Obsidian
-        const leaves = this.app.workspace.getLeavesOfType("webviewer");
-        if (leaves.length > 0) {
-            targetLeaf = leaves[0];
+        // Always open in a fresh tab:
+        let targetLeaf = this.app.workspace.getLeaf("tab");
+        if (targetLeaf && typeof targetLeaf.setViewState === "function") {
+            await targetLeaf.setViewState({
+                type: "webviewer",
+                active: true,
+                state: { url }
+            });
             this.app.workspace.revealLeaf(targetLeaf);
-
-            const view = targetLeaf.view;
-            if (view) {
-                if (view.webview?.loadURL) {
-                    view.webview.loadURL(url);
-                } else if (typeof view.navigate === "function") {
-                    view.navigate(url);
-                }
-            }
-        } else {
-            // 2. Open inside a new Obsidian workspace tab
-            targetLeaf = this.app.workspace.getLeaf("tab");
-            if (targetLeaf && typeof targetLeaf.setViewState === "function") {
-                await targetLeaf.setViewState({
-                    type: "webviewer",
-                    active: true,
-                    state: { url }
-                });
-                this.app.workspace.revealLeaf(targetLeaf);
-            }
         }
 
         if (!targetLeaf) {
@@ -793,7 +801,6 @@ class StepBibleSearchModal extends Modal {
             return;
         }
 
-        // 3. Wait for webview element to exist and attach/trigger sync + collapse
         const waitForWebview = () => {
             let attempts = 0;
             const interval = setInterval(async () => {
@@ -802,29 +809,15 @@ class StepBibleSearchModal extends Modal {
                 if (webviewEl) {
                     clearInterval(interval);
 
-                    if (!webviewEl.__stepListenersAttached) {
-                        webviewEl.__stepListenersAttached = true;
-
-                        webviewEl.addEventListener("did-finish-load", async () => {
-                            const cur = webviewEl.getURL?.();
-                            if (this.plugin.settings.autoSyncOnNavigation && cur) {
-                                await this.plugin.searchWebviewUrl(cur, webviewEl);
-                            }
-                            await this.plugin.autoCollapseStepToolbar(webviewEl);
-                        });
-
-                        webviewEl.addEventListener("did-navigate-in-page", async () => {
-                            const cur = webviewEl.getURL?.();
-                            if (this.plugin.settings.autoSyncOnNavigation && cur) {
-                                await this.plugin.searchWebviewUrl(cur, webviewEl);
-                            }
-                            await this.plugin.autoCollapseStepToolbar(webviewEl);
-                        });
+                    // Attach centralized listeners via plugin helper
+                    if (typeof this.plugin.attachWebviewListeners === "function") {
+                        this.plugin.attachWebviewListeners(webviewEl);
                     }
 
                     if (this.plugin.settings.autoSyncOnNavigation) {
-                        await this.plugin.searchWebviewUrl(url, webviewEl);
+                        await this.plugin.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                     }
+
                     await this.plugin.autoCollapseStepToolbar(webviewEl);
                 }
 
@@ -1245,7 +1238,9 @@ class StepBibleSearchModal extends Modal {
         const commitDraftAndSync = async () => {
             const versionsChanged = isVersionsOutOfSync();
             const serverChanged = isServerOutOfSync();
+            const autoSyncTurnedOn = !this.plugin.settings.autoSyncOnNavigation && this._draftAutoSync;
 
+            // Commit all settings directly to plugin
             this.plugin.settings.localVersions = [...this._draftLocalVersions];
             this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
             this.plugin.settings.autoSyncOnNavigation = this._draftAutoSync;
@@ -1260,7 +1255,11 @@ class StepBibleSearchModal extends Modal {
                 await this.plugin.rewriteStepLinks();
                 this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
             }
+            if (autoSyncTurnedOn) {
+                await this.triggerSyncIfWebviewerActive();
+            }
             await this.plugin.saveSettings();
+            new Notice("Settings updated");
         };
 
         const resetInputState = () => {
@@ -1280,27 +1279,37 @@ class StepBibleSearchModal extends Modal {
 
                 if (this._isSubmitting) return;
 
-                this._isSubmitting = true;
                 const inputRef = (input.value || "").trim();
 
-                // 1. If NO reference: Grey out modal until links update
+                // 1. If NO reference and NO changes: Simply close modal cleanly
+                if (!inputRef && !this.hasAnyDraftChanges()) {
+                    this._changesCommitted = true;
+                    this.close();
+                    return;
+                }
+
+                this._isSubmitting = true;
+
+                // 2. If NO reference but THERE ARE changes: Grey out modal until links update
                 if (!inputRef) {
                     contentEl.style.opacity = "0.5";
                     contentEl.style.pointerEvents = "none";
-                    helperText.setText("⏳ Updating vault links...");
+                    helperText.setText("Updating vault links...");
 
                     try {
                         await commitDraftAndSync();
                         this._changesCommitted = true;
                         updateDrawerBorder();
                         renderVersionPills();
+                        renderSearchPanelPills();
+                        renderServerPill();
                     } finally {
                         resetInputState();
                     }
                     return;
                 }
 
-                // 2. If reference IS entered: Search first, close modal, update in background
+                // 3. If reference IS entered: Validate, commit settings immediately, search, and close
                 input.disabled = true;
                 input.style.opacity = "0.5";
                 input.style.cursor = "not-allowed";
@@ -1323,25 +1332,27 @@ class StepBibleSearchModal extends Modal {
                 const url = buildUrlWithDraftVersions(urlRef);
                 const versionsChanged = isVersionsOutOfSync();
                 const serverChanged = isServerOutOfSync();
+                const autoSyncTurnedOn = !this.plugin.settings.autoSyncOnNavigation && this._draftAutoSync;
+
+                // --- CRITICAL FIX: COMMIT SETTINGS SYNCHRONOUSLY BEFORE OPENING TAB ---
+                this.plugin.settings.localVersions = [...this._draftLocalVersions];
+                this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
+                this.plugin.settings.autoSyncOnNavigation = this._draftAutoSync;
+                this.plugin.settings.autoCloseSearchPanel = this._draftAutoClose;
+                this._changesCommitted = true;
 
                 // 1. Search & Open URL inside Obsidian tab
                 if (url) {
                     await this.openStepUrl(url);
                 }
 
-                this._changesCommitted = true;
-
                 // 2. Close modal immediately
                 this.close();
 
-                // 3. Save settings & update vault in background
-                this.plugin.settings.localVersions = [...this._draftLocalVersions];
-                this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
-                this.plugin.settings.autoSyncOnNavigation = this._draftAutoSync;
-                this.plugin.settings.autoCloseSearchPanel = this._draftAutoClose;
+                // 3. Save settings to disk & update vault in background
                 await this.plugin.saveSettings();
 
-                if (versionsChanged || serverChanged) {
+                if (versionsChanged || serverChanged || autoSyncTurnedOn) {
                     setTimeout(async () => {
                         if (serverChanged) {
                             await this.plugin.toggleLocaltoOnline();
@@ -1351,9 +1362,13 @@ class StepBibleSearchModal extends Modal {
                             await this.plugin.rewriteStepLinks();
                             this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
                         }
+                        if (autoSyncTurnedOn) {
+                            await this.triggerSyncIfWebviewerActive();
+                        }
                         await this.plugin.saveSettings();
                     }, 50);
                 }
+
             }
         };
 
@@ -1378,6 +1393,10 @@ class StepBibleSearchModal extends Modal {
 
 
 
+
+
+
+
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
@@ -1387,6 +1406,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         console.log('STEP Bible Linker Loaded.');
         this.activePopover = null;
+        this._lastSearchQueryRef = null;
 
         // Load settings and add settings tab
         await this.loadSettings();
@@ -1397,6 +1417,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             STEP_SEARCH_VIEW,
             (leaf) => new StepSearchView(leaf, this)
         );
+
+        
 
         // DETECT AND LINK INPUT REF AT CURSOR 
         this.addCommand({
@@ -1464,6 +1486,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
+        //================================================================ SEARCH LOGIC
         // SEARCH BASED ON STEP URL
         this.addCommand({
             id: "step-sync-search-panel",
@@ -1492,90 +1515,64 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const webviewEl = view.webview;
                 if (!webviewEl) return;
 
-                await this.searchWebviewUrl(url, webviewEl);
+                await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: true, ignoreDuplicate: true });
 
                 console.log("STEP Sync: Manual search panel update complete.");
             }
         });
 
-        // 1. Initialise on startup once Obsidian's workspace layout is ready
-        this.app.workspace.onLayoutReady(async () => {
-            const activeLeaf = this.app.workspace.activeLeaf;
-            const view = activeLeaf?.view;
+        // Helper to attach listeners once per webview element
+        this.attachWebviewListeners = (webviewEl) => {
+            if (!webviewEl || webviewEl.__stepListenersAttached) return;
+            webviewEl.__stepListenersAttached = true;
 
-            if (view && view.getViewType?.() === "webviewer") {
-                const webviewEl = view.webview;
+            const onNav = async () => {
+                const currentUrl = webviewEl.getURL?.();
+                if (!currentUrl) return;
+
+                if (this.settings.autoSyncOnNavigation) {
+                    await this.searchWebviewUrl(currentUrl, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
+                }
+                await this.autoCollapseStepToolbar(webviewEl);
+            };
+
+            webviewEl.addEventListener("did-finish-load", onNav);
+            webviewEl.addEventListener("did-navigate-in-page", onNav);
+        };
+
+
+        // 1. Initialise existing tabs on layout ready
+        this.app.workspace.onLayoutReady(async () => {
+            const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
+            for (const leaf of webLeaves) {
+                const webviewEl = leaf.view?.webview;
                 if (webviewEl) {
+                    this.attachWebviewListeners(webviewEl);
                     if (this.settings.autoSyncOnNavigation) {
-                        await this.searchWebviewUrl(view.url || webviewEl.getURL?.(), webviewEl);
+                        const url = leaf.view.url || webviewEl.getURL?.();
+                        if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: false });
                     }
                     await this.autoCollapseStepToolbar(webviewEl);
                 }
             }
-
-            // Also attach listeners to any existing webviewer leaves across all tabs
-            const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
-            for (const leaf of webLeaves) {
-                const webviewEl = leaf.view?.webview;
-                if (webviewEl && !webviewEl.__stepListenersAttached) {
-                    webviewEl.__stepListenersAttached = true;
-
-                    webviewEl.addEventListener("did-finish-load", async () => {
-                        const currentUrl = webviewEl.getURL();
-                        if (this.settings.autoSyncOnNavigation) {
-                            await this.searchWebviewUrl(currentUrl, webviewEl);
-                        }
-                        await this.autoCollapseStepToolbar(webviewEl);
-                    });
-
-                    webviewEl.addEventListener("did-navigate-in-page", async () => {
-                        const currentUrl = webviewEl.getURL();
-                        if (this.settings.autoSyncOnNavigation) {
-                            await this.searchWebviewUrl(currentUrl, webviewEl);
-                        }
-                        await this.autoCollapseStepToolbar(webviewEl);
-                    });
-                }
-            }
         });
 
-        // 2. SEARCH BASED ON STEP URL AUTOMATICALLY (Tab switches & new tabs)
+        // 2. Attach listeners & sync on tab switch
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
                 const view = leaf?.view;
-                if (!view) return;
+                if (!view || view.getViewType?.() !== "webviewer") return;
 
-                if (view.getViewType?.() !== "webviewer") return;
                 const webviewEl = view.webview;
                 if (!webviewEl) return;
 
-                // Reset dedupe on tab switch
-                webviewEl.__lastProcessedRef = null;
+                this.attachWebviewListeners(webviewEl);
 
                 if (this.settings.autoSyncOnNavigation) {
-                    await this.searchWebviewUrl(view.url || webviewEl.getURL?.(), webviewEl);
+                    const url = view.url || webviewEl.getURL?.();
+                    if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: false });
                 }
                 await this.autoCollapseStepToolbar(webviewEl);
-
-                if (!webviewEl.__stepListenersAttached) {
-                    webviewEl.__stepListenersAttached = true;
-
-                    webviewEl.addEventListener("did-finish-load", async () => {
-                        const currentUrl = webviewEl.getURL();
-                        if (this.settings.autoSyncOnNavigation) {
-                            await this.searchWebviewUrl(currentUrl, webviewEl);
-                        }
-                        await this.autoCollapseStepToolbar(webviewEl);
-                    });
-
-                    webviewEl.addEventListener("did-navigate-in-page", async () => {
-                        const currentUrl = webviewEl.getURL();
-                        if (this.settings.autoSyncOnNavigation) {
-                            await this.searchWebviewUrl(currentUrl, webviewEl);
-                        }
-                        await this.autoCollapseStepToolbar(webviewEl);
-                    });
-                }
             })
         );
 
@@ -1628,6 +1625,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // Otherwise: keep search panel open
             })
         );
+
+        //============================================================================
 
         // HOVERING HANDLER
         this.registerDomEvent(document, "mouseover", async (evt) => {
@@ -1869,19 +1868,32 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return new RegExp(pattern, "gi");
     }
 
-    
-    // SEARCH HELPERS =========================================================================================
-    async searchWebviewUrl(url, webviewEl) {
+
+    // SEARCH HELPERS =======================================================================================
+    async searchWebviewUrl(url, webviewEl, { ignoreAutoSync = false, ignoreDuplicate = false } = {}) {
         if (!url || !url.includes("reference=")) return;
+
+        // 1. SETTING GATE: Block search if autosearch is OFF unless explicitly bypassed
+        if (!ignoreAutoSync && !this.settings.autoSyncOnNavigation) {
+            return;
+        }
 
         const urlRef = this.url_urlRef(url);
         if (!urlRef) return;
 
-        if (webviewEl.__lastProcessedRef === urlRef) return;
-        webviewEl.__lastProcessedRef = urlRef;
-
         const queryRef = this.urlRef_queryRef(urlRef);
         const displayRef = this.urlRef_displayRef(urlRef);
+
+        // Convert array/query to comparable string key
+        const queryKey = Array.isArray(queryRef) ? queryRef.join("|") : String(queryRef);
+
+        // 2. DUPLICATE GATE: Block identical queries unless ignoreDuplicate is true
+        if (!ignoreDuplicate && this._lastSearchQueryKey === queryKey) {
+            return;
+        }
+
+        this._lastSearchQueryKey = queryKey;
+        this._lastSearchQueryRef = queryRef;
 
         this.app.workspace.leftSplit?.expand();
 
@@ -1907,7 +1919,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         if (typeof searchView.updateQuery !== "function") return;
 
-        searchView.updateQuery(queryRef, displayRef);
+        searchView.updateQuery(queryRef, displayRef, ignoreDuplicate);
     }
     minimiseLeftLeaf() {
         const leaf = this.app.workspace.getLeavesOfType("step-search-view")[0];

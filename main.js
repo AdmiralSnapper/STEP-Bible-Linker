@@ -748,40 +748,86 @@ class StepBibleSearchModal extends Modal {
             }
         }
 
+        let targetLeaf = null;
+
         // 1. Look for an existing webviewer tab inside Obsidian
         const leaves = this.app.workspace.getLeavesOfType("webviewer");
         if (leaves.length > 0) {
-            const leaf = leaves[0];
-            this.app.workspace.revealLeaf(leaf);
+            targetLeaf = leaves[0];
+            this.app.workspace.revealLeaf(targetLeaf);
 
-            const view = leaf.view;
+            const view = targetLeaf.view;
             if (view) {
                 if (view.webview?.loadURL) {
                     view.webview.loadURL(url);
-                    return;
-                }
-                if (typeof view.navigate === "function") {
+                } else if (typeof view.navigate === "function") {
                     view.navigate(url);
-                    return;
                 }
+            }
+        } else {
+            // 2. Open inside a new Obsidian workspace tab
+            targetLeaf = this.app.workspace.getLeaf("tab");
+            if (targetLeaf && typeof targetLeaf.setViewState === "function") {
+                await targetLeaf.setViewState({
+                    type: "webviewer",
+                    active: true,
+                    state: { url }
+                });
+                this.app.workspace.revealLeaf(targetLeaf);
             }
         }
 
-        // 2. Open inside Obsidian's workspace tab
-        const leaf = this.app.workspace.getLeaf("tab");
-        if (leaf && typeof leaf.setViewState === "function") {
-            await leaf.setViewState({
-                type: "webviewer",
-                active: true,
-                state: { url }
-            });
-            this.app.workspace.revealLeaf(leaf);
+        if (!targetLeaf) {
+            window.open(url, "_blank");
             return;
         }
 
-        // 3. Fallback
-        window.open(url, "_blank");
+        // 3. Wait for webview element to exist and attach/trigger sync + collapse
+        const waitForWebview = () => {
+            let attempts = 0;
+            const interval = setInterval(async () => {
+                attempts++;
+                const webviewEl = targetLeaf.view?.webview;
+                if (webviewEl) {
+                    clearInterval(interval);
+
+                    // Attach navigation listeners if not yet attached
+                    if (!webviewEl.__stepListenersAttached) {
+                        webviewEl.__stepListenersAttached = true;
+
+                        webviewEl.addEventListener("did-finish-load", async () => {
+                            const cur = webviewEl.getURL?.();
+                            if (this.plugin.settings.autoSyncOnNavigation && cur) {
+                                await this.plugin.searchWebviewUrl(cur, webviewEl);
+                            }
+                            await this.plugin.autoCollapseStepToolbar(webviewEl);
+                        });
+
+                        webviewEl.addEventListener("did-navigate-in-page", async () => {
+                            const cur = webviewEl.getURL?.();
+                            if (this.plugin.settings.autoSyncOnNavigation && cur) {
+                                await this.plugin.searchWebviewUrl(cur, webviewEl);
+                            }
+                            await this.plugin.autoCollapseStepToolbar(webviewEl);
+                        });
+                    }
+
+                    // Trigger sync and auto-collapse directly
+                    if (this.plugin.settings.autoSyncOnNavigation) {
+                        await this.plugin.searchWebviewUrl(url, webviewEl);
+                    }
+                    await this.plugin.autoCollapseStepToolbar(webviewEl);
+                }
+
+                if (attempts > 50) {
+                    clearInterval(interval);
+                }
+            }, 100);
+        };
+
+        waitForWebview();
     }
+
 
     onOpen() {
         const { contentEl } = this;
@@ -1422,7 +1468,48 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        // SEARCH BASED ON STEP URL AUTOMATICALLY
+        // 1. Initialise on startup once Obsidian's workspace layout is ready
+        this.app.workspace.onLayoutReady(async () => {
+            const activeLeaf = this.app.workspace.activeLeaf;
+            const view = activeLeaf?.view;
+
+            if (view && view.getViewType?.() === "webviewer") {
+                const webviewEl = view.webview;
+                if (webviewEl) {
+                    if (this.settings.autoSyncOnNavigation) {
+                        await this.searchWebviewUrl(view.url || webviewEl.getURL?.(), webviewEl);
+                    }
+                    await this.autoCollapseStepToolbar(webviewEl);
+                }
+            }
+
+            // Also attach listeners to any existing webviewer leaves across all tabs
+            const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
+            for (const leaf of webLeaves) {
+                const webviewEl = leaf.view?.webview;
+                if (webviewEl && !webviewEl.__stepListenersAttached) {
+                    webviewEl.__stepListenersAttached = true;
+
+                    webviewEl.addEventListener("did-finish-load", async () => {
+                        const currentUrl = webviewEl.getURL();
+                        if (this.settings.autoSyncOnNavigation) {
+                            await this.searchWebviewUrl(currentUrl, webviewEl);
+                        }
+                        await this.autoCollapseStepToolbar(webviewEl);
+                    });
+
+                    webviewEl.addEventListener("did-navigate-in-page", async () => {
+                        const currentUrl = webviewEl.getURL();
+                        if (this.settings.autoSyncOnNavigation) {
+                            await this.searchWebviewUrl(currentUrl, webviewEl);
+                        }
+                        await this.autoCollapseStepToolbar(webviewEl);
+                    });
+                }
+            }
+        });
+
+        // 2. SEARCH BASED ON STEP URL AUTOMATICALLY (Tab switches & new tabs)
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
                 const view = leaf?.view;
@@ -1435,13 +1522,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // Reset dedupe on tab switch
                 webviewEl.__lastProcessedRef = null;
 
-                // 1. Run immediately on active leaf
                 if (this.settings.autoSyncOnNavigation) {
-                    await this.searchWebviewUrl(view.url, webviewEl);
+                    await this.searchWebviewUrl(view.url || webviewEl.getURL?.(), webviewEl);
                 }
                 await this.autoCollapseStepToolbar(webviewEl);
 
-                // 2. Attach listeners for subsequent navigations
                 if (!webviewEl.__stepListenersAttached) {
                     webviewEl.__stepListenersAttached = true;
 

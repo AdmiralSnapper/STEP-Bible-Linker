@@ -1425,8 +1425,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // SEARCH BASED ON STEP URL AUTOMATICALLY
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
-                if (!this.settings.autoSyncOnNavigation) return;
-
                 const view = leaf?.view;
                 if (!view) return;
 
@@ -1437,22 +1435,32 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // Reset dedupe on tab switch
                 webviewEl.__lastProcessedRef = null;
 
-                // TAB SWITCHING — view.url is correct here
-                await this.searchWebviewUrl(view.url, webviewEl);
+                // 1. Run immediately on active leaf
+                if (this.settings.autoSyncOnNavigation) {
+                    await this.searchWebviewUrl(view.url, webviewEl);
+                }
+                await this.autoCollapseStepToolbar(webviewEl);
 
-                //
-                // ALWAYS attach listeners fresh — WebView is recreated on tab switch
-                //
-                webviewEl.addEventListener("did-finish-load", async () => {
-                    const currentUrl = webviewEl.getURL();
-                    await this.searchWebviewUrl(currentUrl, webviewEl);
-                    await this.autoCollapseStepToolbar(webviewEl);
-                });
+                // 2. Attach listeners for subsequent navigations
+                if (!webviewEl.__stepListenersAttached) {
+                    webviewEl.__stepListenersAttached = true;
 
-                webviewEl.addEventListener("did-navigate-in-page", async () => {
-                    const currentUrl = webviewEl.getURL();
-                    await this.searchWebviewUrl(currentUrl, webviewEl);
-                });
+                    webviewEl.addEventListener("did-finish-load", async () => {
+                        const currentUrl = webviewEl.getURL();
+                        if (this.settings.autoSyncOnNavigation) {
+                            await this.searchWebviewUrl(currentUrl, webviewEl);
+                        }
+                        await this.autoCollapseStepToolbar(webviewEl);
+                    });
+
+                    webviewEl.addEventListener("did-navigate-in-page", async () => {
+                        const currentUrl = webviewEl.getURL();
+                        if (this.settings.autoSyncOnNavigation) {
+                            await this.searchWebviewUrl(currentUrl, webviewEl);
+                        }
+                        await this.autoCollapseStepToolbar(webviewEl);
+                    });
+                }
             })
         );
 
@@ -3136,33 +3144,30 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return overviews[book] || null;
     }
 
-
     async autoCollapseStepToolbar(webviewEl) {
         if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
-
-        Notice("reached autoCollapseStepToolbar");
 
         try {
             await webviewEl.executeJavaScript(`
                 (function() {
+                    console.log("STEP Plugin: Attempting toolbar auto-collapse...");
                     const tryCollapse = () => {
                         const navbar = document.getElementById("stepnavbar");
                         const resizeBtn = document.querySelector(".resizePanel") || 
                                           document.querySelector(".glyphicon-resize-full")?.closest("a, button, div, span");
 
-                        // If navbar is visible (display != 'none') and button is present, click it
                         if (navbar && navbar.style.display !== "none" && resizeBtn) {
+                            console.log("STEP Plugin: Found resizePanel button, clicking...");
                             resizeBtn.click();
                             return true;
                         } else if (navbar && navbar.style.display === "none") {
-                            return true; // Already collapsed!
+                            console.log("STEP Plugin: Toolbar already collapsed.");
+                            return true;
                         }
                         return false;
                     };
 
-                    // Try immediately
                     if (!tryCollapse()) {
-                        // Poll for up to 3 seconds until STEP finishes rendering its UI components
                         let attempts = 0;
                         const interval = setInterval(() => {
                             attempts++;
@@ -3174,7 +3179,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 })();
             `);
         } catch (err) {
-            // Webview might still be loading or destroyed
+            console.error("STEP Plugin: executeJavaScript error:", err);
         }
     }
 

@@ -1,9 +1,26 @@
 {
   "autoSyncOnNavigation": true,
   "autoCloseSearchPanel": false,
-  "enabledVersions": [
-    "ESV"
+  "useLocalStepServer": true,
+  "globalVersions": [
+    "ESV",
+    "SBLG",
+    "THOT",
+    "LXX"
+  ],
+  "localVersions": [
+    "ESV",
+    "LXX"
   ],
   "useLocalUrlPrefix": true,
-  "useLocalStepServer": true
+  "enabledVersions": [
+    "ESV",
+    "THOT",
+    "SBLG",
+    "LXX"
+  ],
+  "lastSyncedVersions": [
+    "ESV",
+    "LXX"
+  ]
 }

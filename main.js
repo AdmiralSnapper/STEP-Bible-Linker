@@ -5,22 +5,33 @@ const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, re
  * @typedef {Object} StepBibleLinkerSettings
  * @property {boolean} autoSyncOnNavigation - If true, STEP auto-syncs on navigation
  * @property {boolean} autoCloseSearchPanel - If true, the STEP search panel auto-closes when switching to a non-STEP tab
- * @property {boolean} useLocalUrlPrefix - If true, use local URL prefix.
- * @property {string[]} enabledVersions - List of STEP Bible versions to include in generated links
+ * @property {boolean} useLocalStepServer - If true, use local URL prefix
+ * @property {string[]} globalVersions - Master list and ordering of versions configured in settings
+ * @property {string[]} localVersions - Active versions toggled in search modal and used in links
  */
 
 /** @type {StepBibleLinkerSettings} */
 const DEFAULT_SETTINGS = {
     autoSyncOnNavigation: true,
     autoCloseSearchPanel: true,
-    enabledVersions: ["ESV", "THOT", "SBLG"],
-    useLocalUrlPrefix: true,
+    useLocalStepServer: true,
+    globalVersions: ["ESV", "THOT", "SBLG"],
+    localVersions: ["ESV", "THOT", "SBLG"],
 };
 
 class StepBibleLinkerSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
         this.plugin = plugin;
+    }
+
+    rebuildGlobalVersions(activeEnglish, activeOriginal) {
+        const newGlobal = [...activeEnglish, ...activeOriginal];
+        this.plugin.settings.globalVersions = newGlobal;
+        
+        // Ensure localVersions only contains versions in globalVersions and preserves order
+        const currentLocal = this.plugin.settings.localVersions || [];
+        this.plugin.settings.localVersions = newGlobal.filter(v => currentLocal.includes(v));
     }
 
     display() {
@@ -62,159 +73,162 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
                     .onChange(async (value) => {
                         this.plugin.settings.useLocalStepServer = value;
                         await this.plugin.saveSettings();
-
-                        // Optional: rewrite links to match new prefix
                         await this.plugin.toggleLocaltoOnline();
-
                         this.display();
                     });
             });
 
+        const globalList = this.plugin.settings.globalVersions || [];
 
-        //BIBLE VERSION TOGGLES ==========================================================================
-        containerEl.createEl("h3", { text: "Bible Versions Enabled" });
+        // 1. ENGLISH VERSIONS SECTION ================================================================
+        containerEl.createEl("h3", { text: "English Versions" });
 
-        new Setting(containerEl)
-            .setName("Enable ESV")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.enabledVersions.includes("ESV"))
-                    .onChange(async (value) => {
-                        this.plugin.toggleVersion("ESV", value);
-                        await this.plugin.saveSettings();
+        const allEnglish = ["ESV", "NIV", "KJV"];
+        let activeEnglish = globalList.filter(v => allEnglish.includes(v));
+        const inactiveEnglish = allEnglish.filter(v => !activeEnglish.includes(v));
 
-                        // Rewrite all STEP links to match new version list
-                        await this.plugin.rewriteStepLinks();
-                        //Refresh UI to reflect changes in version order
-                        this.display();
-                    });
-            });
+        const allOriginal = ["THOT", "SBLG", "LXX"];
+        let activeOriginal = globalList.filter(v => allOriginal.includes(v));
+        const inactiveOriginal = allOriginal.filter(v => !activeOriginal.includes(v));
 
-        new Setting(containerEl)
-            .setName("Enable NIV")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.enabledVersions.includes("NIV"))
-                    .onChange(async (value) => {
-                        this.plugin.toggleVersion("NIV", value);
-                        await this.plugin.saveSettings();
+        const originalNames = {
+            "THOT": "Hebrew Old Testament (THOT)",
+            "SBLG": "Greek New Testament (SBLG)",
+            "LXX": "Septuagint (LXX)"
+        };
 
-                        // Rewrite all STEP links to match new version list
-                        await this.plugin.rewriteStepLinks();
-                        //Refresh UI to reflect changes in version order
-                        this.display(); 
-                    });
-            });
-
-        new Setting(containerEl)
-            .setName("Enable KJV")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.enabledVersions.includes("KJV"))
-                    .onChange(async (value) => {
-                        this.plugin.toggleVersion("KJV", value);
-                        await this.plugin.saveSettings();
-
-                        // Rewrite all STEP links to match new version list
-                        await this.plugin.rewriteStepLinks();
-                        //Refresh UI to reflect changes in version order
-                        this.display(); 
-                    });
-            });
-
-        new Setting(containerEl)
-            .setName("Enable THOT")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.enabledVersions.includes("THOT"))
-                    .onChange(async (value) => {
-                        this.plugin.toggleVersion("THOT", value);
-                        await this.plugin.saveSettings();
-
-                        // Rewrite all STEP links to match new version list
-                        await this.plugin.rewriteStepLinks();
-                        //Refresh UI to reflect changes in version order
-                        this.display(); 
-                    });
-            });
-
-        new Setting(containerEl)
-            .setName("Enable SBLG")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.enabledVersions.includes("SBLG"))
-                    .onChange(async (value) => {
-                        this.plugin.toggleVersion("SBLG", value);
-                        await this.plugin.saveSettings();
-
-                        // Rewrite all STEP links to match new version list
-                        await this.plugin.rewriteStepLinks();
-                        //Refresh UI to reflect changes in version order
-                        this.display(); 
-                    });
-            });
-
-        new Setting(containerEl)
-            .setName("Enable LXX")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.enabledVersions.includes("LXX"))
-                    .onChange(async (value) => {
-                        this.plugin.toggleVersion("LXX", value);
-                        await this.plugin.saveSettings();
-
-                        // Rewrite all STEP links to match new version list
-                        await this.plugin.rewriteStepLinks();
-                        //Refresh UI to reflect changes in version order
-                        this.display(); 
-                    });
-            });
-
-        
-
-        // VERSION REORDERING ==========================================================================
-        containerEl.createEl("h3", { text: "Version Order" });
-
-        const versions = this.plugin.settings.enabledVersions;
-
-        versions.forEach((version, index) => {
-            const setting = new Setting(containerEl)
+        // Active English versions (reorderable)
+        activeEnglish.forEach((version, index) => {
+            new Setting(containerEl)
                 .setName(version)
-                .setDesc("Order determines display order in STEP Bible.");
-
-            // Move up
-            setting.addButton(btn => {
-                btn.setButtonText("↑")
-                    .setDisabled(index === 0)
-                    .onClick(async () => {
-                        this.plugin.moveVersion(index, index - 1);
-                        await this.plugin.saveSettings();
-
-                        // IMPORTANT: re-read updated version list
-                        this.plugin.settings.enabledVersions = [...this.plugin.settings.enabledVersions];
-
-                        await this.plugin.rewriteStepLinks();
-                        this.display();
+                .addToggle(toggle => {
+                    toggle.setValue(true).onChange(async (value) => {
+                        if (!value) {
+                            activeEnglish = activeEnglish.filter(v => v !== version);
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        }
                     });
-            });
+                })
+                .addButton(btn => {
+                    btn.setButtonText("↑")
+                        .setDisabled(index === 0)
+                        .onClick(async () => {
+                            const temp = activeEnglish[index];
+                            activeEnglish[index] = activeEnglish[index - 1];
+                            activeEnglish[index - 1] = temp;
 
-            // Move down
-            setting.addButton(btn => {
-                btn.setButtonText("↓")
-                    .setDisabled(index === versions.length - 1)
-                    .onClick(async () => {
-                        this.plugin.moveVersion(index, index + 1);
-                        await this.plugin.saveSettings();
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        });
+                })
+                .addButton(btn => {
+                    btn.setButtonText("↓")
+                        .setDisabled(index === activeEnglish.length - 1)
+                        .onClick(async () => {
+                            const temp = activeEnglish[index];
+                            activeEnglish[index] = activeEnglish[index + 1];
+                            activeEnglish[index + 1] = temp;
 
-                        // IMPORTANT: re-read updated version list
-                        this.plugin.settings.enabledVersions = [...this.plugin.settings.enabledVersions];
-
-                        await this.plugin.rewriteStepLinks();
-                        this.display();
-                    });
-            });
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        });
+                });
         });
 
+        // Inactive English versions
+        inactiveEnglish.forEach((version) => {
+            new Setting(containerEl)
+                .setName(version)
+                .addToggle(toggle => {
+                    toggle.setValue(false).onChange(async (value) => {
+                        if (value) {
+                            activeEnglish.push(version);
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            if (!this.plugin.settings.localVersions.includes(version)) {
+                                this.plugin.settings.localVersions.push(version);
+                            }
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        }
+                    });
+                });
+        });
+
+        // 2. ORIGINAL & ANCIENT LANGUAGES SECTION ====================================================
+        containerEl.createEl("h3", { text: "Original & Ancient Languages" });
+
+        // Active Original versions (reorderable)
+        activeOriginal.forEach((version, index) => {
+            new Setting(containerEl)
+                .setName(originalNames[version] || version)
+                .addToggle(toggle => {
+                    toggle.setValue(true).onChange(async (value) => {
+                        if (!value) {
+                            activeOriginal = activeOriginal.filter(v => v !== version);
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        }
+                    });
+                })
+                .addButton(btn => {
+                    btn.setButtonText("↑")
+                        .setDisabled(index === 0)
+                        .onClick(async () => {
+                            const temp = activeOriginal[index];
+                            activeOriginal[index] = activeOriginal[index - 1];
+                            activeOriginal[index - 1] = temp;
+
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        });
+                })
+                .addButton(btn => {
+                    btn.setButtonText("↓")
+                        .setDisabled(index === activeOriginal.length - 1)
+                        .onClick(async () => {
+                            const temp = activeOriginal[index];
+                            activeOriginal[index] = activeOriginal[index + 1];
+                            activeOriginal[index + 1] = temp;
+
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        });
+                });
+        });
+
+        // Inactive Original versions
+        inactiveOriginal.forEach((version) => {
+            new Setting(containerEl)
+                .setName(originalNames[version] || version)
+                .addToggle(toggle => {
+                    toggle.setValue(false).onChange(async (value) => {
+                        if (value) {
+                            activeOriginal.push(version);
+                            this.rebuildGlobalVersions(activeEnglish, activeOriginal);
+                            if (!this.plugin.settings.localVersions.includes(version)) {
+                                this.plugin.settings.localVersions.push(version);
+                            }
+                            await this.plugin.saveSettings();
+                            await this.plugin.rewriteStepLinks();
+                            this.display();
+                        }
+                    });
+                });
+        });
     }
 }
 
@@ -699,6 +713,11 @@ class StepBibleSearchModal extends Modal {
         this.plugin = plugin;
         this.prefill = prefill;
         this._isSubmitting = false;
+
+        // Track last synced vault versions (default to localVersions if not set)
+        if (!this.plugin.settings.lastSyncedVersions) {
+            this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
+        }
     }
 
     async openStepUrl(url) {
@@ -722,15 +741,17 @@ class StepBibleSearchModal extends Modal {
 
     onOpen() {
         const { contentEl } = this;
+        contentEl.empty();
 
         contentEl.style.display = "flex";
         contentEl.style.flexDirection = "column";
-        contentEl.style.gap = "14px";
-        contentEl.style.padding = "12px";
+        contentEl.style.gap = "10px";
+        contentEl.style.padding = "16px";
 
+        // 1. Reference Search Input Box
         const input = contentEl.createEl("input", {
             type: "text",
-            placeholder: "Enter Reference"
+            placeholder: "Enter Reference (e.g. John 3.16)"
         });
 
         input.style.width = "100%";
@@ -745,6 +766,92 @@ class StepBibleSearchModal extends Modal {
             input.value = this.prefill.trim();
             input.select();
         }
+
+        // 2. Version Control & Changed Indicator Row
+        const buttonsRow = contentEl.createEl("div");
+        buttonsRow.style.display = "flex";
+        buttonsRow.style.justifyContent = "space-between";
+        buttonsRow.style.alignItems = "center";
+        buttonsRow.style.gap = "8px";
+
+        const pillsContainer = buttonsRow.createEl("div");
+        pillsContainer.style.display = "flex";
+        pillsContainer.style.flexWrap = "wrap";
+        pillsContainer.style.gap = "6px";
+
+        const changedIndicator = buttonsRow.createEl("span", { text: "" });
+        changedIndicator.style.flexShrink = "0";
+        changedIndicator.style.fontSize = "11px";
+        changedIndicator.style.fontWeight = "bold";
+        changedIndicator.style.color = "var(--text-accent)";
+        changedIndicator.style.userSelect = "none";
+
+        const isOutOfSync = () => {
+            const local = this.plugin.settings.localVersions || [];
+            const synced = this.plugin.settings.lastSyncedVersions || [];
+            if (local.length !== synced.length) return true;
+            return local.some((v, i) => v !== synced[i]);
+        };
+
+        const renderControls = () => {
+            pillsContainer.empty();
+
+            const globalList = this.plugin.settings.globalVersions || [];
+            const localList = this.plugin.settings.localVersions || [];
+
+            // Update Changed indicator
+            if (isOutOfSync()) {
+                changedIndicator.setText("● Changed");
+            } else {
+                changedIndicator.setText("");
+            }
+
+            // Render Version Pills
+            globalList.forEach(version => {
+                const isActive = localList.includes(version);
+
+                const btn = pillsContainer.createEl("button", { text: version });
+
+                btn.tabIndex = -1;
+                btn.style.padding = "4px 10px";
+                btn.style.fontSize = "12px";
+                btn.style.fontWeight = "bold";
+                btn.style.borderRadius = "12px";
+                btn.style.cursor = "pointer";
+                btn.style.border = "none";
+                btn.style.userSelect = "none";
+                btn.style.outline = "none";
+                btn.style.transition = "all 0.15s ease-in-out";
+
+                if (isActive) {
+                    btn.style.backgroundColor = "var(--interactive-accent)";
+                    btn.style.color = "var(--text-on-accent)";
+                } else {
+                    btn.style.backgroundColor = "var(--background-modifier-border)";
+                    btn.style.color = "var(--text-muted)";
+                    btn.style.opacity = "0.7";
+                }
+
+                btn.onmousedown = (e) => e.preventDefault();
+
+                btn.onclick = async (e) => {
+                    e.preventDefault();
+
+                    if (isActive) {
+                        this.plugin.settings.localVersions = this.plugin.settings.localVersions.filter(v => v !== version);
+                    } else {
+                        const updated = [...this.plugin.settings.localVersions, version];
+                        this.plugin.settings.localVersions = globalList.filter(v => updated.includes(v));
+                    }
+
+                    await this.plugin.saveSettings();
+                    renderControls();
+                    input.focus();
+                };
+            });
+        };
+
+        renderControls();
 
         const resetInputState = () => {
             this._isSubmitting = false;
@@ -761,7 +868,6 @@ class StepBibleSearchModal extends Modal {
 
                 if (this._isSubmitting) return;
 
-                // Grey out and disable input
                 this._isSubmitting = true;
                 input.disabled = true;
                 input.style.opacity = "0.5";
@@ -771,7 +877,6 @@ class StepBibleSearchModal extends Modal {
                 const regex = this.plugin.buildInputRefRegex();
                 const match = inputRef.match(regex);
 
-                // Check if input ref matches regex
                 if (!match || match[0].trim() !== inputRef) {
                     new Notice("Not a valid Bible reference.");
                     resetInputState();
@@ -785,11 +890,23 @@ class StepBibleSearchModal extends Modal {
                 }
 
                 const url = this.plugin.urlRef_url(urlRef);
+                const shouldRewrite = isOutOfSync();
 
-                try {
-                    if (url) await this.openStepUrl(url);
-                } finally {
-                    this.close();
+                // 1. Open the URL immediately
+                if (url) {
+                    await this.openStepUrl(url);
+                }
+
+                // 2. Close modal immediately
+                this.close();
+
+                // 3. Perform vault rewrite in background if versions changed
+                if (shouldRewrite) {
+                    setTimeout(async () => {
+                        await this.plugin.rewriteStepLinks();
+                        this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
+                        await this.plugin.saveSettings();
+                    }, 50);
                 }
             }
         };
@@ -806,6 +923,8 @@ class StepBibleSearchModal extends Modal {
         this.contentEl.empty();
     }
 }
+
+
 
 
 // PLUGIN =======================================================================
@@ -1654,7 +1773,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return urlRef(raw);
     }
     urlRef_url(urlRef) {
-        const versionPart = this.settings.enabledVersions
+        const versionPart = (this.settings.localVersions || [])
             .map(v => `version=${v}`)
             .join("@");
 
@@ -2645,27 +2764,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return overviews[book] || null;
     }
 
-    // SETTINGS MANAGEMENT HELPERS ================================================================================
-    toggleVersion(version, enabled) {
-        const list = this.settings.enabledVersions;
-
-        if (enabled) {
-            if (!list.includes(version)) list.push(version);
-        } else {
-            this.settings.enabledVersions = list.filter(v => v !== version);
-        }
-    }
-    moveVersion(fromIndex, toIndex) {
-        const list = this.settings.enabledVersions;
-        const item = list.splice(fromIndex, 1)[0];
-        list.splice(toIndex, 0, item);
-    }
     async rewriteStepLinks() {
         const files = this.app.vault.getMarkdownFiles();
 
-        // Build the version part from your toggles
-        const versionPart = this.settings.enabledVersions.length
-            ? this.settings.enabledVersions.map(v => `version=${v}`).join("@")
+        const activeList = this.settings.localVersions || [];
+        const versionPart = activeList.length
+            ? activeList.map(v => `version=${v}`).join("@")
             : "";
 
         for (const file of files) {
@@ -2691,7 +2795,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         }
 
-        new Notice("STEP Bible links updated.");
+        new Notice("Bible Versions Updated");
     }
     async toggleLocaltoOnline() {
         const vault = this.app.vault;
@@ -2724,11 +2828,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         this.urlPrefix = targetPrefix;
 
-        new Notice("STEP Bible Links Updated.");
+        new Notice("Bible Links Updated");
     }
     async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-        this.urlPrefix = this.settings.useLocalUrlPrefix
+        const loadedData = await this.loadData() || {};
+        if (loadedData.enabledVersions && !loadedData.globalVersions) {
+            loadedData.globalVersions = [...loadedData.enabledVersions];
+            loadedData.localVersions = [...loadedData.enabledVersions];
+            delete loadedData.enabledVersions;
+        }
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
+        this.urlPrefix = this.settings.useLocalStepServer
             ? "http://localhost:8989/"
             : "https://www.stepbible.org/";
     } 

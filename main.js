@@ -713,6 +713,7 @@ class StepBibleSearchModal extends Modal {
         this.plugin = plugin;
         this.prefill = prefill;
         this._isSubmitting = false;
+        this._changesCommitted = false;
 
         // Draft state (only applied when Enter is pressed)
         this._draftLocalVersions = [...(this.plugin.settings.localVersions || [])];
@@ -730,6 +731,16 @@ class StepBibleSearchModal extends Modal {
         if (this.plugin.settings.searchModalSettingsOpen === undefined) {
             this.plugin.settings.searchModalSettingsOpen = true;
         }
+    }
+
+    hasAnyDraftChanges() {
+        const local = this._draftLocalVersions;
+        const savedLocal = this.plugin.settings.localVersions || [];
+        const versionsChanged = local.length !== savedLocal.length || local.some((v, i) => v !== savedLocal[i]);
+        const serverChanged = this._draftLocalStepServer !== this.plugin.settings.useLocalStepServer;
+        const autoSyncChanged = this._draftAutoSync !== this.plugin.settings.autoSyncOnNavigation;
+        const autoCloseChanged = this._draftAutoClose !== this.plugin.settings.autoCloseSearchPanel;
+        return versionsChanged || serverChanged || autoSyncChanged || autoCloseChanged;
     }
 
     async openStepUrl(url) {
@@ -791,7 +802,6 @@ class StepBibleSearchModal extends Modal {
                 if (webviewEl) {
                     clearInterval(interval);
 
-                    // Attach navigation listeners if not yet attached
                     if (!webviewEl.__stepListenersAttached) {
                         webviewEl.__stepListenersAttached = true;
 
@@ -812,7 +822,6 @@ class StepBibleSearchModal extends Modal {
                         });
                     }
 
-                    // Trigger sync and auto-collapse directly
                     if (this.plugin.settings.autoSyncOnNavigation) {
                         await this.plugin.searchWebviewUrl(url, webviewEl);
                     }
@@ -827,7 +836,6 @@ class StepBibleSearchModal extends Modal {
 
         waitForWebview();
     }
-
 
     onOpen() {
         const { contentEl } = this;
@@ -909,23 +917,46 @@ class StepBibleSearchModal extends Modal {
         settingsDrawer.style.backgroundColor = "transparent";
         settingsDrawer.style.transition = "border-color 0.2s ease, padding 0.25s ease";
 
-        const hasAnyDraftChanges = () => {
-            const local = this._draftLocalVersions;
-            const savedLocal = this.plugin.settings.localVersions || [];
-            const versionsChanged = local.length !== savedLocal.length || local.some((v, i) => v !== savedLocal[i]);
-            const serverChanged = this._draftLocalStepServer !== this.plugin.settings.useLocalStepServer;
-            const autoSyncChanged = this._draftAutoSync !== this.plugin.settings.autoSyncOnNavigation;
-            const autoCloseChanged = this._draftAutoClose !== this.plugin.settings.autoCloseSearchPanel;
-            return versionsChanged || serverChanged || autoSyncChanged || autoCloseChanged;
-        };
+        // Animated Container for bottom helper text
+        const helperWrapper = settingsDrawer.createEl("div");
+        helperWrapper.style.display = "grid";
+        helperWrapper.style.gridTemplateRows = "0fr";
+        helperWrapper.style.opacity = "0";
+        helperWrapper.style.transition = "grid-template-rows 0.25s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease";
+
+        const helperInner = helperWrapper.createEl("div");
+        helperInner.style.overflow = "hidden";
+
+        const helperText = helperInner.createEl("div", { text: "" });
+        helperText.style.textAlign = "center";
+        helperText.style.fontSize = "11px";
+        helperText.style.color = "var(--text-muted)";
+        helperText.style.paddingTop = "6px";
+        helperText.style.userSelect = "none";
 
         const updateDrawerBorder = () => {
-            if (hasAnyDraftChanges()) {
+            if (this.hasAnyDraftChanges()) {
                 settingsDrawer.style.borderColor = "var(--interactive-accent)";
+                helperWrapper.style.gridTemplateRows = "1fr";
+                helperWrapper.style.opacity = "1";
+
+                const hasText = (input.value || "").trim().length > 0;
+                helperText.setText(
+                    hasText
+                        ? "Press enter to confirm changes and open reference"
+                        : "Press enter to confirm changes"
+                );
             } else {
                 settingsDrawer.style.borderColor = "var(--background-modifier-border)";
+                helperWrapper.style.gridTemplateRows = "0fr";
+                helperWrapper.style.opacity = "0";
+                helperText.setText("");
             }
         };
+
+        input.addEventListener("input", () => {
+            updateDrawerBorder();
+        });
 
         toggleBtn.onmousedown = (e) => e.preventDefault();
 
@@ -1198,16 +1229,7 @@ class StepBibleSearchModal extends Modal {
 
         renderServerPill();
 
-        // Helper Confirmation Text at the bottom
-        const helperText = settingsDrawer.createEl("div", {
-            text: "Press enter to confirm changes and/or search reference"
-        });
-        helperText.style.textAlign = "center";
-        helperText.style.fontSize = "11px";
-        helperText.style.color = "var(--text-muted)";
-        helperText.style.marginTop = "4px";
-        helperText.style.userSelect = "none";
-
+        settingsDrawer.appendChild(helperWrapper);
         updateDrawerBorder();
 
         const buildUrlWithDraftVersions = (urlRef) => {
@@ -1217,7 +1239,7 @@ class StepBibleSearchModal extends Modal {
             const prefix = this._draftLocalStepServer
                 ? "http://localhost:8989/"
                 : "https://www.stepbible.org/";
-            return `${prefix}?q=${versionPart}@reference=${urlRef}&options=GNVUH&display=COLUMN`;
+            return `${prefix}?q=${versionPart}@reference=${urlRef}&options=GNVUH&display=COLUMN&skipwelcome`;
         };
 
         const commitDraftAndSync = async () => {
@@ -1269,10 +1291,10 @@ class StepBibleSearchModal extends Modal {
 
                     try {
                         await commitDraftAndSync();
+                        this._changesCommitted = true;
                         updateDrawerBorder();
                         renderVersionPills();
                     } finally {
-                        helperText.setText("Press enter to confirm changes and/or search reference");
                         resetInputState();
                     }
                     return;
@@ -1307,6 +1329,8 @@ class StepBibleSearchModal extends Modal {
                     await this.openStepUrl(url);
                 }
 
+                this._changesCommitted = true;
+
                 // 2. Close modal immediately
                 this.close();
 
@@ -1338,6 +1362,10 @@ class StepBibleSearchModal extends Modal {
     }
 
     onClose() {
+        if (!this._changesCommitted && this.hasAnyDraftChanges()) {
+            new Notice("Changes not committed");
+        }
+
         const input = this.contentEl.querySelector("input");
         if (input && this._keydownHandler) {
             input.removeEventListener("keydown", this._keydownHandler);
@@ -1345,6 +1373,8 @@ class StepBibleSearchModal extends Modal {
         this.contentEl.empty();
     }
 }
+
+
 
 
 
@@ -2243,7 +2273,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             .join("@");
 
         const urlBase = `${this.urlPrefix}?q=${versionPart}@reference=`;
-        const urlSuffix = "&options=GNVUH&display=COLUMN";
+        const urlSuffix = "&options=GNVUH&display=COLUMN&skipwelcome";
 
         if (!urlRef) return null;
 

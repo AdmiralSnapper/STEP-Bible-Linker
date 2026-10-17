@@ -1,6 +1,6 @@
 {
-  "autoSyncOnNavigation": true,
-  "autoCloseSearchPanel": false,
+  "autoSyncOnNavigation": false,
+  "autoCloseSearchPanel": true,
   "useLocalStepServer": true,
   "globalVersions": [
     "ESV",

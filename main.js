@@ -1416,9 +1416,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this.registerView(
             STEP_SEARCH_VIEW,
             (leaf) => new StepSearchView(leaf, this)
-        );
-
-        
+        );  
 
         // DETECT AND LINK INPUT REF AT CURSOR 
         this.addCommand({
@@ -2062,7 +2060,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const rawBook1 = m[1].trim();
                 const book1 = normalizeBook(rawBook1);
                 if (!book1) {
-                    new Notice(`Unrecognized book name: "${rawBook1}".`);
+                    //new Notice(`Unrecognized book name: "${rawBook1}".`);
                     return null;
                 }
                 const chap1 = parseInt(m[2], 10);
@@ -2077,7 +2075,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const rawBook2 = (m[4] || rawBook1).trim();
                 const book2 = normalizeBook(rawBook2);
                 if (!book2) {
-                    new Notice(`Unrecognized book name: "${rawBook2}".`);
+                    //new Notice(`Unrecognized book name: "${rawBook2}".`);
                     return null;
                 }
                 const chap2 = parseInt(m[5], 10);
@@ -2108,7 +2106,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         if (bookOnlyPattern.test(text) && !/\d+\s*:/.test(text)) {
             const book = normalizeBook(text);
             if (book) return book.replace(/\s+/g, "");
-            new Notice(`Unrecognized book name: "${text}".`);
+            //new Notice(`Unrecognized book name: "${text}".`);
             return null;
         }
 
@@ -2127,7 +2125,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const rawBook = match[0].trim();
         const book = normalizeBook(rawBook);
         if (!book) {
-            new Notice(`Unrecognized book name: "${rawBook}".`);
+            //new Notice(`Unrecognized book name: "${rawBook}".`);
             return null;
         }
         const bk = bookKey(book);

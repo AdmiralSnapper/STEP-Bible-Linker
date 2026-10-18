@@ -819,6 +819,8 @@ class StepBibleSearchModal extends Modal {
                     }
 
                     await this.plugin.autoCollapseStepToolbar(webviewEl);
+                    await this.plugin.injectNoteDots(webviewEl);
+                    this.plugin.registerWebviewNoteChannel(webviewEl);
                 }
 
                 if (attempts > 50) {
@@ -1390,13 +1392,6 @@ class StepBibleSearchModal extends Modal {
 }
 
 
-
-
-
-
-
-
-
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
@@ -1484,7 +1479,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        //================================================================ SEARCH LOGIC
         // SEARCH BASED ON STEP URL
         this.addCommand({
             id: "step-sync-search-panel",
@@ -1532,14 +1526,43 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     await this.searchWebviewUrl(currentUrl, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                 }
                 await this.autoCollapseStepToolbar(webviewEl);
+                await this.injectNoteDots(webviewEl);
+                webviewEl.executeJavaScript(
+                    `document.title = "VERSES " + document.querySelectorAll("a.verseLink").length +
+                     " DOTS " + document.querySelectorAll(".step-note-dot").length;`);
+
+                this.registerWebviewNoteChannel(webviewEl);
             };
 
             webviewEl.addEventListener("did-finish-load", onNav);
             webviewEl.addEventListener("did-navigate-in-page", onNav);
         };
 
+        // Open notes when dots inside the webview are clicked
+        this.registerWebviewNoteChannel = (webviewEl) => {
+            if (!webviewEl || webviewEl.__stepNoteChannel) return;
+            webviewEl.__stepNoteChannel = true;
 
-        // 1. Initialise existing tabs on layout ready
+            webviewEl.addEventListener("ipc-message", async (e) => {
+                if (e.channel === "step-open-note") {
+                    await this.app.workspace.openLinkText(e.args[0] + ".md", "", false);
+                }
+            });
+
+            // Fallback: title-based channel
+            webviewEl.addEventListener("page-title-updated", async (e) => {
+                const m = (e.title || "").match(/^__obsidianOpenNote:(.+)$/);
+                if (!m) return;
+                await this.app.workspace.openLinkText(m[1] + ".md", "", false);
+                // restore the page title
+                try {
+                    await webviewEl.executeJavaScript(
+                        `document.title = window.__stepOriginalTitle || document.title;`);
+                } catch (_) { }
+            });
+        };
+
+        // ATTACH LISTENERS TO NEW WEBVIEWS
         this.app.workspace.onLayoutReady(async () => {
             const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
             for (const leaf of webLeaves) {
@@ -1551,11 +1574,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                     }
                     await this.autoCollapseStepToolbar(webviewEl);
+                    await this.injectNoteDots(webviewEl);
+                    this.registerWebviewNoteChannel(webviewEl);
                 }
             }
         });
 
-        // 2. Attach listeners & sync on tab switch
+        // ATTACH LISTENERS WHEN SWITCHING WEBVIEW TABS
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
                 const view = leaf?.view;
@@ -1571,6 +1596,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: false });
                 }
                 await this.autoCollapseStepToolbar(webviewEl);
+                await this.injectNoteDots(webviewEl);
+                this.registerWebviewNoteChannel(webviewEl);
             })
         );
 
@@ -3269,6 +3296,196 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return overviews[book] || null;
     }
 
+    async injectNoteDots(webviewEl) {
+        if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
+
+        try {
+            const bookMap = this.getBookMap();
+            const toCanonical = (ref) => {
+                const parts = ref.split(".");
+                const lookup = parts[0].replace(/\s+/g, " ").trim().toLowerCase();
+                const full = bookMap[lookup];
+                if (!full) return null;
+                return [full.replace(/\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
+            };
+
+            // STEP 2: build/reuse the vault scan cache (60s TTL, cleared on rewriteStepLinks)
+            const now = Date.now();
+            if (!this._noteDotsCache || now - this._noteDotsCache.time > 60000) {
+                const map = {}; // canonicalVerse -> Set of note basenames
+                const files = this.app.vault.getMarkdownFiles();
+                const linkRegex = /\(\[([^\]]+)\]\(([^)]+reference=([^)&]+)[^)]*)\)\)/g;
+
+                for (const file of files) {
+                    const text = await this.app.vault.cachedRead(file);
+                    if (!text.includes("reference=")) continue;
+
+                    for (const [, linkText, , refRaw] of text.matchAll(linkRegex)) {
+                        const decoded = decodeURIComponent(refRaw.trim());
+                        const [left, right] = decoded.split("-").map(s => s.trim());
+                        const canonL = toCanonical(left);
+                        const canonR = right ? toCanonical(right) : null;
+                        if (!canonL) continue;
+
+                        const [bookL, chapL, verseL] = canonL.split(".");
+                        const bookR = canonR ? canonR.split(".")[0] : bookL;
+                        const chapR = canonR ? canonR.split(".")[1] : chapL;
+                        const verseR = canonR ? (canonR.split(".")[2] || null) : null;
+
+                        if (bookL !== bookR) continue; // cross-book ranges unsupported for dots
+
+                        const maxV = (c) => this.getMaxVerse(bookL, parseInt(c, 10)) || 0;
+
+                        for (let c = parseInt(chapL, 10); c <= parseInt(chapR, 10); c++) {
+                            const lastV = (c === parseInt(chapR, 10) && verseR) ? parseInt(verseR, 10) : maxV(c);
+                            const firstV = (c === parseInt(chapL, 10)) ? (parseInt(verseL || "1", 10)) : 1;
+                            for (let v = firstV; v <= lastV; v++) {
+                                const key = `${bookL}.${c}.${v}`;
+                                (map[key] = map[key] || new Set()).add(file.basename);
+                            }
+                        }
+                    }
+                }
+                // convert Sets to arrays for serialisation
+                const serialised = {};
+                for (const k of Object.keys(map)) serialised[k] = Array.from(map[k]);
+                this._noteDotsCache = { time: now, map: serialised };
+            }
+
+            // STEP 3: push the FULL vault map + bookMap once per webview.
+            // The page intersects it with the CURRENT verses at injection time,
+            // so observer reruns during internal navigation always use fresh refs
+            // (fixes the stale-data race where arrow navigation injected old-page data).
+            // NOTE: the push is unconditional — the plugin has no access to the page's
+            // window, so it can't dedupe from here. The page tolerates re-pushes fine.
+            await webviewEl.executeJavaScript(
+                `window.__stepDotFullMap = ${JSON.stringify(this._noteDotsCache.map)};` +
+                `window.__stepDotBookMap = ${JSON.stringify(bookMap)};`);
+
+            // 4b. Define the in-page injector + MutationObserver (hardened):
+            //  - observes only the passage text container(s), not the whole body
+            //  - disconnects around injection so our own dot-appends never feed back
+            //  - debounced 300ms, idempotent injector (duplicate-guarded)
+            await webviewEl.executeJavaScript(`
+                (function() {
+                    // The injector: idempotent, safe to run any number of times
+                    window.__stepInjectDots = function() {
+                        const fullMap = window.__stepDotFullMap || {};
+                        const bookMap = window.__stepDotBookMap || {};
+                        const toCanon = (ref) => {
+                            const parts = ref.split(".");
+                            const full = bookMap[parts[0].toLowerCase()];
+                            if (!full) return null;
+                            return [full.replace(/\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
+                        };
+                        const dotData = {};
+                        document.querySelectorAll("a.verseLink").forEach(a => {
+                            const n = a.getAttribute("name");
+                            if (!n) return;
+                            const canon = toCanon(n);
+                            if (canon && fullMap[canon]) dotData[n] = fullMap[canon];
+                        });
+                        if (!document.getElementById("step-linker-dot-style")) {
+                            const style = document.createElement("style");
+                            style.id = "step-linker-dot-style";
+                            style.textContent = [
+                                "span.verse { position: relative; }",
+                                "span.verse.step-dot-hover {",
+                                "  background: rgba(194, 201, 168, 0.02);",
+                                "  outline: 1px solid #cacda6;",
+                                "  border-radius: 3px;",
+                                "  transition: background 0.15s ease;",
+                                "}",
+                                ".step-note-dot {",
+                                "  position: absolute; left: -14px; top: 2px;",
+                                "  width: 8px; height: 8px; border-radius: 50%;",
+                                "  background: #226b37; opacity: 0.85;",
+                                "  cursor: pointer; z-index: 10;",
+                                "  transition: transform 0.12s ease;",
+                                "}",
+                                ".step-note-dot:hover { transform: scale(1.5); opacity: 1; }"
+                            ].join("\\n");
+                            document.head.appendChild(style);
+                        }
+
+                        let added = 0;
+                        document.querySelectorAll("span.verse").forEach(verse => {
+                            if (verse.querySelector(".step-note-dot")) return;
+                            const name = verse.querySelector("a.verseLink")?.getAttribute("name");
+                            if (!name || !dotData[name]) return;
+
+                            const dot = document.createElement("div");
+                            dot.className = "step-note-dot";
+                            dot.title = dotData[name].join(", ");
+                            dot.addEventListener("mouseenter", () => verse.classList.add("step-dot-hover"));
+                            dot.addEventListener("mouseleave", () => verse.classList.remove("step-dot-hover"));
+                            dot.addEventListener("click", (e) => {
+                                e.stopPropagation();
+                                const note = dotData[name][0];
+                                if (window.ipcRenderer) {
+                                    window.ipcRenderer.sendToHost("step-open-note", note);
+                                } else {
+                                    window.__stepOriginalTitle = document.title;
+                                    document.title = "__obsidianOpenNote:" + note;
+                                }
+                            });
+                            verse.appendChild(dot);
+                            added++;
+                        });
+                        return added;
+                    };
+
+                    // Observe document.body — the only element guaranteed to survive
+                    // STEP's navigation (it replaces .passageContent AND #wrap wholesale).
+                    // Feedback from our own dot-appends is suppressed by
+                    // disconnect-around-inject below, so the broad scope is safe.
+                    const getTargets = () => [document.body];
+
+                    if (!window.__stepDotObserver) {
+                        let pending = null;
+                        const run = () => {
+                            clearTimeout(pending);
+                            pending = setTimeout(() => {
+                                try {
+                                    if (!window.__stepInjectDots) { document.title = "INJ MISSING fn"; return; }
+                                    if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
+                                    let n;
+                                    try { n = window.__stepInjectDots(); }
+                                    finally { if (window.__stepDotObserve) window.__stepDotObserve(); }
+                                    const vcount = document.querySelectorAll("span.verse").length;
+                                    const mcount = document.querySelectorAll("a.verseLink").length;
+                                    document.title = "OBS added=" + n + " v=" + vcount + " m=" + mcount + " t=" + Date.now() % 100000;
+                                } catch (e) {
+                                    document.title = "OBS ERR " + (e && e.message ? e.message.slice(0, 40) : e);
+                                }
+                            }, 300);
+                        };
+                        const obs = new MutationObserver(run);
+                        window.__stepDotObserver = obs;
+                        window.__stepDotObserve = () => {
+                            try { obs.disconnect(); } catch (e) {}
+                            getTargets().forEach(t => obs.observe(t, { childList: true, subtree: true }));
+                        };
+                        window.__stepDotObserve();
+                    }
+
+                    // Inject once now, observer suppressed during our own DOM writes
+                    let added = 0;
+                    if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
+                    try { added = window.__stepInjectDots(); } finally {
+                        if (window.__stepDotObserve) window.__stepDotObserve();
+                    }
+                    const vcount2 = document.querySelectorAll("span.verse").length;
+                    document.title = "INJ added=" + added + " v=" + vcount2 + " m=" + document.querySelectorAll("a.verseLink").length;
+                    return added;
+                })();
+            `);
+        } catch (err) {
+            console.error("STEP Plugin: injectNoteDots error:", err);
+        }
+    }
+
+
     async autoCollapseStepToolbar(webviewEl) {
         if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
 
@@ -3309,6 +3526,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     }
 
     async rewriteStepLinks() {
+        this._noteDotsCache = null;
+
         const files = this.app.vault.getMarkdownFiles();
 
         const activeList = this.settings.localVersions || [];

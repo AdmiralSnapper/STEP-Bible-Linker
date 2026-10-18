@@ -819,8 +819,6 @@ class StepBibleSearchModal extends Modal {
                     }
 
                     await this.plugin.autoCollapseStepToolbar(webviewEl);
-                    await this.plugin.injectNoteDots(webviewEl);
-                    this.plugin.registerWebviewNoteChannel(webviewEl);
                 }
 
                 if (attempts > 50) {
@@ -1392,6 +1390,13 @@ class StepBibleSearchModal extends Modal {
 }
 
 
+
+
+
+
+
+
+
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
@@ -1401,6 +1406,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         console.log('STEP Bible Linker Loaded.');
         this.activePopover = null;
+
+        // Note-dots state (vault scan cache, 60s TTL)
+        this._noteDotsCache = null;
         this._lastSearchQueryRef = null;
 
         // Load settings and add settings tab
@@ -1414,6 +1422,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         );  
 
         // DETECT AND LINK INPUT REF AT CURSOR 
+        //============================================================================
         this.addCommand({
             id: 'auto-link-step-ref',
             name: 'Link/Unlink Reference at Cursor',
@@ -1480,6 +1489,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         });
 
         // SEARCH BASED ON STEP URL
+        //============================================================================
         this.addCommand({
             id: "step-sync-search-panel",
             name: "Update STEP Search Panel",
@@ -1508,16 +1518,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!webviewEl) return;
 
                 await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: true, ignoreDuplicate: true });
-
-                console.log("STEP Sync: Manual search panel update complete.");
             }
         });
 
-        // Helper to attach listeners once per webview element
+        // SEARCH PANEL 
+        //============================================================================
         this.attachWebviewListeners = (webviewEl) => {
             if (!webviewEl || webviewEl.__stepListenersAttached) return;
             webviewEl.__stepListenersAttached = true;
 
+            //Listener function that gets attached to webview  
             const onNav = async () => {
                 const currentUrl = webviewEl.getURL?.();
                 if (!currentUrl) return;
@@ -1527,45 +1537,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
                 await this.autoCollapseStepToolbar(webviewEl);
                 await this.injectNoteDots(webviewEl);
-                webviewEl.executeJavaScript(
-                    `document.title = "VERSES " + document.querySelectorAll("a.verseLink").length +
-                     " DOTS " + document.querySelectorAll(".step-note-dot").length;`);
-
-                this.registerWebviewNoteChannel(webviewEl);
             };
 
+            //Attach listener
             webviewEl.addEventListener("did-finish-load", onNav);
             webviewEl.addEventListener("did-navigate-in-page", onNav);
         };
-
-        // Open notes when dots inside the webview are clicked
-        this.registerWebviewNoteChannel = (webviewEl) => {
-            if (!webviewEl || webviewEl.__stepNoteChannel) return;
-            webviewEl.__stepNoteChannel = true;
-
-            webviewEl.addEventListener("ipc-message", async (e) => {
-                if (e.channel === "step-open-note") {
-                    await this.app.workspace.openLinkText(e.args[0] + ".md", "", false);
-                }
-            });
-
-            // Fallback: title-based channel
-            webviewEl.addEventListener("page-title-updated", async (e) => {
-                const m = (e.title || "").match(/^__obsidianOpenNote:(.+)$/);
-                if (!m) return;
-                await this.app.workspace.openLinkText(m[1] + ".md", "", false);
-                // restore the page title
-                try {
-                    await webviewEl.executeJavaScript(
-                        `document.title = window.__stepOriginalTitle || document.title;`);
-                } catch (_) { }
-            });
-        };
-
-        // ATTACH LISTENERS TO NEW WEBVIEWS
+        // On new tab
         this.app.workspace.onLayoutReady(async () => {
             const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
             for (const leaf of webLeaves) {
+                
                 const webviewEl = leaf.view?.webview;
                 if (webviewEl) {
                     this.attachWebviewListeners(webviewEl);
@@ -1575,33 +1557,28 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     }
                     await this.autoCollapseStepToolbar(webviewEl);
                     await this.injectNoteDots(webviewEl);
-                    this.registerWebviewNoteChannel(webviewEl);
                 }
             }
         });
-
-        // ATTACH LISTENERS WHEN SWITCHING WEBVIEW TABS
+        // On tab switch
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
                 const view = leaf?.view;
                 if (!view || view.getViewType?.() !== "webviewer") return;
 
-                const webviewEl = view.webview;
-                if (!webviewEl) return;
-
-                this.attachWebviewListeners(webviewEl);
-
-                if (this.settings.autoSyncOnNavigation) {
-                    const url = view.url || webviewEl.getURL?.();
-                    if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: false });
+                const webviewEl = leaf.view?.webview;
+                if (webviewEl) {
+                    this.attachWebviewListeners(webviewEl);
+                    if (this.settings.autoSyncOnNavigation) {
+                        const url = leaf.view.url || webviewEl.getURL?.();
+                        if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
+                    }
+                    await this.autoCollapseStepToolbar(webviewEl);
+                    await this.injectNoteDots(webviewEl);
                 }
-                await this.autoCollapseStepToolbar(webviewEl);
-                await this.injectNoteDots(webviewEl);
-                this.registerWebviewNoteChannel(webviewEl);
             })
         );
-
-        // CLOSE SEARCH PANEL WHEN TAB CHANGES — BUT NOT WHEN SEARCH TAB IS FOCUSED
+        // Close panel
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", (leaf) => {
                 if (!this.settings.autoCloseSearchPanel) return;
@@ -1651,9 +1628,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             })
         );
 
-        //============================================================================
-
         // HOVERING HANDLER
+        //============================================================================
         this.registerDomEvent(document, "mouseover", async (evt) => {
             const targetEl = evt.target;
             if (!targetEl) return;
@@ -1833,6 +1809,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         });
 
         // OPEN SEARCH MODAL
+        //============================================================================
         this.addCommand({
             id: "step-bible-search",
             name: "Search Bible Reference…",
@@ -3296,6 +3273,45 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return overviews[book] || null;
     }
 
+    // DOM EDITORS
+    async autoCollapseStepToolbar(webviewEl) {
+        if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
+
+        try {
+            await webviewEl.executeJavaScript(`
+                (function() {
+                    console.log("STEP Plugin: Attempting toolbar auto-collapse...");
+                    const tryCollapse = () => {
+                        const navbar = document.getElementById("stepnavbar");
+                        const resizeBtn = document.querySelector(".resizePanel") || 
+                                          document.querySelector(".glyphicon-resize-full")?.closest("a, button, div, span");
+
+                        if (navbar && navbar.style.display !== "none" && resizeBtn) {
+                            console.log("STEP Plugin: Found resizePanel button, clicking...");
+                            resizeBtn.click();
+                            return true;
+                        } else if (navbar && navbar.style.display === "none") {
+                            console.log("STEP Plugin: Toolbar already collapsed.");
+                            return true;
+                        }
+                        return false;
+                    };
+
+                    if (!tryCollapse()) {
+                        let attempts = 0;
+                        const interval = setInterval(() => {
+                            attempts++;
+                            if (tryCollapse() || attempts > 30) {
+                                clearInterval(interval);
+                            }
+                        }, 100);
+                    }
+                })();
+            `);
+        } catch (err) {
+            console.error("STEP Plugin: executeJavaScript error:", err);
+        }
+    }
     async injectNoteDots(webviewEl) {
         if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
 
@@ -3368,163 +3384,132 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             //  - debounced 300ms, idempotent injector (duplicate-guarded)
             await webviewEl.executeJavaScript(`
                 (function() {
-                    // The injector: idempotent, safe to run any number of times
-                    window.__stepInjectDots = function() {
-                        const fullMap = window.__stepDotFullMap || {};
-                        const bookMap = window.__stepDotBookMap || {};
-                        const toCanon = (ref) => {
-                            const parts = ref.split(".");
-                            const full = bookMap[parts[0].toLowerCase()];
-                            if (!full) return null;
-                            return [full.replace(/\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
+                    try {
+                        // The injector: idempotent, safe to run any number of times
+                        window.__stepInjectDots = function() {
+                            const fullMap = window.__stepDotFullMap || {};
+                            const bookMap = window.__stepDotBookMap || {};
+                            const toCanon = (ref) => {
+                                const parts = ref.split(".");
+                                const full = bookMap[parts[0].toLowerCase()];
+                                if (!full) return null;
+                                return [full.replace(/\\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
+                            };
+                            const dotData = {};
+                            document.querySelectorAll("a.verseLink").forEach(a => {
+                                const n = a.getAttribute("name");
+                                if (!n) return;
+                                const canon = toCanon(n);
+                                if (canon && fullMap[canon]) dotData[n] = fullMap[canon];
+                            });
+                            if (!document.getElementById("step-linker-dot-style")) {
+                                const style = document.createElement("style");
+                                style.id = "step-linker-dot-style";
+                                style.textContent = [
+                                    "span.verse { position: relative; }",
+                                    "span.verse.step-dot-hover {",
+                                    "  background: rgba(194, 201, 168, 0.02);",
+                                    "  outline: 1px solid #cacda6;",
+                                    "  border-radius: 3px;",
+                                    "  transition: background 0.15s ease;",
+                                    "}",
+                                    ".step-note-dot {",
+                                    "  position: absolute; left: -14px; top: 2px;",
+                                    "  width: 8px; height: 8px; border-radius: 50%;",
+                                    "  background: #226b37; opacity: 0.85;",
+                                    "  cursor: pointer; z-index: 10;",
+                                    "  transition: transform 0.12s ease;",
+                                    "}",
+                                    ".step-note-dot:hover { transform: scale(1.5); opacity: 1; }"
+                                ].join("\\n");
+                                document.head.appendChild(style);
+                            }
+
+                            let added = 0;
+                            document.querySelectorAll("span.verse").forEach(verse => {
+                                if (verse.querySelector(".step-note-dot")) return;
+                                const name = verse.querySelector("a.verseLink")?.getAttribute("name");
+                                if (!name || !dotData[name]) return;
+
+                                const dot = document.createElement("div");
+                                dot.className = "step-note-dot";
+                                dot.title = dotData[name].join(", ");
+                                dot.addEventListener("mouseenter", () => verse.classList.add("step-dot-hover"));
+                                dot.addEventListener("mouseleave", () => verse.classList.remove("step-dot-hover"));
+                                verse.appendChild(dot);
+                                added++;
+                            });
+                            console.log("[step-dots] INJECT matched=" + Object.keys(dotData).length
+                                + " added=" + added
+                                + " sample=" + (Object.keys(dotData)[0] || "none"));
+                            return added;
                         };
-                        const dotData = {};
-                        document.querySelectorAll("a.verseLink").forEach(a => {
-                            const n = a.getAttribute("name");
-                            if (!n) return;
-                            const canon = toCanon(n);
-                            if (canon && fullMap[canon]) dotData[n] = fullMap[canon];
-                        });
-                        if (!document.getElementById("step-linker-dot-style")) {
-                            const style = document.createElement("style");
-                            style.id = "step-linker-dot-style";
-                            style.textContent = [
-                                "span.verse { position: relative; }",
-                                "span.verse.step-dot-hover {",
-                                "  background: rgba(194, 201, 168, 0.02);",
-                                "  outline: 1px solid #cacda6;",
-                                "  border-radius: 3px;",
-                                "  transition: background 0.15s ease;",
-                                "}",
-                                ".step-note-dot {",
-                                "  position: absolute; left: -14px; top: 2px;",
-                                "  width: 8px; height: 8px; border-radius: 50%;",
-                                "  background: #226b37; opacity: 0.85;",
-                                "  cursor: pointer; z-index: 10;",
-                                "  transition: transform 0.12s ease;",
-                                "}",
-                                ".step-note-dot:hover { transform: scale(1.5); opacity: 1; }"
-                            ].join("\\n");
-                            document.head.appendChild(style);
+
+                        // Observe document.body — the only element guaranteed to survive
+                        // STEP's navigation. Feedback from our own dot-appends is
+                        // suppressed by disconnect-around-inject below.
+                        const getTargets = () => [document.body];
+
+                        if (!window.__stepDotObserver) {
+                            let pending = null;
+                            const run = () => {
+                                clearTimeout(pending);
+                                pending = setTimeout(() => {
+                                    try {
+                                        if (!window.__stepInjectDots) { console.log("[step-dots] OBS MISSING fn"); return; }
+                                        if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
+                                        let n;
+                                        try { n = window.__stepInjectDots(); }
+                                        finally { if (window.__stepDotObserve) window.__stepDotObserve(); }
+                                        const vcount = document.querySelectorAll("span.verse").length;
+                                        const mcount = document.querySelectorAll("a.verseLink").length;
+                                        console.log("[step-dots] OBS added=" + n + " v=" + vcount + " m=" + mcount);
+                                    } catch (e) {
+                                        console.log("[step-dots] OBS ERR " + (e && e.message ? e.message.slice(0, 80) : e));
+                                    }
+                                }, 300);
+                            };
+                            const obs = new MutationObserver(run);
+                            window.__stepDotObserver = obs;
+                            window.__stepDotObserve = () => {
+                                try { obs.disconnect(); } catch (e) {}
+                                getTargets().forEach(t => obs.observe(t, { childList: true, subtree: true }));
+                            };
+                            window.__stepDotObserve();
                         }
 
+                        // Inject once now, observer suppressed during our own DOM writes
                         let added = 0;
-                        document.querySelectorAll("span.verse").forEach(verse => {
-                            if (verse.querySelector(".step-note-dot")) return;
-                            const name = verse.querySelector("a.verseLink")?.getAttribute("name");
-                            if (!name || !dotData[name]) return;
+                        if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
+                        try { added = window.__stepInjectDots(); } finally {
+                            if (window.__stepDotObserve) window.__stepDotObserve();
+                        }
+                        const vcount2 = document.querySelectorAll("span.verse").length;
+                        console.log("[step-dots] INJ added=" + added
+                            + " v=" + vcount2
+                            + " m=" + document.querySelectorAll("a.verseLink").length);
 
-                            const dot = document.createElement("div");
-                            dot.className = "step-note-dot";
-                            dot.title = dotData[name].join(", ");
-                            dot.addEventListener("mouseenter", () => verse.classList.add("step-dot-hover"));
-                            dot.addEventListener("mouseleave", () => verse.classList.remove("step-dot-hover"));
-                            dot.addEventListener("click", (e) => {
-                                e.stopPropagation();
-                                const note = dotData[name][0];
-                                if (window.ipcRenderer) {
-                                    window.ipcRenderer.sendToHost("step-open-note", note);
-                                } else {
-                                    window.__stepOriginalTitle = document.title;
-                                    document.title = "__obsidianOpenNote:" + note;
-                                }
-                            });
-                            verse.appendChild(dot);
-                            added++;
-                        });
+                        console.log("[step-dots] PUSH map=" + Object.keys(window.__stepDotFullMap || {}).length
+                            + " bookMap=" + Object.keys(window.__stepDotBookMap || {}).length);
+
+                        window.__stepLastInjectError = null;
                         return added;
-                    };
-
-                    // Observe document.body — the only element guaranteed to survive
-                    // STEP's navigation (it replaces .passageContent AND #wrap wholesale).
-                    // Feedback from our own dot-appends is suppressed by
-                    // disconnect-around-inject below, so the broad scope is safe.
-                    const getTargets = () => [document.body];
-
-                    if (!window.__stepDotObserver) {
-                        let pending = null;
-                        const run = () => {
-                            clearTimeout(pending);
-                            pending = setTimeout(() => {
-                                try {
-                                    if (!window.__stepInjectDots) { document.title = "INJ MISSING fn"; return; }
-                                    if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
-                                    let n;
-                                    try { n = window.__stepInjectDots(); }
-                                    finally { if (window.__stepDotObserve) window.__stepDotObserve(); }
-                                    const vcount = document.querySelectorAll("span.verse").length;
-                                    const mcount = document.querySelectorAll("a.verseLink").length;
-                                    document.title = "OBS added=" + n + " v=" + vcount + " m=" + mcount + " t=" + Date.now() % 100000;
-                                } catch (e) {
-                                    document.title = "OBS ERR " + (e && e.message ? e.message.slice(0, 40) : e);
-                                }
-                            }, 300);
-                        };
-                        const obs = new MutationObserver(run);
-                        window.__stepDotObserver = obs;
-                        window.__stepDotObserve = () => {
-                            try { obs.disconnect(); } catch (e) {}
-                            getTargets().forEach(t => obs.observe(t, { childList: true, subtree: true }));
-                        };
-                        window.__stepDotObserve();
+                    } catch (e) {
+                        window.__stepLastInjectError = e && e.message ? e.message : String(e);
+                        return null;
                     }
-
-                    // Inject once now, observer suppressed during our own DOM writes
-                    let added = 0;
-                    if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
-                    try { added = window.__stepInjectDots(); } finally {
-                        if (window.__stepDotObserve) window.__stepDotObserve();
-                    }
-                    const vcount2 = document.querySelectorAll("span.verse").length;
-                    document.title = "INJ added=" + added + " v=" + vcount2 + " m=" + document.querySelectorAll("a.verseLink").length;
-                    return added;
                 })();
             `);
+
+            const pageErr = await webviewEl.executeJavaScript(`window.__stepLastInjectError || null`);
+            if (pageErr) console.error("[step-dots] Page-side error:", pageErr);
+
         } catch (err) {
             console.error("STEP Plugin: injectNoteDots error:", err);
         }
     }
 
-
-    async autoCollapseStepToolbar(webviewEl) {
-        if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
-
-        try {
-            await webviewEl.executeJavaScript(`
-                (function() {
-                    console.log("STEP Plugin: Attempting toolbar auto-collapse...");
-                    const tryCollapse = () => {
-                        const navbar = document.getElementById("stepnavbar");
-                        const resizeBtn = document.querySelector(".resizePanel") || 
-                                          document.querySelector(".glyphicon-resize-full")?.closest("a, button, div, span");
-
-                        if (navbar && navbar.style.display !== "none" && resizeBtn) {
-                            console.log("STEP Plugin: Found resizePanel button, clicking...");
-                            resizeBtn.click();
-                            return true;
-                        } else if (navbar && navbar.style.display === "none") {
-                            console.log("STEP Plugin: Toolbar already collapsed.");
-                            return true;
-                        }
-                        return false;
-                    };
-
-                    if (!tryCollapse()) {
-                        let attempts = 0;
-                        const interval = setInterval(() => {
-                            attempts++;
-                            if (tryCollapse() || attempts > 30) {
-                                clearInterval(interval);
-                            }
-                        }, 100);
-                    }
-                })();
-            `);
-        } catch (err) {
-            console.error("STEP Plugin: executeJavaScript error:", err);
-        }
-    }
-
+    // SETTINGS / LINK REWRITE
     async rewriteStepLinks() {
         this._noteDotsCache = null;
 

@@ -1543,6 +1543,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             webviewEl.addEventListener("did-finish-load", onNav);
             webviewEl.addEventListener("did-navigate-in-page", onNav);
         };
+        
         // On new tab
         this.app.workspace.onLayoutReady(async () => {
             const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
@@ -1551,6 +1552,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const webviewEl = leaf.view?.webview;
                 if (webviewEl) {
                     this.attachWebviewListeners(webviewEl);
+                    // Fresh webviews aren't ready for executeJavaScript yet;
+                    if (!webviewEl.getURL?.()) return;
                     if (this.settings.autoSyncOnNavigation) {
                         const url = leaf.view.url || webviewEl.getURL?.();
                         if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
@@ -1569,6 +1572,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const webviewEl = leaf.view?.webview;
                 if (webviewEl) {
                     this.attachWebviewListeners(webviewEl);
+                    // Fresh webviews aren't ready for executeJavaScript yet;
+                    if (!webviewEl.getURL?.()) return;
                     if (this.settings.autoSyncOnNavigation) {
                         const url = leaf.view.url || webviewEl.getURL?.();
                         if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
@@ -3372,14 +3377,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // The page intersects it with the CURRENT verses at injection time,
             // so observer reruns during internal navigation always use fresh refs
             // (fixes the stale-data race where arrow navigation injected old-page data).
-            // NOTE: the push is unconditional — the plugin has no access to the page's
-            // window, so it can't dedupe from here. The page tolerates re-pushes fine.
             await webviewEl.executeJavaScript(
                 `window.__stepDotFullMap = ${JSON.stringify(this._noteDotsCache.map)};` +
                 `window.__stepDotBookMap = ${JSON.stringify(bookMap)};`);
 
-            // 4b. Define the in-page injector + MutationObserver (hardened):
-            //  - observes only the passage text container(s), not the whole body
+            // 4b. Define the in-page injector + MutationObserver:
+            //  - observes document.body (survives STEP's container swaps)
             //  - disconnects around injection so our own dot-appends never feed back
             //  - debounced 300ms, idempotent injector (duplicate-guarded)
             await webviewEl.executeJavaScript(`
@@ -3439,9 +3442,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 verse.appendChild(dot);
                                 added++;
                             });
-                            console.log("[step-dots] INJECT matched=" + Object.keys(dotData).length
-                                + " added=" + added
-                                + " sample=" + (Object.keys(dotData)[0] || "none"));
                             return added;
                         };
 
@@ -3456,14 +3456,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 clearTimeout(pending);
                                 pending = setTimeout(() => {
                                     try {
-                                        if (!window.__stepInjectDots) { console.log("[step-dots] OBS MISSING fn"); return; }
+                                        if (!window.__stepInjectDots) return;
                                         if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
                                         let n;
                                         try { n = window.__stepInjectDots(); }
                                         finally { if (window.__stepDotObserve) window.__stepDotObserve(); }
-                                        const vcount = document.querySelectorAll("span.verse").length;
-                                        const mcount = document.querySelectorAll("a.verseLink").length;
-                                        console.log("[step-dots] OBS added=" + n + " v=" + vcount + " m=" + mcount);
                                     } catch (e) {
                                         console.log("[step-dots] OBS ERR " + (e && e.message ? e.message.slice(0, 80) : e));
                                     }
@@ -3479,21 +3476,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         }
 
                         // Inject once now, observer suppressed during our own DOM writes
-                        let added = 0;
                         if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
-                        try { added = window.__stepInjectDots(); } finally {
+                        try { window.__stepInjectDots(); } finally {
                             if (window.__stepDotObserve) window.__stepDotObserve();
                         }
-                        const vcount2 = document.querySelectorAll("span.verse").length;
-                        console.log("[step-dots] INJ added=" + added
-                            + " v=" + vcount2
-                            + " m=" + document.querySelectorAll("a.verseLink").length);
-
-                        console.log("[step-dots] PUSH map=" + Object.keys(window.__stepDotFullMap || {}).length
-                            + " bookMap=" + Object.keys(window.__stepDotBookMap || {}).length);
 
                         window.__stepLastInjectError = null;
-                        return added;
                     } catch (e) {
                         window.__stepLastInjectError = e && e.message ? e.message : String(e);
                         return null;
@@ -3501,13 +3489,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 })();
             `);
 
-            const pageErr = await webviewEl.executeJavaScript(`window.__stepLastInjectError || null`);
-            if (pageErr) console.error("[step-dots] Page-side error:", pageErr);
-
         } catch (err) {
             console.error("STEP Plugin: injectNoteDots error:", err);
         }
     }
+
+
 
     // SETTINGS / LINK REWRITE
     async rewriteStepLinks() {

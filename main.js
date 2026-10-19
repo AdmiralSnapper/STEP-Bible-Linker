@@ -1641,17 +1641,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (!targetEl) return;
 
             let url = "";
+            let linkText = "";
 
             const lineParent = targetEl.closest(".cm-line");
             if (lineParent) {
                 const m = lineParent.textContent.match(/https?:\/\/[^\s)]+/);
                 if (m) url = m[0];
+                // Markdown link: use the text inside [ ... ]
+                const md = lineParent.textContent.match(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/);
+                if (md && md[2] === url) linkText = md[1];
             }
 
             if (!url) {
                 const a = targetEl.closest("a[href]");
                 if (a && a.href.startsWith(this.urlPrefix)) {
                     url = a.href;
+                    linkText = a.textContent.trim();
                 }
             }
 
@@ -1666,7 +1671,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const urlRef = this.inputRef_urlRef(t);
                         if (urlRef) {
                             const builtUrl = this.urlRef_url(urlRef);
-                            if (builtUrl) url = builtUrl;
+                            if (builtUrl) { url = builtUrl; linkText = t; }
                         }
                     }
                 }
@@ -1675,7 +1680,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             if (!url || !url.startsWith(this.urlPrefix)) return;
 
-            // Any new hover clears leftover highlights
+            // Only clear/reprocess when the hovered reference actually changes;
+            // mouseover fires repeatedly on child elements within the same link.
+            const refKey = this.urlRef_url(url);
+            if (this._hoverRefKey === refKey) return;
+            this._hoverRefKey = refKey;
+
+            // Any new reference clears leftover highlights
             this.clearAllStepHighlights();
 
             if (this.activePopover) {
@@ -1713,16 +1724,36 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 document.body.appendChild(pop);
 
                 const rect = pop.getBoundingClientRect();
-                let leftPos = evt.clientX + 15;
+                // Anchor the popup's top-left corner to the link's
+                // top-left corner so it covers the link itself.
+                const linkRect = targetEl.getBoundingClientRect();
+                let leftPos = linkRect.left;
+                let topPos = linkRect.top;
                 if (leftPos + rect.width > window.innerWidth) {
-                    leftPos = evt.clientX - rect.width - 15;
+                    leftPos = Math.max(0, window.innerWidth - rect.width);
+                }
+                if (topPos + rect.height > window.innerHeight) {
+                    topPos = Math.max(0, window.innerHeight - rect.height);
                 }
 
                 pop.style.left = `${leftPos}px`;
-                pop.style.top = `${evt.clientY + 15}px`;
+                pop.style.top = `${topPos}px`;
                 pop.style.visibility = "visible";
 
                 this.activePopover = pop;
+
+                // The header reference is a clickable link that opens the
+                // STEP page in the webviewer, same as links in the note.
+                pop.querySelectorAll("a").forEach(a => {
+                    a.addEventListener("click", (ev) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        pop.remove();
+                        if (this.activePopover === pop) this.activePopover = null;
+                        this._hoverRefKey = null;
+                        this.openStepUrl(a.href);
+                    });
+                });
 
                 let hideTimeout = null;
                 const cancelHide = () => {
@@ -1734,13 +1765,20 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     hideTimeout = setTimeout(() => {
                         pop.remove();
                         if (this.activePopover === pop) this.activePopover = null;
+                        // Pop is gone: allow the same link to re-trigger a popup
+                        this._hoverRefKey = null;
                     }, 200);
                 };
 
                 requestAnimationFrame(() => {
                     targetEl.addEventListener("mouseleave", scheduleHide, { once: true });
                     pop.addEventListener("mouseenter", cancelHide);
-                    pop.addEventListener("mouseleave", scheduleHide);
+                    pop.addEventListener("mouseleave", () => {
+                        scheduleHide();
+                        // Highlights only clear when the pointer leaves the popout
+                        this._hoverRefKey = null;
+                        this.clearAllStepHighlights();
+                    });
                 });
             };
 
@@ -1826,25 +1864,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             `);
 
 
-                            // Clear highlights when the pointer leaves the link
-                            targetEl.addEventListener("mouseleave", () => {
-                                wvEl.executeJavaScript(`
-                                    document.querySelectorAll(".step-ref-hover").forEach(el =>
-                                        el.classList.remove("step-ref-hover"));
-                                `).catch(() => { });
-                            }, { once: true });
-
                             highlightedAny = true;
                         }
                     }
                 }
                 // ---------------------------------------------
 
-                // Badge: shown whenever the reference's verses intersect any
-                // open STEP tab — regardless of whether highlighting succeeded.
-                const stepBadge = foundInStep
-                    ? `<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;"><span style="width:8px;height:8px;border-radius:50%;background:#4caf50;display:inline-block;"></span><span style="font-size:12px;color:#9cc49c;">Reference Open</span></div>`
-                    : "";
+                // Header: the reference (same text as the link) plus the
+                // Bible version used, e.g. "Genesis 4:1-3 (ESV)".
+                const versionMatch = url.match(/version=([^&@]+)/);
+                const versionName = versionMatch ? versionMatch[1].toUpperCase() : "";
+                const refHeader = `<div style="margin-bottom:10px;"><a href="${url}" style="text-decoration:none;color:var(--text-accent);"><b>${linkText || urlRef}${versionName ? ` (${versionName})` : ""}</b></a></div>`;
 
                 //If only a book
                 if (!urlRef.includes(".")) {
@@ -1852,7 +1882,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     const info = this.getBookOverview(urlRef);
 
                     if (info) {
-                        pop.innerHTML = `${stepBadge}
+                        pop.innerHTML = `${refHeader}
                             <b>${info.name}</b><br>
                             ${info.chapters} chapters<br><br>
                             <i>Author:</i> ${info.author}<br>
@@ -1863,7 +1893,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         return;
                     }
 
-                    pop.innerHTML = `${stepBadge}<b>${urlRef}</b><br>No overview available.`;
+                    pop.innerHTML = `${refHeader}No overview available.`;
                     return;
                 }
 
@@ -1907,7 +1937,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
 
                 pop.innerHTML = combined || "<p><i>No English text found.</i></p>";
-                if (stepBadge) pop.insertAdjacentHTML("afterbegin", stepBadge);
+                if (refHeader) pop.insertAdjacentHTML("afterbegin", refHeader);
 
                 requestAnimationFrame(() => {
                     if (pop.scrollHeight > pop.clientHeight) {

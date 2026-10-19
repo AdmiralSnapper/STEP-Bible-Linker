@@ -1537,7 +1537,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     await this.searchWebviewUrl(currentUrl, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                 }
                 await this.autoCollapseStepToolbar(webviewEl);
-                await this.injectNoteDots(webviewEl);
+                //await this.injectNoteDots(webviewEl);
             };
 
             //Attach listener
@@ -1560,7 +1560,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                     }
                     await this.autoCollapseStepToolbar(webviewEl);
-                    await this.injectNoteDots(webviewEl);
+                    //await this.injectNoteDots(webviewEl);
                 }
             }
         });
@@ -1580,7 +1580,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                     }
                     await this.autoCollapseStepToolbar(webviewEl);
-                    await this.injectNoteDots(webviewEl);
+                    //await this.injectNoteDots(webviewEl);
                 }
             })
         );

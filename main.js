@@ -1641,22 +1641,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (!targetEl) return;
 
             let url = "";
-            let linkText = "";
 
             const lineParent = targetEl.closest(".cm-line");
             if (lineParent) {
                 const m = lineParent.textContent.match(/https?:\/\/[^\s)]+/);
                 if (m) url = m[0];
-                // Markdown link: use the text inside [ ... ]
-                const md = lineParent.textContent.match(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/);
-                if (md && md[2] === url) linkText = md[1];
             }
 
             if (!url) {
                 const a = targetEl.closest("a[href]");
                 if (a && a.href.startsWith(this.urlPrefix)) {
                     url = a.href;
-                    linkText = a.textContent.trim();
                 }
             }
 
@@ -1671,7 +1666,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const urlRef = this.inputRef_urlRef(t);
                         if (urlRef) {
                             const builtUrl = this.urlRef_url(urlRef);
-                            if (builtUrl) { url = builtUrl; linkText = t; }
+                            if (builtUrl) url = builtUrl;
                         }
                     }
                 }
@@ -1694,93 +1689,77 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 this.activePopover = null;
             }
 
-            // The popup element is created lazily (makePop) so that the
-            // webview-highlight path can return without ever building one.
-            let pop = null;
-            const makePop = () => {
-                pop = document.createElement("div");
-                pop.classList.add("step-popover");
-                Object.assign(pop.style, {
-                    position: "fixed",
-                    left: "-9999px",
-                    top: "-9999px",
-                    visibility: "hidden",
-                    backgroundColor: "#2c2c2c",
-                    border: "1px solid var(--border-color)",
-                    borderRadius: "6px",
-                    padding: "14px",
-                    width: "460px",
-                    maxHeight: "350px",
-                    overflowY: "auto",
-                    boxShadow: "0 4px 14px rgba(0,0,0,0.25)",
-                    zIndex: "1000000",
-                    color: "#d6d6d6",
-                    fontSize: "13.5px",
-                    lineHeight: "1.6",
-                    fontFamily: "var(--font-interface)"
-                });
+            const pop = document.createElement("div");
+            pop.classList.add("step-popover");
+            Object.assign(pop.style, {
+                position: "fixed",
+                left: "-9999px",
+                top: "-9999px",
+                visibility: "hidden",
+                backgroundColor: "#2c2c2c",
+                border: "1px solid var(--border-color)",
+                borderRadius: "6px",
+                padding: "14px",
+                width: "460px",
+                maxHeight: "350px",
+                overflowY: "auto",
+                boxShadow: "0 4px 14px rgba(0,0,0,0.25)",
+                zIndex: "1000000",
+                color: "#d6d6d6",
+                fontSize: "13.5px",
+                lineHeight: "1.6",
+                fontFamily: "var(--font-interface)"
+            });
 
-                pop.innerHTML = "<i>Loading STEP Bible…</i>";
-                document.body.appendChild(pop);
+            pop.innerHTML = "<i>Loading STEP Bible\u2026</i>";
+            document.body.appendChild(pop);
 
-                const rect = pop.getBoundingClientRect();
-                // Anchor the popup's top-left corner to the link's
-                // top-left corner so it covers the link itself.
-                const linkRect = targetEl.getBoundingClientRect();
-                let leftPos = linkRect.left;
-                let topPos = linkRect.top;
-                if (leftPos + rect.width > window.innerWidth) {
-                    leftPos = Math.max(0, window.innerWidth - rect.width);
-                }
-                if (topPos + rect.height > window.innerHeight) {
-                    topPos = Math.max(0, window.innerHeight - rect.height);
-                }
+            const rect = pop.getBoundingClientRect();
+            let leftPos = evt.clientX + 15;
+            if (leftPos + rect.width > window.innerWidth) {
+                leftPos = evt.clientX - rect.width - 15;
+            }
 
-                pop.style.left = `${leftPos}px`;
-                pop.style.top = `${topPos}px`;
-                pop.style.visibility = "visible";
+            pop.style.left = `${leftPos}px`;
+            pop.style.top = `${evt.clientY + 15}px`;
+            pop.style.visibility = "visible";
 
-                this.activePopover = pop;
+            this.activePopover = pop;
 
-                // The header reference is a clickable link that opens the
-                // STEP page in the webviewer, same as links in the note.
-                pop.querySelectorAll("a").forEach(a => {
-                    a.addEventListener("click", (ev) => {
-                        ev.preventDefault();
-                        ev.stopPropagation();
-                        pop.remove();
-                        if (this.activePopover === pop) this.activePopover = null;
-                        this._hoverRefKey = null;
-                        this.openStepUrl(a.href);
-                    });
-                });
-
-                let hideTimeout = null;
-                const cancelHide = () => {
-                    if (hideTimeout) clearTimeout(hideTimeout);
-                    hideTimeout = null;
-                };
-                const scheduleHide = () => {
-                    cancelHide();
-                    hideTimeout = setTimeout(() => {
-                        pop.remove();
-                        if (this.activePopover === pop) this.activePopover = null;
-                        // Pop is gone: allow the same link to re-trigger a popup
-                        this._hoverRefKey = null;
-                    }, 200);
-                };
-
-                requestAnimationFrame(() => {
-                    targetEl.addEventListener("mouseleave", scheduleHide, { once: true });
-                    pop.addEventListener("mouseenter", cancelHide);
-                    pop.addEventListener("mouseleave", () => {
-                        scheduleHide();
-                        // Highlights only clear when the pointer leaves the popout
-                        this._hoverRefKey = null;
-                        this.clearAllStepHighlights();
-                    });
-                });
+            let hideTimeout = null;
+            const cancelHide = () => {
+                if (hideTimeout) clearTimeout(hideTimeout);
+                hideTimeout = null;
             };
+            const scheduleHide = () => {
+                cancelHide();
+                hideTimeout = setTimeout(() => {
+                    pop.remove();
+                    if (this.activePopover === pop) this.activePopover = null;
+                    // Pop is gone: allow the same link to re-trigger a popup
+                    this._hoverRefKey = null;
+                }, 200);
+            };
+
+            requestAnimationFrame(() => {
+                targetEl.addEventListener("mouseleave", scheduleHide, { once: true });
+                pop.addEventListener("mouseenter", cancelHide);
+                pop.addEventListener("mouseleave", () => {
+                    scheduleHide();
+                    // Highlights only clear when the pointer leaves the popout
+                    this._hoverRefKey = null;
+                    this.clearAllStepHighlights();
+                });
+                // Leaving the link without entering the popout also clears highlights
+                targetEl.addEventListener("mouseleave", () => {
+                    setTimeout(() => {
+                        if (!pop.isConnected) {
+                            this._hoverRefKey = null;
+                            this.clearAllStepHighlights();
+                        }
+                    }, 250);
+                }, { once: true });
+            });
 
             try {
                 if (!(await this.isLocalStepRunning())) {
@@ -1792,97 +1771,79 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 // ---------- WEBVIEW HIGHLIGHT CHECK ----------
                 // Highlight verses in any STEP webviewer tab showing verses
-                // in this reference's range. The popup always shows too; it
-                // gets an "open in STEP" badge when highlights were applied.
-                let foundInStep = false;
+                // in this reference's range.
                 if (urlRef.includes(".")) {
                     const wvLeaves = this.app.workspace.getLeavesOfType("webviewer");
                     const wvEls = wvLeaves
                         .map(l => l?.view?.webview ?? l?.view?.el?.querySelector?.("webview"))
                         .filter(el => el && typeof el.executeJavaScript === "function");
-                    if (wvEls.length > 0) {
 
-                        // Expand the hovered reference into explicit verse refs
-                        // (urlRef_verseListArray already handles ranges/chapters)
-                        const hoverRefs = this.urlRef_verseListArray(urlRef) || [];
-                        const hoverSet = new Set(hoverRefs);
+                    // Expand the hovered reference into explicit verse refs
+                    // (urlRef_verseListArray already handles ranges/chapters)
+                    const hoverRefs = this.urlRef_verseListArray(urlRef) || [];
+                    const hoverSet = new Set(hoverRefs);
 
-                        let highlightedAny = false;
+                    for (const wvEl of wvEls) {
+                        // Expand the page's current reference the same way
+                        const pageUrl = wvEl.getURL?.() || "";
+                        const pageUrlRef = this.url_urlRef(pageUrl);
+                        const pageRefs = pageUrlRef ? (this.urlRef_verseListArray(pageUrlRef) || []) : [];
 
-                        for (const wvEl of wvEls) {
-                            // Expand the page's current reference the same way
-                            const pageUrl = wvEl.getURL?.() || "";
-                            const pageUrlRef = this.url_urlRef(pageUrl);
-                            const pageRefs = pageUrlRef ? (this.urlRef_verseListArray(pageUrlRef) || []) : [];
+                        // Intersect
+                        const matched = pageRefs.filter(r => hoverSet.has(r));
+                        if (matched.length === 0) continue;
 
-                            // Intersect
-                            const matched = pageRefs.filter(r => hoverSet.has(r));
-                            if (matched.length === 0) continue;
-                            foundInStep = true;
+                        await wvEl.executeJavaScript(`
+                            (function() {
+                                document.querySelectorAll(".step-ref-hover").forEach(el =>
+                                    el.classList.remove("step-ref-hover"));
 
-                            await wvEl.executeJavaScript(`
-                                (function() {
-                                    document.querySelectorAll(".step-ref-hover").forEach(el =>
-                                        el.classList.remove("step-ref-hover"));
+                                const existing = document.getElementById("step-linker-ref-style");
+                                if (existing) existing.remove();
+                                {
+                                    const style = document.createElement("style");
+                                    style.id = "step-linker-ref-style";
+                                    style.textContent = [
+                                        "span.verse.step-ref-hover {",
+                                        "  background-color: rgba(190, 190, 163, 0.19) !important;",
+                                        "  outline: 1px solid #cacda600 !important;",
+                                        "  border-radius: 3px;",
+                                        "}"
+                                    ].join("\\n");
+                                    document.head.appendChild(style);
+                                }
 
-                                    const existing = document.getElementById("step-linker-ref-style");
-                                    if (existing) existing.remove();
-                                    {
-                                        const style = document.createElement("style");
-                                        style.id = "step-linker-ref-style";
-                                        style.textContent = [
-                                            "span.verse.step-ref-hover {",
-                                            "  background-color: rgba(190, 190, 163, 0.19) !important;",
-                                            "  outline: 1px solid #cacda600 !important;",
-                                            "  border-radius: 3px;",
-                                            "}"
-                                        ].join("\\n");
-                                        document.head.appendChild(style);
+                                // Canonical matched set from the plugin
+                                const targetSet = new Set(${JSON.stringify(matched)});
+
+                                // Same conversion the dots use
+                                const bookMap = window.__stepDotBookMap || {};
+                                const toCanon = (ref) => {
+                                    const parts = ref.split(".");
+                                    const full = bookMap[parts[0].toLowerCase()];
+                                    if (!full) return null;
+                                    return [full.replace(/\\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
+                                };
+
+                                document.querySelectorAll("a.verseLink").forEach(a => {
+                                    const canon = toCanon(a.getAttribute("name") || "");
+                                    if (canon && targetSet.has(canon)) {
+                                        const verse = a.closest("span.verse");
+                                        if (verse) verse.classList.add("step-ref-hover");
                                     }
-
-                                    // Canonical matched set from the plugin
-                                    const targetSet = new Set(${JSON.stringify(matched)});
-
-                                    // Same conversion the dots use
-                                    const bookMap = window.__stepDotBookMap || {};
-                                    const toCanon = (ref) => {
-                                        const parts = ref.split(".");
-                                        const full = bookMap[parts[0].toLowerCase()];
-                                        if (!full) return null;
-                                        return [full.replace(/\\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
-                                    };
-
-                                    let applied = 0;
-                                    document.querySelectorAll("a.verseLink").forEach(a => {
-                                        const canon = toCanon(a.getAttribute("name") || "");
-                                        if (canon && targetSet.has(canon)) {
-                                            const verse = a.closest("span.verse");
-                                            if (verse) { verse.classList.add("step-ref-hover"); applied++; }
-                                        }
-                                    });
-                                })();
-                            `);
-
-
-                            highlightedAny = true;
-                        }
+                                });
+                            })();
+                        `);
                     }
                 }
                 // ---------------------------------------------
 
-                // Header: the reference (same text as the link) plus the
-                // Bible version used, e.g. "Genesis 4:1-3 (ESV)".
-                const versionMatch = url.match(/version=([^&@]+)/);
-                const versionName = versionMatch ? versionMatch[1].toUpperCase() : "";
-                const refHeader = `<div style="margin-bottom:10px;"><a href="${url}" style="text-decoration:none;color:var(--text-accent);"><b>${linkText || urlRef}${versionName ? ` (${versionName})` : ""}</b></a></div>`;
-
                 //If only a book
                 if (!urlRef.includes(".")) {
-                    makePop();
                     const info = this.getBookOverview(urlRef);
 
                     if (info) {
-                        pop.innerHTML = `${refHeader}
+                        pop.innerHTML = `
                             <b>${info.name}</b><br>
                             ${info.chapters} chapters<br><br>
                             <i>Author:</i> ${info.author}<br>
@@ -1893,11 +1854,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         return;
                     }
 
-                    pop.innerHTML = `${refHeader}No overview available.`;
+                    pop.innerHTML = `<b>${urlRef}</b><br>No overview available.`;
                     return;
                 }
-
-                makePop();
 
                 const verseRefs = this.urlRef_verseListArray(urlRef);
 
@@ -1937,7 +1896,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
 
                 pop.innerHTML = combined || "<p><i>No English text found.</i></p>";
-                if (refHeader) pop.insertAdjacentHTML("afterbegin", refHeader);
 
                 requestAnimationFrame(() => {
                     if (pop.scrollHeight > pop.clientHeight) {
@@ -1946,9 +1904,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 });
 
             } catch (err) {
-                if (pop) {
-                    pop.innerHTML = `<span style="color:var(--text-error)">Failed to load STEP Bible.</span>`;
-                }
+                pop.innerHTML = `<span style="color:var(--text-error)">Failed to load STEP Bible.</span>`;
             }
         });
 

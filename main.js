@@ -3470,7 +3470,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const chapR = canonR ? canonR.split(".")[1] : chapL;
                         const verseR = canonR ? (canonR.split(".")[2] || null) : null;
 
-                        if (bookL !== bookR) continue; // cross-book ranges unsupported for dots
+                        if (bookL !== bookR) continue; // cross-book ranges unsupported for bars
 
                         const maxV = (c) => this.getMaxVerse(bookL, parseInt(c, 10)) || 0;
 
@@ -3500,8 +3500,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             // 4b. Define the in-page injector + MutationObserver:
             //  - observes document.body (survives STEP's container swaps)
-            //  - disconnects around injection so our own dot-appends never feed back
-            //  - debounced 300ms, idempotent injector (duplicate-guarded)
+            //  - disconnects around injection so our own bar-appends never feed back
+            //  - debounced 300ms, idempotent injector (duplicate-guarded per note)
             await webviewEl.executeJavaScript(`
                 (function() {
                     try {
@@ -3515,55 +3515,126 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 if (!full) return null;
                                 return [full.replace(/\\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
                             };
-                            const dotData = {};
-                            document.querySelectorAll("a.verseLink").forEach(a => {
-                                const n = a.getAttribute("name");
-                                if (!n) return;
-                                const canon = toCanon(n);
-                                if (canon && fullMap[canon]) dotData[n] = fullMap[canon];
-                            });
+
                             if (!document.getElementById("step-linker-dot-style")) {
                                 const style = document.createElement("style");
                                 style.id = "step-linker-dot-style";
                                 style.textContent = [
                                     "span.verse { position: relative; }",
-                                    "span.verse.step-dot-hover {",
-                                    "  background: rgba(194, 201, 168, 0.02);",
-                                    "  outline: 1px solid #cacda6;",
-                                    "  border-radius: 3px;",
-                                    "  transition: background 0.15s ease;",
-                                    "}",
-                                    ".step-note-dot {",
-                                    "  position: absolute; left: -14px; top: 2px;",
-                                    "  width: 8px; height: 8px; border-radius: 50%;",
-                                    "  background: #226b37; opacity: 0.85;",
+                                    ".step-note-bar {",
+                                    "  position: absolute; top: 0;",
+                                    "  width: 4px; min-height: 10px;",
+                                    "  background: #226b37; opacity: 0.7;",
+                                    "  border-radius: 2px;",
                                     "  cursor: pointer; z-index: 10;",
-                                    "  transition: transform 0.12s ease;",
+                                    "  transition: opacity 0.12s ease, width 0.12s ease;",
                                     "}",
-                                    ".step-note-dot:hover { transform: scale(1.5); opacity: 1; }"
+                                    ".step-note-bar:hover { opacity: 1; width: 6px; }",
+                                    "span.verse.step-ref-hover {",
+                                    "  background-color: rgba(190, 190, 163, 0.19) !important;",
+                                    "  outline: 1px solid #cacda600 !important;",
+                                    "  border-radius: 3px;",
+                                    "}",
+                                    ".step-note-tip {",
+                                    "  position: fixed; z-index: 1000000;",
+                                    "  background: #1e1e1e; color: #d6d6d6;",
+                                    "  border: 1px solid var(--border-color);",
+                                    "  border-radius: 4px; padding: 4px 8px;",
+                                    "  font-size: 12px; font-family: var(--font-interface);",
+                                    "  pointer-events: none; white-space: nowrap;",
+                                    "  box-shadow: 0 2px 8px rgba(0,0,0,0.3);",
+                                    "}"
                                 ].join("\\n");
                                 document.head.appendChild(style);
                             }
 
-                            let added = 0;
-                            document.querySelectorAll("span.verse").forEach(verse => {
-                                if (verse.querySelector(".step-note-dot")) return;
-                                const name = verse.querySelector("a.verseLink")?.getAttribute("name");
-                                if (!name || !dotData[name]) return;
+                            // Collect the page's verses in DOM order
+                            const verses = [];
+                            const seenVerses = new Set();
+                            document.querySelectorAll("a.verseLink").forEach(anchor => {
+                                const name = anchor.getAttribute("name");
+                                if (!name) return;
+                                const canon = toCanon(name);
+                                if (!canon) return;
+                                const verseEl = anchor.closest("span.verse") || anchor.parentElement;
+                                if (!verseEl || seenVerses.has(verseEl)) return;
+                                seenVerses.add(verseEl);
+                                verses.push({ verse: verseEl, canon });
+                            });
 
-                                const dot = document.createElement("div");
-                                dot.className = "step-note-dot";
-                                dot.title = dotData[name].join(", ");
-                                dot.addEventListener("mouseenter", () => verse.classList.add("step-dot-hover"));
-                                dot.addEventListener("mouseleave", () => verse.classList.remove("step-dot-hover"));
-                                verse.appendChild(dot);
-                                added++;
+                            // For each note, the min/max verse index present on this page
+                            const noteIdx = {};
+                            verses.forEach((v, i) => {
+                                const notes = fullMap[v.canon];
+                                if (!notes) return;
+                                notes.forEach(nb => {
+                                    const e = noteIdx[nb] || (noteIdx[nb] = { min: i, max: i });
+                                    if (i < e.min) e.min = i;
+                                    if (i > e.max) e.max = i;
+                                });
+                            });
+
+                            // Group notes by their first verse; shorter spans sit closer
+                            // to the text (leftmost slot), longer ones further out.
+                            const byStart = {};
+                            Object.keys(noteIdx).forEach(nb => {
+                                const e = noteIdx[nb];
+                                (byStart[e.min] = byStart[e.min] || []).push({ nb, e });
+                            });
+
+                            let added = 0;
+                            Object.keys(byStart).forEach(keyStr => {
+                                const arr = byStart[keyStr];
+                                arr.sort((a, b) =>
+                                    (a.e.max - a.e.min) - (b.e.max - b.e.min) || a.nb.localeCompare(b.nb));
+
+                                arr.forEach((item, slot) => {
+                                    const firstV = verses[item.e.min].verse;
+                                    const lastV = verses[item.e.max].verse;
+
+                                    // Idempotency: one bar per note per page
+                                    if (firstV.querySelector(".step-note-bar[data-note=\"" + item.nb.replace(/"/g, "") + "\"]")) return;
+
+                                    const bar = document.createElement("div");
+                                    bar.className = "step-note-bar";
+                                    bar.dataset.note = item.nb;
+                                    bar.style.left = -(slot + 1) * 8 - 4 + "px";
+
+                                    // Measure the range for the bar height
+                                    const fr = firstV.getBoundingClientRect();
+                                    const lr = lastV.getBoundingClientRect();
+                                    bar.style.height = Math.max(10, lr.bottom - fr.top) + "px";
+
+                                    // Hover: highlight the whole referenced range in-page
+                                    bar.addEventListener("mouseenter", () => {
+                                        for (let i = item.e.min; i <= item.e.max; i++) {
+                                            verses[i].verse.classList.add("step-ref-hover");
+                                        }
+                                        const fr2 = firstV.getBoundingClientRect();
+                                        const tip = document.createElement("div");
+                                        tip.className = "step-note-tip";
+                                        tip.textContent = item.nb;
+                                        tip.style.left = (fr.right + 10) + "px";
+                                        tip.style.top = fr2.top + "px";
+                                        document.body.appendChild(tip);
+                                        bar.__tip = tip;
+                                    });
+                                    bar.addEventListener("mouseleave", () => {
+                                        for (let i = item.e.min; i <= item.e.max; i++) {
+                                            verses[i].verse.classList.remove("step-ref-hover");
+                                        }
+                                        if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
+                                    });
+
+                                    firstV.appendChild(bar);
+                                    added++;
+                                });
                             });
                             return added;
                         };
 
                         // Observe document.body — the only element guaranteed to survive
-                        // STEP's navigation. Feedback from our own dot-appends is
+                        // STEP's navigation. Feedback from our own bar-appends is
                         // suppressed by disconnect-around-inject below.
                         const getTargets = () => [document.body];
 
@@ -3613,7 +3684,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
 
 
-    // SETTINGS / LINK REWRITE
     async rewriteStepLinks() {
         this._noteDotsCache = null;
 

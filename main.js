@@ -3525,8 +3525,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 const style = document.createElement("style");
                                 style.id = "step-linker-dot-style";
                                 style.textContent = [
-                                    ".verse { position: relative; }",
-                                    ".passageContentHolder { padding-left: 30px !important; }",
+                                    "div.verse { position: relative; }",
+                                    // NOTE: no padding rule here — the adaptive gutter is set
+                                    // as an inline style on the passage container below, and a
+                                    // stylesheet !important would override it.
                                     ".step-note-bar {",
                                     "  position: absolute; top: 0;",
                                     "  width: 4px; min-height: 10px;",
@@ -3616,6 +3618,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             let added = 0;
                             noteList.forEach(item => {
                                 const slot = slotOf[item.nb];
+                                // Track widest slot regardless of whether the bar is
+                                // newly added — otherwise re-injection (bars already
+                                // exist) collapses the gutter back to the base padding.
+                                maxSlot = Math.max(maxSlot, slot);
                                     const firstV = verses[item.e.min].verse;
                                     const lastV = verses[item.e.max].verse;
 
@@ -3634,12 +3640,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // container scroll) so inline spans can't inflate it.
                                     const r1 = firstV.getBoundingClientRect();
                                     const r2 = lastV.getBoundingClientRect();
-                                    const top1 = r1.top - contRect.top + cont.scrollTop;
+                                    // The verse span includes the raised verse number,
+                                    // so its rect top sits above the text line. Align the
+                                    // bar to the text's own line box instead.
+                                    const lineH1 = parseFloat(getComputedStyle(firstV).lineHeight) || r1.height;
+                                    const top1 = Math.max(r1.top, r1.bottom - lineH1) - contRect.top + cont.scrollTop;
                                     const bottom2 = r2.bottom - contRect.top + cont.scrollTop;
                                     bar.style.top = top1 + "px";
                                     bar.style.height = Math.max(10, bottom2 - top1) + "px";
                                     dbg.push("#" + added + " s" + slot + " t" + Math.round(top1) + " h" + Math.round(bottom2 - top1) + " " + verses[item.e.min].canon + ".." + verses[item.e.max].canon);
-                                    maxSlot = Math.max(maxSlot, slot);
 
                                     // Hover: highlight the whole referenced range in-page
                                     bar.addEventListener("mouseenter", () => {
@@ -3667,7 +3676,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             });
                             // Adaptive gutter: widen padding to fit the slot stack
                             if (cont && cont !== document.body) {
-                                cont.style.paddingLeft = (30 + maxSlot * 8) + "px";
+                                cont.style.paddingLeft = (16 + maxSlot * 8) + "px";
                             }
                             if (dbg.length) {
                                 document.title = "BARS cont=" + (cont === document.body ? "BODY" : cont.className) + " | " + dbg.join(" | ");

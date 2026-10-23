@@ -3593,7 +3593,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     const lastV = verses[item.e.max].verse;
 
                                     // Idempotency: one bar per note per page
-                                    if (firstV.querySelector(".step-note-bar[data-note=\"" + item.nb.replace(/"/g, "") + "\"]")) return;
+                                    const existing = firstV.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
+                                    if (existing) return;
 
                                     const bar = document.createElement("div");
                                     bar.className = "step-note-bar";
@@ -3665,13 +3666,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         // Inject once now, observer suppressed during our own DOM writes
                         if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
-                        try { window.__stepInjectDots(); } finally {
+                        let n = 0;
+                        try { n = window.__stepInjectDots(); } finally {
                             if (window.__stepDotObserve) window.__stepDotObserve();
                         }
 
                         window.__stepLastInjectError = null;
+                        document.title = "INJ added=" + n + " verses=" + document.querySelectorAll("span.verse").length;
+
+
                     } catch (e) {
                         window.__stepLastInjectError = e && e.message ? e.message : String(e);
+                        document.title = "INJERR " + window.__stepLastInjectError;
                         return null;
                     }
                 })();

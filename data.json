@@ -1,5 +1,5 @@
 {
-  "autoSyncOnNavigation": false,
+  "autoSyncOnNavigation": true,
   "autoCloseSearchPanel": true,
   "useLocalStepServer": true,
   "globalVersions": [

@@ -1804,7 +1804,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     const style = document.createElement("style");
                                     style.id = "step-linker-ref-style";
                                     style.textContent = [
-                                        "span.verse.step-ref-hover {",
+                                        ".verse.step-ref-hover {",
                                         "  background-color: rgba(190, 190, 163, 0.19) !important;",
                                         "  outline: 1px solid #cacda600 !important;",
                                         "  border-radius: 3px;",
@@ -1828,7 +1828,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 document.querySelectorAll("a.verseLink").forEach(a => {
                                     const canon = toCanon(a.getAttribute("name") || "");
                                     if (canon && targetSet.has(canon)) {
-                                        const verse = a.closest("span.verse");
+                                        const verse = a.closest(".verse");
                                         if (verse) verse.classList.add("step-ref-hover");
                                     }
                                 });
@@ -3437,6 +3437,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     async injectNoteDots(webviewEl) {
         if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
 
+        let res = null;
         try {
             const bookMap = this.getBookMap();
             const toCanonical = (ref) => {
@@ -3475,7 +3476,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const maxV = (c) => this.getMaxVerse(bookL, parseInt(c, 10)) || 0;
 
                         for (let c = parseInt(chapL, 10); c <= parseInt(chapR, 10); c++) {
-                            const lastV = (c === parseInt(chapR, 10) && verseR) ? parseInt(verseR, 10) : maxV(c);
+                            // No range (canonR null) means a single verse: end at verseL,
+                            // NOT the last verse of the chapter.
+                            const lastV = canonR
+                                ? ((c === parseInt(chapR, 10) && verseR) ? parseInt(verseR, 10) : maxV(c))
+                                : parseInt(verseL, 10);
                             const firstV = (c === parseInt(chapL, 10)) ? (parseInt(verseL || "1", 10)) : 1;
                             for (let v = firstV; v <= lastV; v++) {
                                 const key = `${bookL}.${c}.${v}`;
@@ -3502,7 +3507,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             //  - observes document.body (survives STEP's container swaps)
             //  - disconnects around injection so our own bar-appends never feed back
             //  - debounced 300ms, idempotent injector (duplicate-guarded per note)
-            await webviewEl.executeJavaScript(`
+            res = await webviewEl.executeJavaScript(`
                 (function() {
                     try {
                         // The injector: idempotent, safe to run any number of times
@@ -3520,7 +3525,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 const style = document.createElement("style");
                                 style.id = "step-linker-dot-style";
                                 style.textContent = [
-                                    "span.verse { position: relative; }",
+                                    ".verse { position: relative; }",
+                                    ".passageContentHolder { padding-left: 30px !important; }",
                                     ".step-note-bar {",
                                     "  position: absolute; top: 0;",
                                     "  width: 4px; min-height: 10px;",
@@ -3530,7 +3536,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     "  transition: opacity 0.12s ease, width 0.12s ease;",
                                     "}",
                                     ".step-note-bar:hover { opacity: 1; width: 6px; }",
-                                    "span.verse.step-ref-hover {",
+                                    ".verse.step-ref-hover {",
                                     "  background-color: rgba(190, 190, 163, 0.19) !important;",
                                     "  outline: 1px solid #cacda600 !important;",
                                     "  border-radius: 3px;",
@@ -3556,7 +3562,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 if (!name) return;
                                 const canon = toCanon(name);
                                 if (!canon) return;
-                                const verseEl = anchor.closest("span.verse") || anchor.parentElement;
+                                const verseEl = anchor.closest(".verse") || anchor.parentElement;
                                 if (!verseEl || seenVerses.has(verseEl)) return;
                                 seenVerses.add(verseEl);
                                 verses.push({ verse: verseEl, canon });
@@ -3574,37 +3580,66 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 });
                             });
 
-                            // Group notes by their first verse; shorter spans sit closer
-                            // to the text (leftmost slot), longer ones further out.
-                            const byStart = {};
-                            Object.keys(noteIdx).forEach(nb => {
-                                const e = noteIdx[nb];
-                                (byStart[e.min] = byStart[e.min] || []).push({ nb, e });
+                            // Bars are anchored to the passage container, not the
+                            // verse spans: inline spans have unreliable bounding
+                            // boxes, so measure from rects relative to the container.
+                            const cont = verses.length
+                                ? (verses[0].verse.closest(".passageContentHolder") ||
+                                   verses[0].verse.closest("[class*='passage']") ||
+                                   document.body)
+                                : null;
+                            let contRect = null;
+                            if (cont) {
+                                cont.style.position = "relative";
+                                contRect = cont.getBoundingClientRect();
+                            }
+
+                            // Build note list in verse order, then assign slots by
+                            // vertical overlap: each bar gets the first slot whose
+                            // previous occupant doesn't overlap its range. This makes
+                            // overlapping bars sit in separate columns and makes the
+                            // gutter width adapt to how many overlap at once.
+                            const noteList = Object.keys(noteIdx)
+                                .map(nb => ({ nb, e: noteIdx[nb] }))
+                                .sort((a, b) => a.e.min - b.e.min || a.e.max - b.e.max);
+                            const slotEnds = [];   // slot -> max verse index used
+                            const slotOf = {};
+                            noteList.forEach(item => {
+                                let s = 0;
+                                while (s < slotEnds.length && slotEnds[s] >= item.e.min) s++;
+                                slotOf[item.nb] = s;
+                                slotEnds[s] = item.e.max;
                             });
 
+                            const dbg = [];
+                            let maxSlot = 0;
                             let added = 0;
-                            Object.keys(byStart).forEach(keyStr => {
-                                const arr = byStart[keyStr];
-                                arr.sort((a, b) =>
-                                    (a.e.max - a.e.min) - (b.e.max - b.e.min) || a.nb.localeCompare(b.nb));
-
-                                arr.forEach((item, slot) => {
+                            noteList.forEach(item => {
+                                const slot = slotOf[item.nb];
                                     const firstV = verses[item.e.min].verse;
                                     const lastV = verses[item.e.max].verse;
 
                                     // Idempotency: one bar per note per page
-                                    const existing = firstV.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
+                                    const existing = cont.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
                                     if (existing) return;
 
                                     const bar = document.createElement("div");
                                     bar.className = "step-note-bar";
                                     bar.dataset.note = item.nb;
-                                    bar.style.left = -(slot + 1) * 8 - 4 + "px";
+                                    // Fixed gutter position: always left of the text
+                                    bar.style.left = (2 + slot * 8) + "px";
 
-                                    // Measure the range for the bar height
-                                    const fr = firstV.getBoundingClientRect();
-                                    const lr = lastV.getBoundingClientRect();
-                                    bar.style.height = Math.max(10, lr.bottom - fr.top) + "px";
+                                    // Measure the range from viewport rects, converted
+                                    // to container-content coordinates (accounting for
+                                    // container scroll) so inline spans can't inflate it.
+                                    const r1 = firstV.getBoundingClientRect();
+                                    const r2 = lastV.getBoundingClientRect();
+                                    const top1 = r1.top - contRect.top + cont.scrollTop;
+                                    const bottom2 = r2.bottom - contRect.top + cont.scrollTop;
+                                    bar.style.top = top1 + "px";
+                                    bar.style.height = Math.max(10, bottom2 - top1) + "px";
+                                    dbg.push("#" + added + " s" + slot + " t" + Math.round(top1) + " h" + Math.round(bottom2 - top1) + " " + verses[item.e.min].canon + ".." + verses[item.e.max].canon);
+                                    maxSlot = Math.max(maxSlot, slot);
 
                                     // Hover: highlight the whole referenced range in-page
                                     bar.addEventListener("mouseenter", () => {
@@ -3615,7 +3650,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                         const tip = document.createElement("div");
                                         tip.className = "step-note-tip";
                                         tip.textContent = item.nb;
-                                        tip.style.left = (fr.right + 10) + "px";
+                                        tip.style.left = (fr2.right + 10) + "px";
                                         tip.style.top = fr2.top + "px";
                                         document.body.appendChild(tip);
                                         bar.__tip = tip;
@@ -3627,11 +3662,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                         if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
                                     });
 
-                                    firstV.appendChild(bar);
+                                    cont.appendChild(bar);
                                     added++;
-                                });
                             });
-                            return added;
+                            // Adaptive gutter: widen padding to fit the slot stack
+                            if (cont && cont !== document.body) {
+                                cont.style.paddingLeft = (30 + maxSlot * 8) + "px";
+                            }
+                            if (dbg.length) {
+                                document.title = "BARS cont=" + (cont === document.body ? "BODY" : cont.className) + " | " + dbg.join(" | ");
+                            }
+                            return { added, dbg: dbg.join(" | "), cont: cont === document.body ? "BODY" : (cont && cont.className) || "?", verses: verses.length };
                         };
 
                         // Observe document.body — the only element guaranteed to survive
@@ -3666,14 +3707,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         // Inject once now, observer suppressed during our own DOM writes
                         if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
-                        let n = 0;
-                        try { n = window.__stepInjectDots(); } finally {
+                        let res = null;
+                        try { res = window.__stepInjectDots(); } finally {
                             if (window.__stepDotObserve) window.__stepDotObserve();
                         }
 
                         window.__stepLastInjectError = null;
-                        document.title = "INJ added=" + n + " verses=" + document.querySelectorAll("span.verse").length;
-
+                        if (res && res.dbg) {
+                            document.title = "BARS " + res.added + "v | " + res.dbg;
+                        } else {
+                            document.title = "INJ added=" + (res ? res.added : 0) + " verses=" + (res ? res.verses : "?");
+                        }
+                        return res;
 
                     } catch (e) {
                         window.__stepLastInjectError = e && e.message ? e.message : String(e);
@@ -3686,7 +3731,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         } catch (err) {
             console.error("STEP Plugin: injectNoteDots error:", err);
         }
-    }
+        if (res) {
+            if (res.dbg) console.log("STEP Plugin: bars =>", "cont=" + res.cont, "verses=" + res.verses, res.dbg);
+            else console.log("STEP Plugin: inject =>", "added=" + res.added, "verses=" + res.verses, "cont=" + res.cont);
+        }    }
 
 
 

@@ -11,6 +11,7 @@
   "localVersions": [
     "ESV"
   ],
+  "noteLinesColour": "#226b37",
   "useLocalUrlPrefix": true,
   "enabledVersions": [
     "ESV",

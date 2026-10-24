@@ -17,6 +17,7 @@ const DEFAULT_SETTINGS = {
     useLocalStepServer: true,
     globalVersions: ["ESV", "THOT", "SBLG"],
     localVersions: ["ESV", "THOT", "SBLG"],
+    noteLinesColour: "#17758f",
 };
 
 class StepBibleLinkerSettingTab extends PluginSettingTab {
@@ -75,6 +76,29 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                         await this.plugin.toggleLocaltoOnline();
                         this.display();
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName("Note lines colour")
+            .setDesc("Colour of the note reference bars shown beside the passage in STEP Bible.")
+            .addColorPicker(color => {
+                color
+                    .setValue(this.plugin.settings.noteLinesColour)
+                    .onChange(async (value) => {
+                        this.plugin.settings.noteLinesColour = value;
+                        await this.plugin.saveSettings();
+                    });
+            })
+            .addText(text => {
+                text
+                    .setValue(this.plugin.settings.noteLinesColour)
+                    .setPlaceholder("#17758f")
+                    .onChange(async (value) => {
+                        if (/^#[0-9a-fA-F]{3,8}$/.test(value.trim())) {
+                            this.plugin.settings.noteLinesColour = value.trim();
+                            await this.plugin.saveSettings();
+                        }
                     });
             });
 
@@ -3543,7 +3567,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     ".step-note-bar {",
                                     "  position: absolute; top: 0;",
                                     "  width: 4px; min-height: 10px;",
-                                    "  background: #226b37; opacity: 0.7;",
+                                    "  background: ${(this.settings && this.settings.noteLinesColour) || "#17758f"}; opacity: 0.7;",
                                     "  border-radius: 2px;",
                                     "  cursor: pointer; z-index: 10;",
                                     "  transition: opacity 0.12s ease, width 0.12s ease;",

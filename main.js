@@ -3452,6 +3452,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const now = Date.now();
             if (!this._noteDotsCache || now - this._noteDotsCache.time > 60000) {
                 const map = {}; // canonicalVerse -> Set of note basenames
+                const bookRefs = {}; // bookName -> Set of note basenames (whole-book references)
                 const files = this.app.vault.getMarkdownFiles();
                 const linkRegex = /\(\[([^\]]+)\]\(([^)]+reference=([^)&]+)[^)]*)\)\)/g;
 
@@ -3467,6 +3468,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         if (!canonL) continue;
 
                         const [bookL, chapL, verseL] = canonL.split(".");
+
+                        // Book-only reference (no chapter): a grey whole-book bar
+                        if (!chapL) {
+                            (bookRefs[bookL] = bookRefs[bookL] || new Set()).add(file.basename);
+                            continue;
+                        }
+
                         const bookR = canonR ? canonR.split(".")[0] : bookL;
                         const chapR = canonR ? canonR.split(".")[1] : chapL;
                         const verseR = canonR ? (canonR.split(".")[2] || null) : null;
@@ -3492,7 +3500,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // convert Sets to arrays for serialisation
                 const serialised = {};
                 for (const k of Object.keys(map)) serialised[k] = Array.from(map[k]);
-                this._noteDotsCache = { time: now, map: serialised };
+                const serialisedBookRefs = {};
+                for (const k of Object.keys(bookRefs)) serialisedBookRefs[k] = Array.from(bookRefs[k]);
+                this._noteDotsCache = { time: now, map: serialised, bookRefs: serialisedBookRefs };
             }
 
             // STEP 3: push the FULL vault map + bookMap once per webview.
@@ -3501,7 +3511,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // (fixes the stale-data race where arrow navigation injected old-page data).
             await webviewEl.executeJavaScript(
                 `window.__stepDotFullMap = ${JSON.stringify(this._noteDotsCache.map)};` +
-                `window.__stepDotBookMap = ${JSON.stringify(bookMap)};`);
+                `window.__stepDotBookMap = ${JSON.stringify(bookMap)};` +
+                `window.__stepBookRefs = ${JSON.stringify(this._noteDotsCache.bookRefs || {})};`);
 
             // 4b. Define the in-page injector + MutationObserver:
             //  - observes document.body (survives STEP's container swaps)
@@ -3537,6 +3548,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     "  cursor: pointer; z-index: 10;",
                                     "  transition: opacity 0.12s ease, width 0.12s ease;",
                                     "}",
+                                    ".step-note-bar.book {",
+                                    "  width: 3px; left: 0;",
+                                    "  background: #9a9a9a; opacity: 0.6;",
+                                    "  border-radius: 1px;",
+                                    "}",
+                                    ".step-note-bar.book:hover { opacity: 1; width: 5px; }",
                                     ".step-note-bar:hover { opacity: 1; width: 6px; }",
                                     ".verse.step-ref-hover {",
                                     "  background-color: rgba(190, 190, 163, 0.19) !important;",
@@ -3616,6 +3633,43 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const dbg = [];
                             let maxSlot = 0;
                             let added = 0;
+
+                            // Grey whole-book bars: one per note that references the
+                            // entire book, at the very left (before the note slots).
+                            const bookRefs = window.__stepBookRefs || {};
+                            if (cont && verses.length) {
+                                const pageBooks = new Set(verses.map(v => v.canon.split(".")[0]));
+                                Object.keys(bookRefs).forEach(bookName => {
+                                    if (!pageBooks.has(bookName)) return;
+                                    bookRefs[bookName].forEach(nb => {
+                                        const clean = nb.replace(/"/g, "");
+                                        if (cont.querySelector('.step-note-bar.book[data-note="' + clean + '"]')) return;
+                                        const bar = document.createElement("div");
+                                        bar.className = "step-note-bar book";
+                                        bar.dataset.note = nb;
+                                        const r1 = verses[0].verse.getBoundingClientRect();
+                                        const r2 = verses[verses.length - 1].verse.getBoundingClientRect();
+                                        bar.style.top = (r1.top - contRect.top + cont.scrollTop) + "px";
+                                        bar.style.height = Math.max(10, r2.bottom - r1.top) + "px";
+                                        bar.addEventListener("mouseenter", () => {
+                                            verses.forEach(v => v.verse.classList.add("step-ref-hover"));
+                                            const fr = bar.getBoundingClientRect();
+                                            const tip = document.createElement("div");
+                                            tip.className = "step-note-tip";
+                                            tip.textContent = nb;
+                                            tip.style.left = (fr.right + 10) + "px";
+                                            tip.style.top = fr.top + "px";
+                                            document.body.appendChild(tip);
+                                            bar.__tip = tip;
+                                        });
+                                        bar.addEventListener("mouseleave", () => {
+                                            verses.forEach(v => v.verse.classList.remove("step-ref-hover"));
+                                            if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
+                                        });
+                                        cont.appendChild(bar);
+                                    });
+                                });
+                            }
                             noteList.forEach(item => {
                                 const slot = slotOf[item.nb];
                                 // Track widest slot regardless of whether the bar is
@@ -3632,8 +3686,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     const bar = document.createElement("div");
                                     bar.className = "step-note-bar";
                                     bar.dataset.note = item.nb;
-                                    // Fixed gutter position: always left of the text
-                                    bar.style.left = (2 + slot * 8) + "px";
+                                    // Fixed gutter position: right of the grey book column
+                                    // (if any book bars exist on this page) so the two never overlap.
+                                    const hasBookBars = cont.querySelector(".step-note-bar.book") !== null;
+                                    bar.style.left = ((hasBookBars ? 6 : 2) + slot * 8) + "px";
 
                                     // Measure the range from viewport rects, converted
                                     // to container-content coordinates (accounting for
@@ -3644,7 +3700,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // so its rect top sits above the text line. Align the
                                     // bar to the text's own line box instead.
                                     const lineH1 = parseFloat(getComputedStyle(firstV).lineHeight) || r1.height;
-                                    const top1 = Math.max(r1.top, r1.bottom - lineH1) - contRect.top + cont.scrollTop;
+                                    // Stretch the bar to cover the full vertical extent of the
+                                    // referenced text: top of the verse number down to the bottom
+                                    // of the last verse's final line.
+                                    const top1 = r1.top - contRect.top + cont.scrollTop;
                                     const bottom2 = r2.bottom - contRect.top + cont.scrollTop;
                                     bar.style.top = top1 + "px";
                                     bar.style.height = Math.max(10, bottom2 - top1) + "px";
@@ -3676,10 +3735,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             });
                             // Adaptive gutter: widen padding to fit the slot stack
                             if (cont && cont !== document.body) {
-                                cont.style.paddingLeft = (16 + maxSlot * 8) + "px";
+                                const hasBookBars = cont.querySelector(".step-note-bar.book") !== null;
+                                cont.style.paddingLeft = ((hasBookBars ? 22 : 16) + maxSlot * 8) + "px";
                             }
                             if (dbg.length) {
-                                document.title = "BARS cont=" + (cont === document.body ? "BODY" : cont.className) + " | " + dbg.join(" | ");
+                                // debug info goes to the console log in the plugin; no title edit
                             }
                             return { added, dbg: dbg.join(" | "), cont: cont === document.body ? "BODY" : (cont && cont.className) || "?", verses: verses.length };
                         };
@@ -3705,6 +3765,40 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     }
                                 }, 300);
                             };
+                            // Re-measure bars when layout changes: bars are absolutely
+                            // positioned, so their tops/heights go stale when text rewraps
+                            // (window resize, fonts loading, scrollbar appearing).
+                            if (!window.__stepBarResizeHooked) {
+                                window.__stepBarResizeHooked = true;
+                                const remeasure = () => {
+                                    try {
+                                        document.querySelectorAll(".step-note-bar").forEach(b => b.remove());
+                                        if (window.__stepInjectDots) window.__stepInjectDots();
+                                    } catch (e) {
+                                        console.log("[step-dots] RESIZE ERR " + (e && e.message ? e.message.slice(0, 80) : e));
+                                    }
+                                };
+                                let rt;
+                                const debounced = () => { clearTimeout(rt); rt = setTimeout(remeasure, 200); };
+                                window.addEventListener("resize", debounced);
+                                // Watch the passage container itself: pane resizes, scrollbar
+                                // changes and rewraps all change its size without a window event.
+                                if (window.ResizeObserver) {
+                                    const hookCont = () => {
+                                        const c = document.querySelector(".passageContentHolder") || document.body;
+                                        if (window.__stepBarRO && window.__stepBarRO._cont === c) return;
+                                        if (window.__stepBarRO) window.__stepBarRO.disconnect();
+                                        window.__stepBarRO = new ResizeObserver(debounced);
+                                        window.__stepBarRO._cont = c;
+                                        window.__stepBarRO.observe(c);
+                                    };
+                                    hookCont();
+                                }
+                                // Fonts finish loading after first paint and rewrap text;
+                                // re-measure once they do, plus one late safety pass.
+                                if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => setTimeout(remeasure, 100));
+                                setTimeout(remeasure, 1200);
+                            }
                             const obs = new MutationObserver(run);
                             window.__stepDotObserver = obs;
                             window.__stepDotObserve = () => {
@@ -3722,16 +3816,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         }
 
                         window.__stepLastInjectError = null;
-                        if (res && res.dbg) {
-                            document.title = "BARS " + res.added + "v | " + res.dbg;
-                        } else {
-                            document.title = "INJ added=" + (res ? res.added : 0) + " verses=" + (res ? res.verses : "?");
-                        }
                         return res;
 
                     } catch (e) {
                         window.__stepLastInjectError = e && e.message ? e.message : String(e);
-                        document.title = "INJERR " + window.__stepLastInjectError;
                         return null;
                     }
                 })();

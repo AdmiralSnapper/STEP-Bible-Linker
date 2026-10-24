@@ -3620,7 +3620,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // gutter width adapt to how many overlap at once.
                             const noteList = Object.keys(noteIdx)
                                 .map(nb => ({ nb, e: noteIdx[nb] }))
-                                .sort((a, b) => a.e.min - b.e.min || a.e.max - b.e.max);
+                                // Longer spans first so the longest bar lands in the
+                                // leftmost slot and bars funnel large-to-small left to right.
+                                .sort((a, b) => (b.e.max - b.e.min) - (a.e.max - a.e.min) || a.e.min - b.e.min);
                             const slotEnds = [];   // slot -> max verse index used
                             const slotOf = {};
                             noteList.forEach(item => {

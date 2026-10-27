@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl, Notice } = require('obsidian');
+const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder } = require('obsidian');
 
 //SETTINGS ======================================================================
 /**
@@ -18,7 +18,113 @@ const DEFAULT_SETTINGS = {
     globalVersions: ["ESV", "THOT", "SBLG"],
     localVersions: ["ESV", "THOT", "SBLG"],
     noteLinesColour: "#17758f",
+    crosslinkColour: "#a352cc",
+    typedColours: {},
+    noteTypesFolder: "",
 };
+
+/**
+ * Suggests vault folders as the user types into a text input.
+ */
+class FolderSuggest extends AbstractInputSuggest {
+    constructor(app, inputEl, onPick) {
+        super(app, inputEl);
+        this.onPick = onPick;
+    }
+
+    getSuggestions(query) {
+        const q = query.toLowerCase();
+        return this.app.vault.getAllLoadedFiles()
+            .filter(f => f instanceof TFolder && f.path !== "/" && f.path.toLowerCase().includes(q))
+            .map(f => f.path);
+    }
+
+    renderSuggestion(path, el) {
+        el.setText(path);
+    }
+
+    selectSuggestion(path) {
+        if (this.inputEl) this.inputEl.setValue(path);
+        this.close();
+        if (this.onPick) this.onPick(path);
+    }
+}
+
+// ==== TYPED NOTE PARSER (pure, testable outside Obsidian) ====
+// START_TYPED_PARSER
+/**
+ * Parse one typed note file's text into entries.
+ * A reference line is a line that starts with a markdown link whose target
+ * contains "reference=". Everything up to the next reference line is that
+ * entry's freeform content (text, images, anything).
+ *
+ * Returns { entries, crosslinks }: entries are [{ refText, refRaw, source,
+ * content }] in file order (a repeated reference in the same file produces one
+ * entry whose contents are concatenated); crosslinks are references found
+ * inside freeform content, each { refText, refRaw, source, target } pointing
+ * at the entry it lives in. A line of only dashes (---, 3 or more) is a hard
+ * section break (and closes any escape block); a line of only tildes (~~~)
+ * toggles an escape block, within which line-starting reference links are
+ * content/crosslinks, never section starts. A reference line may begin with
+ * an optional "([" wrapper, e.g. "([Gen 3:16](url)) notes".
+ */
+function parseTypedFile(text, fileBasename) {
+    const refLine = /^[ \t]*(?:\(\s*)?\[([^\]]+)\]\(([^)]*reference=[^)]*)\)(.*)$/; // optional "(" before the link; link must start the line
+    const inlineRef = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
+    const entries = [];
+    const crosslinks = [];
+    const byRef = new Map();
+    let current = null;
+    let escaped = false; // inside a ~~~ block: line-start refs are content, not section starts
+
+    for (const line of text.split(/\r?\n/)) {
+        if (/^[ \t]*-{3,}[ \t]*$/.test(line)) {
+            // --- : hard section break; also closes any open escape block.
+            // Blank separator lines after it belong to no section and are dropped.
+            escaped = false;
+            current = null;
+            continue;
+        }
+        if (/^[ \t]*~{3,}[ \t]*$/.test(line)) {
+            escaped = !escaped; // toggle escape block
+            continue;
+        }
+        const m = escaped ? null : line.match(refLine);
+        if (m) {
+            const refText = m[1].trim();
+            const refRaw = decodeURIComponent(m[2].trim());
+            const trailing = m[3] ? m[3].replace(/^[ \t]*\)/, "") : ""; // drop the closing paren of an "([...])" wrapper
+            if (byRef.has(refRaw)) {
+                current = byRef.get(refRaw); // duplicate ref: append content to existing entry
+            } else {
+                current = { refText, refRaw, source: fileBasename, content: "" };
+                byRef.set(refRaw, current);
+                entries.push(current);
+            }
+            if (trailing.trim()) current.content += (current.content ? "\n" : "") + trailing.trim();
+            continue;
+        }
+        if (current) current.content += (current.content ? "\n" : "") + line;
+        // crosslinks: any reference link on a line that did not start a section
+        if (current) {
+            for (const cm of line.matchAll(inlineRef)) {
+                crosslinks.push({
+                    refText: cm[1].trim(),
+                    refRaw: decodeURIComponent(cm[2].trim()),
+                    source: fileBasename,
+                    target: current, // the section this crosslink points to
+                });
+            }
+        }
+    }
+
+    // trim leading/trailing blank lines from each entry's content
+    for (const e of entries) {
+        e.content = e.content.replace(/^\s*\n/, "").replace(/\n\s*$/, "");
+    }
+    return { entries, crosslinks };
+}
+// END_TYPED_PARSER
 
 class StepBibleLinkerSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
@@ -79,9 +185,30 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
                     });
             });
 
+        containerEl.createEl("h3", { text: "STEP Note bars" });
+
         new Setting(containerEl)
-            .setName("Note lines colour")
-            .setDesc("Colour of the note reference bars shown beside the passage in STEP Bible.")
+            .setName("Bible notes folder")
+            .setDesc("Vault folder holding one markdown file per note type. Bible references outside this folder are still detected, but will display the entire markdown file, not a single reference section.")
+            .addText(text => {
+                text
+                    .setPlaceholder("e.g. Folder/File")
+                    .setValue(this.plugin.settings.noteTypesFolder)
+                    .onChange(async (value) => {
+                        this.plugin.settings.noteTypesFolder = value.trim();
+                        await this.plugin.saveSettings();
+                    });
+                new FolderSuggest(this.app, text.inputEl, async (path) => {
+                    this.plugin.settings.noteTypesFolder = path;
+                    await this.plugin.saveSettings();
+                    this.display(); // re-render so the visible value matches what was saved
+                });
+            });
+
+        // COLOURS SECTION
+        new Setting(containerEl)
+            .setName("Note bar colour")
+            .setDesc("Colour of notes outside Bible notes folder.")
             .addColorPicker(color => {
                 color
                     .setValue(this.plugin.settings.noteLinesColour)
@@ -98,9 +225,145 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
                         if (/^#[0-9a-fA-F]{3,8}$/.test(value.trim())) {
                             this.plugin.settings.noteLinesColour = value.trim();
                             await this.plugin.saveSettings();
+                            this.plugin.refreshNoteDots();
                         }
                     });
             });
+
+        
+
+        new Setting(containerEl)
+            .setName("Crosslink bar colour")
+            .setDesc("Colour for bars generated by crosslinks from files in the Bible notes folder.")
+            .addColorPicker(color => color
+                .setValue(this.plugin.settings.crosslinkColour)
+                .onChange(async (value) => {
+                    this.plugin.settings.crosslinkColour = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.refreshNoteDots();
+                }))
+            .addText(text => {
+                text
+                    .setValue(this.plugin.settings.crosslinkColour)
+                    .setPlaceholder("#a352cc")
+                    .onChange(async (value) => {
+                        if (/^#[0-9a-fA-F]{3,8}$/.test(value.trim())) {
+                            this.plugin.settings.crosslinkColour = value.trim();
+                            await this.plugin.saveSettings();
+                            this.plugin.refreshNoteDots();
+                        }
+                    });
+            });
+
+        // Per-type bar colours, updating live as types are added/removed.
+        const colourRow = (name) => {
+            const s = new Setting(containerEl)
+                .setName(name)
+                .setDesc("Bar colour for this note type.")
+                .addColorPicker(color => color
+                    .setValue(this.plugin.settings.typedColours[name])
+                    .onChange(async (value) => {
+                        this.plugin.settings.typedColours[name] = value;
+                        await this.plugin.saveSettings();
+                        this.plugin.refreshNoteDots();
+                    }))
+                .addText(text => text
+                    .setValue(this.plugin.settings.typedColours[name])
+                    .onChange(async (value) => {
+                        const v = value.trim();
+                        if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v)) {
+                            this.plugin.settings.typedColours[name] = v;
+                            await this.plugin.saveSettings();
+                            this.plugin.refreshNoteDots();
+                        }
+                    }));
+            return s;
+        };
+        const typeColourNames = Object.keys(this.plugin.settings.typedColours).sort();
+        if (!typeColourNames.length) {
+            containerEl.createEl("p", {
+                text: "No note types yet — add one below and its colour appears here.",
+                cls: "setting-item-description"
+            });
+        }
+        for (const n of typeColourNames) colourRow(n);
+
+        // NOTE TYPES SECTION: a live list of type files with edit/delete.
+        containerEl.createEl("h3", { text: "Note types" });
+        const folderPath = (this.plugin.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
+        const folderObj = folderPath ? this.app.vault.getAbstractFileByPath(folderPath) : null;
+        const folderExists = !!(folderObj && folderObj.children);
+
+        // ADD: create a new type file in the folder; its colour row appears immediately.
+        new Setting(containerEl)
+            .setName("Add note type")
+            .setDesc(folderExists
+                ? "Creates a new markdown file in the note types folder."
+                : "Pick a note types folder first (above).")
+            .addText(text => {
+                text.inputEl.classList.add("step-new-type-input");
+                text.setPlaceholder("New type name");
+            })
+            .addExtraButton(btn => btn
+                .setIcon("plus")
+                .setTooltip("Create type")
+                .onClick(async () => {
+                    if (!folderExists) return;
+                    const input = containerEl.querySelector(".step-new-type-input");
+                    const name = input ? input.value.trim() : "";
+                    if (!name || /[\\/:]/.test(name)) return;
+                    const path = `${folderPath}/${name}.md`;
+                    if (this.app.vault.getAbstractFileByPath(path)) {
+                        new Notice(`A file "${name}.md" already exists there.`);
+                        return;
+                    }
+                    await this.app.vault.create(path, "");
+                    // assign a colour now so the row shows immediately
+                    const palette = ["#c05761", "#5b8c5a", "#b8860b", "#7f5fbf", "#2e86ab", "#c97b2d"];
+                    this.plugin.settings.typedColours[name] = palette[Object.keys(this.plugin.settings.typedColours).length % palette.length];
+                    await this.plugin.saveSettings();
+                    this.plugin.refreshNoteDots();
+                    this.display();
+                }));
+
+        // Existing types: open-for-edit and delete buttons; live via refreshNoteDots.
+        const listTypeNames = () => {
+            if (!folderExists) return [];
+            const f = this.app.vault.getFolderByPath(folderPath);
+            return f.children.filter(c => c.path && c.path.endsWith(".md")).map(c => c.basename).sort();
+        };
+        const typeNames = listTypeNames();
+        if (!typeNames.length) {
+            containerEl.createEl("p", {
+                text: "No note types yet. Pick a folder above and add a type; it will appear here.",
+                cls: "setting-item-description"
+            });
+        }
+        for (const typeName of typeNames) {
+            new Setting(containerEl)
+                .setName(typeName)
+                .addButton(btn => btn
+                    .setIcon("edit")
+                    .setTooltip("Open this type's file for editing")
+                    .onClick(async () => {
+                        const file = this.app.vault.getAbstractFileByPath(`${folderPath}/${typeName}.md`);
+                        if (!file) { new Notice(`No file "${typeName}.md" found.`); return; }
+                        await this.app.workspace.getLeaf("tab").openFile(file);
+                    }))
+                .addButton(btn => btn
+                    .setIcon("trash")
+                    .setTooltip("Delete this type: removes the file from the folder and its colour from settings")
+                    .onClick(async () => {
+                        if (folderExists) {
+                            const file = this.app.vault.getAbstractFileByPath(`${folderPath}/${typeName}.md`);
+                            if (file) await this.app.vault.delete(file);
+                        }
+                        delete this.plugin.settings.typedColours[typeName];
+                        await this.plugin.saveSettings();
+                        this.plugin.refreshNoteDots();
+                        this.display();
+                    }));
+        }
 
         const globalList = this.plugin.settings.globalVersions || [];
 
@@ -3458,6 +3721,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             console.error("STEP Plugin: executeJavaScript error:", err);
         }
     }
+    // Re-scan the vault and re-inject bars into every open STEP webview.
+    // Used after settings changes (e.g. type colours) so they apply immediately.
+    refreshNoteDots() {
+        this._noteDotsCache = null;
+        for (const leaf of this.app.workspace.getLeavesOfType("webviewer")) {
+            const wv = leaf.view?.webview;
+            const url = leaf.view?.url || wv?.getURL?.() || "";
+            if (wv && (url.includes("stepbible.org") || url.includes("localhost:8989"))) {
+                this.injectNoteDots(wv).catch(e => console.error("STEP Plugin: refresh error:", e));
+            }
+        }
+    }
+
     async injectNoteDots(webviewEl) {
         if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
 
@@ -3478,9 +3754,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const map = {}; // canonicalVerse -> Set of note basenames
                 const bookRefs = {}; // bookName -> Set of note basenames (whole-book references)
                 const files = this.app.vault.getMarkdownFiles();
+                const typedPrefix = (this.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
                 const linkRegex = /\(\[([^\]]+)\]\(([^)]+reference=([^)&]+)[^)]*)\)\)/g;
 
                 for (const file of files) {
+                    // Files in the note-types folder are typed bars, not ordinary green bars.
+                    if (typedPrefix && file.path.startsWith(typedPrefix + "/")) continue;
                     const text = await this.app.vault.cachedRead(file);
                     if (!text.includes("reference=")) continue;
 
@@ -3521,12 +3800,80 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         }
                     }
                 }
-                // convert Sets to arrays for serialisation
+                const bookRefKeys = Object.keys(bookRefs);
+
+                // TYPED NOTES: files in the user's note-types folder, one type
+                // per file. Entries become bars coloured by type; crosslinks
+                // (refs inside content) become bars in the crosslink colour
+                // pointing at the section they live in.
+                const typedData = { colourOf: {}, contentOf: {} };
+                const folderPath = (this.settings.noteTypesFolder || "").trim();
+                if (folderPath) {
+                    const prefix = folderPath.replace(/\/+$/, "") + "/";
+                    const typeFiles = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(prefix));
+                    const palette = ["#c05761", "#8a6db1", "#3f7fae", "#b8860b", "#7a9a3f", "#a352cc", "#c87f3f"];
+                    this.settings.typedColours = this.settings.typedColours || {};
+                    let coloursDirty = false;
+                    const addTypedRef = (refStr, key) => {
+                        const [left, right] = refStr.split("-").map(s => s.trim());
+                        const canonL = toCanonical(left);
+                        const canonR = right ? toCanonical(right) : null;
+                        if (!canonL) return;
+                        const [bookL, chapL, verseL] = canonL.split(".");
+                        if (!chapL) return; // typed whole-book refs: not supported yet
+                        const bookR = canonR ? canonR.split(".")[0] : bookL;
+                        const chapR = canonR ? canonR.split(".")[1] : chapL;
+                        const verseR = canonR ? (canonR.split(".")[2] || null) : null;
+                        if (bookL !== bookR) return;
+                        const maxV = (c) => this.getMaxVerse(bookL, parseInt(c, 10)) || 0;
+                        // chapter-only ref (reference=Genesis.1): whole chapter
+                        const startV = verseL ? parseInt(verseL, 10) : 1;
+                        for (let c = parseInt(chapL, 10); c <= parseInt(chapR, 10); c++) {
+                            const lastV = canonR ? ((c === parseInt(chapR, 10) && verseR) ? parseInt(verseR, 10) : maxV(c)) : (verseL ? parseInt(verseL, 10) : maxV(c));
+                            const firstV = (c === parseInt(chapL, 10)) ? startV : 1;
+                            for (let v = firstV; v <= lastV; v++) {
+                                const k2 = `${bookL}.${c}.${v}`;
+                                (map[k2] = map[k2] || new Set()).add(key);
+                            }
+                        }
+                    };
+                    const refPart = (target) => {
+                        const m = target.split("reference=")[1];
+                        return m ? m.split("&")[0].trim() : null;
+                    };
+                    for (let fi = 0; fi < typeFiles.length; fi++) {
+                        const f = typeFiles[fi];
+                        const base = f.basename;
+                        if (!this.settings.typedColours[base]) {
+                            this.settings.typedColours[base] = palette[fi % palette.length];
+                            coloursDirty = true;
+                        }
+                        const colour = this.settings.typedColours[base];
+                        const text = await this.app.vault.cachedRead(f);
+                        const parsed = parseTypedFile(text, base);
+                        parsed.entries.forEach((e, i) => {
+                            const id = "T:" + base + ":" + i;
+                            const rp = refPart(e.refRaw);
+                            if (rp) addTypedRef(rp, id);
+                            typedData.colourOf[id] = colour;
+                            typedData.contentOf[id] = { label: e.refText + " \u2014 " + base, text: e.content };
+                        });
+                        parsed.crosslinks.forEach((c, i) => {
+                            const id = "X:" + base + ":" + i;
+                            const rp = refPart(c.refRaw);
+                            if (rp) addTypedRef(rp, id);
+                            typedData.colourOf[id] = this.settings.crosslinkColour || "#a352cc";
+                            typedData.contentOf[id] = { label: c.refText + " \u2192 " + c.target.refText + " \u2014 " + base, text: c.target.content };
+                        });
+                    }
+                    if (coloursDirty) this.saveSettings();
+                }
+                // serialise the complete map (untyped + typed) for the page
                 const serialised = {};
                 for (const k of Object.keys(map)) serialised[k] = Array.from(map[k]);
                 const serialisedBookRefs = {};
-                for (const k of Object.keys(bookRefs)) serialisedBookRefs[k] = Array.from(bookRefs[k]);
-                this._noteDotsCache = { time: now, map: serialised, bookRefs: serialisedBookRefs };
+                for (const k of bookRefKeys) serialisedBookRefs[k] = Array.from(bookRefs[k]);
+                this._noteDotsCache = { time: now, map: serialised, bookRefs: serialisedBookRefs, typedData };
             }
 
             // STEP 3: push the FULL vault map + bookMap once per webview.
@@ -3536,7 +3883,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             await webviewEl.executeJavaScript(
                 `window.__stepDotFullMap = ${JSON.stringify(this._noteDotsCache.map)};` +
                 `window.__stepDotBookMap = ${JSON.stringify(bookMap)};` +
-                `window.__stepBookRefs = ${JSON.stringify(this._noteDotsCache.bookRefs || {})};`);
+                `window.__stepBookRefs = ${JSON.stringify(this._noteDotsCache.bookRefs || {})};` +
+                `window.__stepTypedData = ${JSON.stringify(this._noteDotsCache.typedData || { colourOf: {}, contentOf: {} })};`);
 
             // 4b. Define the in-page injector + MutationObserver:
             //  - observes document.body (survives STEP's container swaps)
@@ -3592,6 +3940,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     "  font-size: 12px; font-family: var(--font-interface);",
                                     "  pointer-events: none; white-space: nowrap;",
                                     "  box-shadow: 0 2px 8px rgba(0,0,0,0.3);",
+                                    "}",
+                                    ".step-note-tip.wide {",
+                                    "  white-space: pre-line; max-width: 480px;",
+                                    "  padding: 8px 12px; line-height: 1.5;",
+                                    "  max-height: 50vh; overflow: hidden;",
                                     "}"
                                 ].join("\\n");
                                 document.head.appendChild(style);
@@ -3712,6 +4065,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     const bar = document.createElement("div");
                                     bar.className = "step-note-bar";
                                     bar.dataset.note = item.nb;
+                                    // Typed bars take their colour from the note-type
+                                    // settings (or the crosslink colour for X: ids).
+                                    const tinfo = (window.__stepTypedData || {}).contentOf && window.__stepTypedData.contentOf[item.nb];
+                                    if (tinfo && window.__stepTypedData.colourOf[item.nb]) {
+                                        bar.style.background = window.__stepTypedData.colourOf[item.nb];
+                                    }
                                     // Fixed gutter position: right of the grey book column
                                     // (if any book bars exist on this page) so the two never overlap.
                                     const hasBookBars = cont.querySelector(".step-note-bar.book") !== null;
@@ -3743,10 +4102,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                         const fr2 = firstV.getBoundingClientRect();
                                         const tip = document.createElement("div");
                                         tip.className = "step-note-tip";
-                                        tip.textContent = item.nb;
+                                        if (tinfo) {
+                                            tip.classList.add("wide");
+                                            tip.textContent = tinfo.label + "\\n\\n" + tinfo.text;
+                                        } else {
+                                            tip.textContent = item.nb;
+                                        }
                                         tip.style.left = (fr2.right + 10) + "px";
                                         tip.style.top = fr2.top + "px";
                                         document.body.appendChild(tip);
+                                        // Clamp inside the viewport: verses near the right
+                                        // or bottom edge would otherwise push the tip off screen.
+                                        const tr = tip.getBoundingClientRect();
+                                        const lx = Math.max(4, Math.min(fr2.right + 10, window.innerWidth - tr.width - 4));
+                                        const ty = Math.max(4, Math.min(fr2.top, window.innerHeight - tr.height - 4));
+                                        tip.style.left = lx + "px";
+                                        tip.style.top = ty + "px";
                                         bar.__tip = tip;
                                     });
                                     bar.addEventListener("mouseleave", () => {

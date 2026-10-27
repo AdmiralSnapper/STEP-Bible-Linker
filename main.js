@@ -3828,7 +3828,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // per file. Entries become bars coloured by type; crosslinks
                 // (refs inside content) become bars in the crosslink colour
                 // pointing at the section they live in.
-                const typedData = { colourOf: {}, contentOf: {} };
+                const typedData = { colourOf: {}, contentOf: {}, outlineOf: {} };
                 const folderPath = (this.settings.noteTypesFolder || "").trim();
                 if (folderPath) {
                     const prefix = folderPath.replace(/\/+$/, "") + "/";
@@ -3873,6 +3873,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const colour = this.settings.typedColours[base];
                         const text = await this.app.vault.cachedRead(f);
                         const parsed = parseTypedFile(text, base);
+                        // Canonical range string for a raw reference, e.g.
+                        // "Genesis.1.1" or "Genesis.1.1-Genesis.1.3" (null if unknown).
+                        const canonRange = (rawRef) => {
+                            const rp = refPart(rawRef);
+                            if (!rp) return null;
+                            const [l, r] = rp.split("-").map(s => s.trim());
+                            const cl = toCanonical(l);
+                            if (!cl) return null;
+                            const cr = r ? toCanonical(r) : null;
+                            return cr ? cl + "-" + cr : cl;
+                        };
                         parsed.entries.forEach((e, i) => {
                             const id = "T:" + base + ":" + i;
                             const rp = refPart(e.refRaw);
@@ -3884,8 +3895,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const id = "X:" + base + ":" + i;
                             const rp = refPart(c.refRaw);
                             if (rp) addTypedRef(rp, id);
-                            typedData.colourOf[id] = this.settings.crosslinkColour || "#a352cc";
-                            typedData.contentOf[id] = { label: base, refText: c.target.refText, via: c.refText, text: c.target.content, colour: this.settings.crosslinkColour || "#a352cc" };
+                            // Crosslink bars share the colour of the note type they
+                            // come from, but are drawn as outlines, not solid bars.
+                            typedData.colourOf[id] = colour;
+                            typedData.outlineOf[id] = true;
+                            // sourceCanon: the section this crosslink lives in, so the
+                            // note's own reference lights up alongside the linked one.
+                            typedData.contentOf[id] = { label: base, refText: c.target.refText, via: c.refText, text: c.target.content, colour: colour, sourceCanon: canonRange(c.target.refRaw), sourceRef: c.target.refText };
                         });
                     }
                     if (coloursDirty) this.saveSettings();
@@ -3906,7 +3922,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 `window.__stepDotFullMap = ${JSON.stringify(this._noteDotsCache.map)};` +
                 `window.__stepDotBookMap = ${JSON.stringify(bookMap)};` +
                 `window.__stepBookRefs = ${JSON.stringify(this._noteDotsCache.bookRefs || {})};` +
-                `window.__stepTypedData = ${JSON.stringify(this._noteDotsCache.typedData || { colourOf: {}, contentOf: {} })};`);
+                `window.__stepTypedData = ${JSON.stringify(this._noteDotsCache.typedData || { colourOf: {}, contentOf: {}, outlineOf: {} })};`);
 
             // 4b. Define the in-page injector + MutationObserver:
             //  - observes document.body (survives STEP's container swaps)
@@ -4095,8 +4111,20 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // verse range and whether this is a typed/crosslink bar.
                                     bar.dataset.ref = verses[item.e.min].canon + ".." + verses[item.e.max].canon;
                                     if (tinfo) bar.dataset.typed = "1";
+                                    if (tinfo && tinfo.sourceCanon) bar.dataset.source = tinfo.sourceCanon;
                                     if (tinfo && window.__stepTypedData.colourOf[item.nb]) {
-                                        bar.style.background = window.__stepTypedData.colourOf[item.nb];
+                                        const typeCol = window.__stepTypedData.colourOf[item.nb];
+                                        const isOutline = !!(window.__stepTypedData.outlineOf || {})[item.nb];
+                                        if (isOutline) {
+                                            // Crosslinks: outline only, in the source type's colour
+                                            bar.style.background = "transparent";
+                                            bar.style.border = "1.5px solid " + typeCol;
+                                            bar.style.boxSizing = "border-box";
+                                            bar.style.opacity = "0.9";
+                                            bar.dataset.outline = "1";
+                                        } else {
+                                            bar.style.background = typeCol;
+                                        }
                                     }
                                     // Fixed gutter position: right of the grey book column
                                     // (if any book bars exist on this page) so the two never overlap.
@@ -4126,9 +4154,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // Typed bars show their content in an Obsidian-managed
                                     // popover (plugin side), so no in-page tip for them.
                                     bar.addEventListener("mouseenter", () => {
-                                        for (let i = item.e.min; i <= item.e.max; i++) {
-                                            verses[i].verse.classList.add("step-ref-hover");
-                                        }
+                                        window.__stepHighlight(item.nb);
                                         if (tinfo) return;
                                         const fr2 = firstV.getBoundingClientRect();
                                         const tip = document.createElement("div");
@@ -4152,9 +4178,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                         bar.__tip = tip;
                                     });
                                     bar.addEventListener("mouseleave", () => {
-                                        for (let i = item.e.min; i <= item.e.max; i++) {
-                                            verses[i].verse.classList.remove("step-ref-hover");
-                                        }
+                                        // Don't wipe a highlight the popover is holding.
+                                        if (!(window.__stepHl && window.__stepHl.hold)) window.__stepHighlight("");
                                         if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
                                     });
 
@@ -4173,20 +4198,46 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         };
 
                         // Host-driven highlight: while the mouse is over a bar or
-                        // its popover, the referenced verses stay lit.
-                        window.__stepHighlight = function(id) {
-                            if (window.__stepHl && window.__stepHl.el) {
-                                for (let i = window.__stepHl.min; i <= window.__stepHl.max; i++)
-                                    window.__stepHl.verses[i].verse.classList.remove("step-ref-hover");
+                        // its popover, the referenced verses stay lit. An optional
+                        // second argument adds a canonical range ("Gen.1.1" or
+                        // "Gen.1.1-Gen.1.3") — used by crosslinks to light up the
+                        // note's own reference as well as the linked one.
+                        window.__stepHighlight = function(id, sourceRange) {
+                            const clear = () => {
+                                if (window.__stepHl && window.__stepHl.els)
+                                    window.__stepHl.els.forEach(el => el.classList.remove("step-ref-hover"));
                                 window.__stepHl = null;
-                            }
+                            };
+                            clear();
                             if (!id) return;
+                            const verses = window.__stepVerses || [];
+                            const els = [];
+                            const lit = (v) => {
+                                if (!v || !v.verse || els.indexOf(v.verse) !== -1) return;
+                                v.verse.classList.add("step-ref-hover");
+                                els.push(v.verse);
+                            };
                             const bar = document.querySelector('.step-note-bar[data-note="' + CSS.escape(id) + '"]');
-                            if (bar && bar.__range && window.__stepVerses && window.__stepVerses.length) {
-                                window.__stepHl = { el: bar, min: bar.__range.min, max: bar.__range.max, verses: window.__stepVerses };
-                                for (let i = bar.__range.min; i <= bar.__range.max; i++)
-                                    window.__stepVerses[i].verse.classList.add("step-ref-hover");
+                            if (bar && bar.__range) {
+                                for (let i = bar.__range.min; i <= bar.__range.max; i++) lit(verses[i]);
                             }
+                            const range = sourceRange || (bar && bar.dataset && bar.dataset.source) || "";
+                            if (range && verses.length) {
+                                const parts = (c) => {
+                                    const a = String(c || "").split(".");
+                                    return [a[0] || "", parseInt(a[1], 10) || 0, parseInt(a[2], 10) || 0];
+                                };
+                                const halves = range.split("-");
+                                const lo = parts(halves[0]);
+                                const hi = halves[1] ? parts(halves[1]) : lo;
+                                const cmp = (x, y) => (x[0] !== y[0] ? (x[0] < y[0] ? -1 : 1) : (x[1] - y[1]) || (x[2] - y[2]));
+                                verses.forEach(v => {
+                                    const q = parts(v.canon);
+                                    if (!q[0]) return;
+                                    if (cmp(q, lo) >= 0 && cmp(q, hi) <= 0) lit(v);
+                                });
+                            }
+                            window.__stepHl = { els: els };
                         };
 
                         // Hit-test for the plugin-side hover popover: which bar sits
@@ -4533,7 +4584,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // verses highlighted in STEP (same highlight a markdown-link hover
             // produces). The guest can't see host-side hover, so push it.
             const barId = hit.id;
-            const pushHl = (id) => webviewEl.executeJavaScript(`window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")})`).catch(() => {});
+            const pushHl = (id) => {
+                const hold = id ? "true" : "false";
+                return webviewEl.executeJavaScript(
+                    `(function(){ window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")}); if (${hold} && window.__stepHl) window.__stepHl.hold = true; })()`
+                ).catch(() => {});
+            };
             body.addEventListener("mouseenter", () => pushHl(barId));
             body.addEventListener("pointerleave", () => { if (!this._barPinned) pushHl(""); });
 
@@ -4551,7 +4607,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             header.style.position = "relative";
             header.style.padding = "8px 44px 6px 12px";
             const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
-            titleEl.setText(info.via ? `${info.refText} (via ${info.via})` : (info.refText || ""));
+            titleEl.setText(info.via ? `Link from ${info.sourceRef || info.refText}` : (info.refText || ""));
             titleEl.style.fontWeight = "700";
             titleEl.style.fontSize = "15px";
             titleEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
@@ -4656,6 +4712,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             } catch (e) {
                 mdEl.setText(info.text || "");
             }
+
+            // MarkdownRenderer stamps external links with a title attribute (the
+            // raw URL). Obsidian's reading view suppresses the native tooltip;
+            // a bare div in a popover does not, so it shows as a black URL box.
+            // Strip it, and route external clicks to the browser as links do
+            // elsewhere in this plugin.
+            mdEl.querySelectorAll("a").forEach(a => {
+                a.removeAttribute("title");
+                if (a.classList.contains("external-link")) {
+                    a.addEventListener("click", (ev) => {
+                        ev.preventDefault();
+                        window.open(a.href, "_blank");
+                    });
+                }
+            });
 
             if (pinned) {
                 // Keep it where it is, movable and resizable, and stop the

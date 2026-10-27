@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder } = require('obsidian');
+const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder, setIcon } = require('obsidian');
 
 //SETTINGS ======================================================================
 /**
@@ -62,11 +62,13 @@ class FolderSuggest extends AbstractInputSuggest {
  * content }] in file order (a repeated reference in the same file produces one
  * entry whose contents are concatenated); crosslinks are references found
  * inside freeform content, each { refText, refRaw, source, target } pointing
- * at the entry it lives in. A line of only dashes (---, 3 or more) is a hard
- * section break (and closes any escape block); a line of only tildes (~~~)
- * toggles an escape block, within which line-starting reference links are
- * content/crosslinks, never section starts. A reference line may begin with
- * an optional "([" wrapper, e.g. "([Gen 3:16](url)) notes".
+ * at the entry it lives in. Sections MUST be separated by a line of only
+ * dashes (---, 3 or more), which also closes any escape block: a reference
+ * line before the next --- is content (its refs become crosslinks), so refs
+ * can be written at the start of lines without opening a new section. A line
+ * of only tildes (~~~) toggles an escape block (legacy, kept for
+ * compatibility). A reference line may begin with an optional "(["
+ * wrapper, e.g. "([Gen 3:16](url)) notes".
  */
 function parseTypedFile(text, fileBasename) {
     const refLine = /^[ \t]*(?:\(\s*)?\[([^\]]+)\]\(([^)]*reference=[^)]*)\)(.*)$/; // optional "(" before the link; link must start the line
@@ -76,6 +78,7 @@ function parseTypedFile(text, fileBasename) {
     const byRef = new Map();
     let current = null;
     let escaped = false; // inside a ~~~ block: line-start refs are content, not section starts
+    let closed = true;   // a --- has closed the previous section (true at file start)
 
     for (const line of text.split(/\r?\n/)) {
         if (/^[ \t]*-{3,}[ \t]*$/.test(line)) {
@@ -83,6 +86,7 @@ function parseTypedFile(text, fileBasename) {
             // Blank separator lines after it belong to no section and are dropped.
             escaped = false;
             current = null;
+            closed = true;
             continue;
         }
         if (/^[ \t]*~{3,}[ \t]*$/.test(line)) {
@@ -90,7 +94,7 @@ function parseTypedFile(text, fileBasename) {
             continue;
         }
         const m = escaped ? null : line.match(refLine);
-        if (m) {
+        if (m && closed) {
             const refText = m[1].trim();
             const refRaw = decodeURIComponent(m[2].trim());
             const trailing = m[3] ? m[3].replace(/^[ \t]*\)/, "") : ""; // drop the closing paren of an "([...])" wrapper
@@ -101,6 +105,7 @@ function parseTypedFile(text, fileBasename) {
                 byRef.set(refRaw, current);
                 entries.push(current);
             }
+            closed = false; // next section needs a --- first
             if (trailing.trim()) current.content += (current.content ? "\n" : "") + trailing.trim();
             continue;
         }
@@ -1698,6 +1703,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this._noteDotsCache = null;
         this._localStepRunningCache = { value: null, time: 0 };
         this._lastSearchQueryRef = null;
+        this.setupBarHover();
 
         // Load settings and add settings tab
         await this.loadSettings();
@@ -1814,6 +1820,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this.attachWebviewListeners = (webviewEl) => {
             if (!webviewEl || webviewEl.__stepListenersAttached) return;
             webviewEl.__stepListenersAttached = true;
+
+            // Bar hover reports from the guest page, forwarded as console
+            // messages (the guest has no node integration for ipcRenderer).
+            webviewEl.addEventListener("console-message", (ev) => {
+                const msg = (ev && ev.message) || "";
+                if (msg.startsWith("__STEPBARCLICK__")) {
+                    let click = null;
+                    try { click = JSON.parse(msg.slice("__STEPBARCLICK__".length)); } catch (e) { click = null; }
+                    this.handleBarClickMessage(webviewEl, click);
+                    return;
+                }
+                if (!msg.startsWith("__STEPBAR__")) return;
+                let hit = null;
+                try { hit = JSON.parse(msg.slice("__STEPBAR__".length)); } catch (e) { hit = null; }
+                this.handleBarHoverMessage(webviewEl, hit);
+            });
 
             //Listener function that gets attached to webview  
             const onNav = async () => {
@@ -3856,14 +3878,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const rp = refPart(e.refRaw);
                             if (rp) addTypedRef(rp, id);
                             typedData.colourOf[id] = colour;
-                            typedData.contentOf[id] = { label: e.refText + " \u2014 " + base, text: e.content };
+                            typedData.contentOf[id] = { label: base, refText: e.refText, text: e.content, colour: colour };
                         });
                         parsed.crosslinks.forEach((c, i) => {
                             const id = "X:" + base + ":" + i;
                             const rp = refPart(c.refRaw);
                             if (rp) addTypedRef(rp, id);
                             typedData.colourOf[id] = this.settings.crosslinkColour || "#a352cc";
-                            typedData.contentOf[id] = { label: c.refText + " \u2192 " + c.target.refText + " \u2014 " + base, text: c.target.content };
+                            typedData.contentOf[id] = { label: base, refText: c.target.refText, via: c.refText, text: c.target.content, colour: this.settings.crosslinkColour || "#a352cc" };
                         });
                     }
                     if (coloursDirty) this.saveSettings();
@@ -3952,6 +3974,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                             // Collect the page's verses in DOM order
                             const verses = [];
+                            window.__stepVerses = verses; // exposed for host-driven highlight
                             const seenVerses = new Set();
                             document.querySelectorAll("a.verseLink").forEach(anchor => {
                                 const name = anchor.getAttribute("name");
@@ -4062,12 +4085,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     const existing = cont.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
                                     if (existing) return;
 
-                                    const bar = document.createElement("div");
-                                    bar.className = "step-note-bar";
-                                    bar.dataset.note = item.nb;
                                     // Typed bars take their colour from the note-type
                                     // settings (or the crosslink colour for X: ids).
                                     const tinfo = (window.__stepTypedData || {}).contentOf && window.__stepTypedData.contentOf[item.nb];
+                                    const bar = document.createElement("div");
+                                    bar.className = "step-note-bar";
+                                    bar.dataset.note = item.nb;
+                                    // Metadata for the plugin-side hover popover: the
+                                    // verse range and whether this is a typed/crosslink bar.
+                                    bar.dataset.ref = verses[item.e.min].canon + ".." + verses[item.e.max].canon;
+                                    if (tinfo) bar.dataset.typed = "1";
                                     if (tinfo && window.__stepTypedData.colourOf[item.nb]) {
                                         bar.style.background = window.__stepTypedData.colourOf[item.nb];
                                     }
@@ -4094,11 +4121,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     bar.style.height = Math.max(10, bottom2 - top1) + "px";
                                     dbg.push("#" + added + " s" + slot + " t" + Math.round(top1) + " h" + Math.round(bottom2 - top1) + " " + verses[item.e.min].canon + ".." + verses[item.e.max].canon);
 
-                                    // Hover: highlight the whole referenced range in-page
+                                    bar.__range = { min: item.e.min, max: item.e.max };
+                                    // Hover: highlight the whole referenced range in-page.
+                                    // Typed bars show their content in an Obsidian-managed
+                                    // popover (plugin side), so no in-page tip for them.
                                     bar.addEventListener("mouseenter", () => {
                                         for (let i = item.e.min; i <= item.e.max; i++) {
                                             verses[i].verse.classList.add("step-ref-hover");
                                         }
+                                        if (tinfo) return;
                                         const fr2 = firstV.getBoundingClientRect();
                                         const tip = document.createElement("div");
                                         tip.className = "step-note-tip";
@@ -4140,6 +4171,56 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             }
                             return { added, dbg: dbg.join(" | "), cont: cont === document.body ? "BODY" : (cont && cont.className) || "?", verses: verses.length };
                         };
+
+                        // Host-driven highlight: while the mouse is over a bar or
+                        // its popover, the referenced verses stay lit.
+                        window.__stepHighlight = function(id) {
+                            if (window.__stepHl && window.__stepHl.el) {
+                                for (let i = window.__stepHl.min; i <= window.__stepHl.max; i++)
+                                    window.__stepHl.verses[i].verse.classList.remove("step-ref-hover");
+                                window.__stepHl = null;
+                            }
+                            if (!id) return;
+                            const bar = document.querySelector('.step-note-bar[data-note="' + CSS.escape(id) + '"]');
+                            if (bar && bar.__range && window.__stepVerses && window.__stepVerses.length) {
+                                window.__stepHl = { el: bar, min: bar.__range.min, max: bar.__range.max, verses: window.__stepVerses };
+                                for (let i = bar.__range.min; i <= bar.__range.max; i++)
+                                    window.__stepVerses[i].verse.classList.add("step-ref-hover");
+                            }
+                        };
+
+                        // Hit-test for the plugin-side hover popover: which bar sits
+                        // under this point? Coordinates are viewport-relative.
+                        window.__stepBarAt = function(x, y) {
+                            const hits = document.elementsFromPoint(x, y)
+                                .filter(el => el.classList && el.classList.contains("step-note-bar"));
+                            if (!hits.length) return null;
+                            const b = hits[0];
+                            return { id: b.dataset.note || "", ref: b.dataset.ref || "", typed: b.dataset.typed === "1" };
+                        };
+
+                        // Mouse events over the guest page never reach the host
+                        // document, and the guest has no node integration (no
+                        // ipcRenderer), so bar hovers are reported through the
+                        // console-message channel, which webview forwards to the host.
+                        if (!window.__stepBarHoverHook) {
+                            window.__stepBarHoverHook = true;
+                            let lastHover = null;
+                            document.addEventListener("mousemove", (e) => {
+                                const hit = window.__stepBarAt
+                                    ? window.__stepBarAt(e.clientX, e.clientY) : null;
+                                const key = hit ? hit.id : "";
+                                if (key === lastHover) return; // only report changes
+                                lastHover = key;
+                                console.log("__STEPBAR__" + JSON.stringify(hit));
+                            }, { passive: true });
+                            // Clicking a bar pins the popover (host-side)
+                            document.addEventListener("click", (e) => {
+                                const hit = window.__stepBarAt
+                                    ? window.__stepBarAt(e.clientX, e.clientY) : null;
+                                console.log("__STEPBARCLICK__" + JSON.stringify(hit));
+                            }, { passive: true });
+                        }
 
                         // Observe document.body — the only element guaranteed to survive
                         // STEP's navigation. Feedback from our own bar-appends is
@@ -4311,7 +4392,318 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this.urlPrefix = this.settings.useLocalStepServer
             ? "http://localhost:8989/"
             : "https://www.stepbible.org/";
-    } 
+    }
+
+    // BAR HOVER POPOVER: the guest page reports bar hovers over Electron's
+    // sendToHost channel (mouse events over a webview guest never reach the
+    // host document). Typed/crosslink bars open an Obsidian-managed popover
+    // (real markdown: text, images, links) anchored at the webview's top right.
+    setupBarHover() {
+        if (this._barHoverReady) return;
+        this._barHoverReady = true;
+        this._barHoverTimer = null;
+        this._barPopover = null;
+        this._barPopoverId = null;
+        this._barPinned = false;
+
+        // Popover styling (header + body), theme-aware via Obsidian variables.
+        if (!document.getElementById("step-bar-popover-style")) {
+            const st = document.createElement("style");
+            st.id = "step-bar-popover-style";
+            st.textContent = [
+                ".step-bar-popover { width: max-content; max-width: 560px; min-width: 240px; max-height: 60vh; overflow-y: auto; font-size: 13px; }",
+                ".step-bar-popover .step-bar-popover-header {",
+                "  position: relative; display: flex; flex-direction: column; gap: 1px;",
+                "  padding: 8px 44px 6px 12px; margin-bottom: 0; border-bottom: 1px solid var(--background-modifier-border); }",
+                ".step-bar-popover .step-bar-popover-title {",
+                "  font-weight: 700; font-size: 15px; font-family: var(--font-interface); color: var(--text-normal); }",
+                ".step-bar-popover .step-bar-popover-ref {",
+                "  font-size: 12px; font-family: var(--font-interface); color: var(--text-muted); }",
+                ".step-bar-popover .step-bar-popover-buttons {",
+                "  position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; }",
+                ".step-bar-popover .step-bar-popover-buttons-hidden { display: none; }",
+                ".step-bar-popover .step-bar-popover-btn {",
+                "  background: transparent; border: none; box-shadow: none; padding: 0; cursor: pointer;",
+                "  width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }",
+                ".step-bar-popover .step-bar-popover-btn:hover { background: rgba(255,255,255,0.25); }",
+                ".step-bar-popover .step-bar-popover-btn svg { width: 16px; height: 16px; }",
+                ".step-bar-popover .step-bar-popover-body { padding: 8px 14px 10px 14px; }",
+            ].join("\n");
+            document.head.appendChild(st);
+        }
+
+        const closePopover = () => {
+            if (this._barPopover) {
+                const pop = this._barPopover;
+                try { (this._barPopoverHide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
+                if (this._barPopover.anchorEl && this._barPopover.anchorEl.parentNode)
+                    this._barPopover.anchorEl.remove();
+                try { (this._barWebview || {}).executeJavaScript && this._barWebview.executeJavaScript(`window.__stepHighlight && window.__stepHighlight("")`).catch(() => {}); } catch (e) {}
+                this._barPopover = null;
+                this._barPopoverId = null;
+                this._barPopoverHide = null;
+            }
+        };
+        this._closeBarPopover = closePopover;
+        this._barOpenTimer = null;
+
+        // Called from the webview's ipc-message listener. A null hit means the
+        // pointer is over no bar: close any open popover. A typed hit opens a
+        // popover after a short hover delay (later messages cancel the timer).
+        this.handleBarHoverMessage = (webviewEl, hit) => {
+            this._barWebview = webviewEl;
+            // Push highlight state into the guest: the verses stay lit while
+            // the mouse is on the bar OR on the popover (guest can't see the
+            // popover, the host bridges it).
+            const pushHighlight = (id) => {
+                webviewEl.executeJavaScript(`window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")})`).catch(() => {});
+            };
+            if (!hit || !hit.typed) {
+                // While pinned, moving off the bar must not close the popover
+                if (!this._barPinned) { closePopover(); pushHighlight(""); }
+                return;
+            }
+            pushHighlight(hit.id);
+            if (this._barPinned) return; // pinned popover ignores hovers
+            if (hit.id === this._barPopoverId) return; // already showing
+            this._barOpenTimer = setTimeout(() => this.openBarPopover(webviewEl, hit, false), 150);
+        };
+
+        // Click on a bar: pin the popover (stays put, movable, resizable)
+        this.handleBarClickMessage = (webviewEl, hit) => {
+            clearTimeout(this._barOpenTimer);
+            if (!hit || !hit.typed) return;
+            if (hit.id === this._barPopoverId && this._barPinned) {
+                // second click on the same bar unpins and closes
+                this._barPinned = false;
+                closePopover();
+                return;
+            }
+            this._barPinned = true;
+            this.openBarPopover(webviewEl, hit, true);
+        };
+
+        // Create the popover for one bar hit. Pinned popovers get a header
+        // toolbar (open-in-Obsidian button), are draggable by the header and
+        // resizable from the corner.
+        this.openBarPopover = async (webviewEl, hit, pinned) => {
+            const box = webviewEl.getBoundingClientRect();
+            if (!box.width) { if (!pinned) closePopover(); return; }
+
+            // Content from the cached typed scan (same ids the page uses)
+            const td = this._noteDotsCache && this._noteDotsCache.typedData;
+            const info = td && td.contentOf && td.contentOf[hit.id];
+            if (!info) return;
+            const base = hit.id.split(":")[1];
+            const folder = (this.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
+            const sourcePath = folder ? `${folder}/${base}.md` : `${base}.md`;
+
+            closePopover();
+
+            // Anchor at the webview's top right corner
+            const anchorEl = document.createElement("div");
+            anchorEl.style.cssText = "position:fixed;width:0;height:0;pointer-events:none;";
+            anchorEl.style.left = (box.right - 8) + "px";
+            anchorEl.style.top = (box.top + 8) + "px";
+            document.body.appendChild(anchorEl);
+
+            let pop = null;
+            const { HoverPopover } = require("obsidian");
+            const leaf = this.app.workspace.getLeavesOfType("webviewer")
+                .find(l => l.view && l.view.containerEl && l.view.containerEl.contains(webviewEl));
+            const parent = (leaf && leaf.view) || this;
+            try { pop = new HoverPopover(parent, anchorEl, 0); } catch (e) { pop = null; }
+            if (!pop) { try { pop = new HoverPopover({ parent: parent, target: anchorEl, waitTime: 0 }); } catch (e) { pop = null; } }
+            if (!pop) { anchorEl.remove(); return; }
+
+            const body = pop.hoverEl || pop.contentEl || pop.el;
+            if (!body) { pop.hide(); anchorEl.remove(); return; }
+            body.addClass("step-bar-popover");
+            body.style.width = "max-content";
+            body.style.maxWidth = "560px";
+            body.style.minWidth = "240px";
+            body.style.maxHeight = "60vh";
+            // HoverPopover's hoverEl is a flex row by default; force a column
+            // so the title sits above the text.
+            body.style.display = "flex";
+            body.style.flexDirection = "column";
+            body.style.alignItems = "stretch";
+
+            // While the mouse is over the popover itself, keep the referenced
+            // verses highlighted in STEP (same highlight a markdown-link hover
+            // produces). The guest can't see host-side hover, so push it.
+            const barId = hit.id;
+            const pushHl = (id) => webviewEl.executeJavaScript(`window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")})`).catch(() => {});
+            body.addEventListener("mouseenter", () => pushHl(barId));
+            body.addEventListener("pointerleave", () => { if (!this._barPinned) pushHl(""); });
+
+            // Title block, coloured like the note bar: note name (bold,
+            // larger) with the verse reference underneath. Buttons overlay
+            // the block's top right corner.
+            const header = body.createDiv({ cls: "step-bar-popover-header" });
+            // Title-block colour = bar colour; pick white or dark grey text
+            // by the block's relative luminance.
+            const hex = (info.colour || "#17758f").replace("#", "");
+            const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
+            const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+            const darkText = lum > 0.6;
+            if (info.colour) header.style.backgroundColor = info.colour;
+            header.style.position = "relative";
+            header.style.padding = "8px 44px 6px 12px";
+            const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
+            titleEl.setText(info.via ? `${info.refText} (via ${info.via})` : (info.refText || ""));
+            titleEl.style.fontWeight = "700";
+            titleEl.style.fontSize = "15px";
+            titleEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
+            const refEl = header.createDiv({ cls: "step-bar-popover-ref" });
+            refEl.setText(info.label || "");
+            refEl.style.fontSize = "12px";
+            refEl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
+            const btns = header.createDiv({ cls: "step-bar-popover-buttons" });
+            btns.style.position = "absolute";
+            btns.style.top = "6px";
+            btns.style.right = "6px";
+            btns.style.display = "flex";
+            btns.style.flexDirection = "row";
+            btns.style.gap = "4px";
+            // Lucide svgs size via width:1em; a tiny inherited font-size collapses
+            // them to a dot. Pin explicit pixel size + colour on the svg.
+            const hardenIcon = (btn) => {
+                const svg = btn.querySelector("svg");
+                if (!svg) return;
+                const col = darkText ? "#3a3a3a" : "#ffffff";
+                for (const k of ["width", "height"]) {
+                    svg.setAttribute(k, "16");
+                    svg.style[k] = "16px";
+                }
+                svg.style.stroke = col;
+                svg.style.display = "block";
+            };
+            if (pinned) {
+                const openBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
+                openBtn.style.background = "transparent";
+                openBtn.style.border = "none";
+                openBtn.style.borderRadius = "50%";
+                openBtn.style.width = "26px";
+                openBtn.style.height = "26px";
+                openBtn.style.padding = "0";
+                openBtn.style.fontSize = "16px"; // em-sized icons must not inherit a tiny font
+                openBtn.style.display = "flex";
+                openBtn.style.alignItems = "center";
+                openBtn.style.justifyContent = "center";
+                openBtn.style.cursor = "pointer";
+                openBtn.addEventListener("mouseenter", () => { openBtn.style.background = "rgba(128,128,128,0.35)"; });
+                openBtn.addEventListener("mouseleave", () => { openBtn.style.background = "transparent"; });
+                setIcon(openBtn, "lucide-arrow-up-right");
+                hardenIcon(openBtn);
+                openBtn.setAttribute("aria-label", "Open in Obsidian at this reference");
+                openBtn.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    try {
+                        const leaf2 = await this.app.workspace.openLinkText(sourcePath, "", true);
+                        const view = leaf2 && leaf2.view;
+                        if (view && view.getMode && view.getMode() === "source" && view.editor) {
+                            const ed = view.editor;
+                            const needle = (info.refText || "").replace(/[\[\]]/g, "");
+                            const idx = ed.getValue().indexOf(needle);
+                            if (idx >= 0) {
+                                const pos = ed.offsetToPos(idx);
+                                ed.setCursor(pos);
+                                ed.scrollIntoView({ from: pos, to: pos }, true);
+                            }
+                        }
+                    } catch (e) {}
+                    this._barPinned = false;
+                    closePopover();
+                });
+                const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
+                closeBtn.style.background = "transparent";
+                closeBtn.style.border = "none";
+                closeBtn.style.borderRadius = "50%";
+                closeBtn.style.width = "26px";
+                closeBtn.style.height = "26px";
+                closeBtn.style.padding = "0";
+                closeBtn.style.fontSize = "16px"; // em-sized icons must not inherit a tiny font
+                closeBtn.style.display = "flex";
+                closeBtn.style.alignItems = "center";
+                closeBtn.style.justifyContent = "center";
+                closeBtn.style.cursor = "pointer";
+                closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(128,128,128,0.35)"; });
+                closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "transparent"; });
+                setIcon(closeBtn, "lucide-x");
+                if (!closeBtn.querySelector("svg")) {
+                    // Last resort: guaranteed-visible unicode cross
+                    closeBtn.setText("\u2715");
+                    closeBtn.style.color = darkText ? "#3a3a3a" : "#ffffff";
+                    closeBtn.style.fontSize = "14px";
+                    closeBtn.style.lineHeight = "26px";
+                }
+                hardenIcon(closeBtn);
+                closeBtn.setAttribute("aria-label", "Close");
+                closeBtn.addEventListener("click", (ev) => {
+                    ev.stopPropagation();
+                    this._barPinned = false;
+                    closePopover();
+                });
+            } else {
+                btns.addClass("step-bar-popover-buttons-hidden");
+            }
+
+            const mdEl = body.createDiv({ cls: "step-bar-popover-body" });
+            mdEl.style.padding = "8px 14px 10px 14px";
+            try {
+                await MarkdownRenderer.render(this.app, info.text || "", mdEl, sourcePath, this);
+            } catch (e) {
+                mdEl.setText(info.text || "");
+            }
+
+            if (pinned) {
+                // Keep it where it is, movable and resizable, and stop the
+                // HoverPopover from hiding itself when the mouse leaves it.
+                body.classList.add("step-bar-popover-pinned");
+                const r = anchorEl.getBoundingClientRect();
+                body.style.position = "fixed";
+                body.style.left = Math.max(4, r.left - body.offsetWidth) + "px";
+                body.style.top = r.top + "px";
+                body.style.right = "auto";
+                body.style.overflow = "auto";
+                body.style.minWidth = "240px";
+                body.style.minHeight = "120px";
+
+                // Fixed height: content scrolls, width hugs content
+                body.style.height = "210px";
+                body.style.overflowY = "auto";
+                body.style.minWidth = "240px";
+                body.style.maxWidth = "560px";
+                const origHide = pop.hide.bind(pop);
+                pop.hide = () => {}; // pinned: only the close button closes it
+                this._barPopoverHide = origHide;
+
+                // Drag by the header
+                let drag = null;
+                header.addEventListener("pointerdown", (ev) => {
+                    if (ev.target.closest("button")) return;
+                    drag = { sx: ev.clientX, sy: ev.clientY, l: body.offsetLeft, t: body.offsetTop };
+                    header.setPointerCapture(ev.pointerId);
+                });
+                header.addEventListener("pointermove", (ev) => {
+                    if (!drag) return;
+                    body.style.left = Math.max(0, drag.l + ev.clientX - drag.sx) + "px";
+                    body.style.top = Math.max(0, drag.t + ev.clientY - drag.sy) + "px";
+                });
+                header.addEventListener("pointerup", () => { drag = null; });
+                header.addEventListener("pointercancel", () => { drag = null; });
+            }
+
+            this._barPopover = pop;
+            this._barPopover.anchorEl = anchorEl;
+            this._barPopoverId = hit.id;
+        };
+
+        // Leaving the window kills any open (unpinned) popover
+        this.registerDomEvent(document, "mouseleave", () => { if (!this._barPinned) closePopover(); });
+    }
+
     async saveSettings() {
         await this.saveData(this.settings);
         this.urlPrefix = this.settings.useLocalStepServer

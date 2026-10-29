@@ -854,14 +854,9 @@ class StepSearchView extends ItemView {
                         this.plugin
                     );
 
-                    // Remove tooltip + keep links clickable
-                    preview.querySelectorAll("a").forEach(a => {
-                        a.removeAttribute("title");
-                        a.addEventListener("click", (ev) => {
-                            ev.preventDefault();
-                            window.open(a.href, "_blank");
-                        });
-                    });
+                    // Remove tooltips (Obsidian attaches them to the anchors
+                    // themselves) and keep links clickable.
+                    this.plugin.stripLinkTooltips(preview, this.plugin.app.workspace.getActiveFile()?.path || "");
 
                     // Find matching links in rendered preview
                     previewLinks = [];
@@ -4713,20 +4708,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 mdEl.setText(info.text || "");
             }
 
-            // MarkdownRenderer stamps external links with a title attribute (the
-            // raw URL). Obsidian's reading view suppresses the native tooltip;
-            // a bare div in a popover does not, so it shows as a black URL box.
-            // Strip it, and route external clicks to the browser as links do
-            // elsewhere in this plugin.
-            mdEl.querySelectorAll("a").forEach(a => {
-                a.removeAttribute("title");
-                if (a.classList.contains("external-link")) {
-                    a.addEventListener("click", (ev) => {
-                        ev.preventDefault();
-                        window.open(a.href, "_blank");
-                    });
-                }
-            });
+            // MarkdownRenderer hands links over to Obsidian's tooltip system
+            // (title/aria-label + listeners), which normal reading views
+            // suppress but a bare div in a custom panel does not — hence the
+            // black URL box on hover.
+            this.stripLinkTooltips(mdEl, sourcePath);
 
             if (pinned) {
                 // Keep it where it is, movable and resizable, and stop the
@@ -4773,6 +4759,51 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         // Leaving the window kills any open (unpinned) popover
         this.registerDomEvent(document, "mouseleave", () => { if (!this._barPinned) closePopover(); });
+    }
+
+    // Kill Obsidian's hover tooltips on links rendered into a custom panel.
+    // Attributes are not enough: Obsidian attaches hover listeners to the
+    // anchor, so each link is replaced with a clean clone (no listeners, no
+    // tooltip attributes) and given our own click handling back.
+    stripLinkTooltips(root, sourcePath) {
+        root.querySelectorAll("a").forEach(a => {
+            const ext = a.classList.contains("external-link");
+            const href = a.getAttribute("href") || "";
+            const dataHref = a.getAttribute("data-href") || "";
+            const clone = a.cloneNode(true);
+            for (const attr of ["title", "aria-label", "data-tooltip", "aria-describedby"]) {
+                clone.removeAttribute(attr);
+                clone.querySelectorAll("[" + attr + "]").forEach(n => n.removeAttribute(attr));
+            }
+            clone.addEventListener("mouseover", () => {
+                // Strip again on hover: Obsidian's post-processing can re-add
+                // tooltip attributes after the initial render. Attributes are
+                // removed, but the event is NOT stopped — Obsidian's page
+                // preview (the grey hover popout) is a document-level handler
+                // and needs the event to bubble.
+                for (const attr of ["title", "aria-label", "data-tooltip", "aria-describedby"]) clone.removeAttribute(attr);
+            });
+            clone.addEventListener("click", (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                if (ext) {
+                    window.open(href, "_blank");
+                    return;
+                }
+                const target = dataHref || href;
+                if (!target) return;
+                this.app.workspace.openLinkText(target, sourcePath || "", false);
+            });
+            a.replaceWith(clone);
+        });
+
+        // MarkdownRenderer post-processing is async; sweep once more after the
+        // current task so late-added title attributes are cleared too.
+        setTimeout(() => {
+            root.querySelectorAll("a").forEach(a => {
+                for (const attr of ["title", "aria-label", "data-tooltip", "aria-describedby"]) a.removeAttribute(attr);
+            });
+        }, 0);
     }
 
     async saveSettings() {

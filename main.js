@@ -129,6 +129,53 @@ function parseTypedFile(text, fileBasename) {
     }
     return { entries, crosslinks };
 }
+
+// Canonical book order (matches the verse-count table's key order), used to
+// compare two references positionally.
+const STEP_BOOK_ORDER = ["Genesis","Exodus","Leviticus","Numbers","Deuteronomy","Joshua","Judges","Ruth","1Samuel","2Samuel","1Kings","2Kings","1Chronicles","2Chronicles","Ezra","Nehemiah","Esther","Job","Psalms","Proverbs","Ecclesiastes","SongofSongs","Song","Isaiah","Jeremiah","Lamentations","Ezekiel","Daniel","Hosea","Joel","Amos","Obadiah","Jonah","Micah","Nahum","Habakkuk","Zephaniah","Haggai","Zechariah","Malachi","Matthew","Mark","Luke","John","Acts","Romans","1Corinthians","2Corinthians","Galatians","Ephesians","Philippians","Colossians","1Thessalonians","2Thessalonians","1Timothy","2Timothy","Titus","Philemon","Hebrews","James","1Peter","2Peter","1John","2John","3John","Jude","Revelation"];
+
+/**
+ * Turn a canonical reference range ("Genesis.1.1", "Genesis.1", or
+ * "Genesis.1.1-Genesis.1.3") into a comparable [start, end] ordinal pair.
+ * A chapter-only reference covers the whole chapter.
+ */
+function canonBounds(range) {
+    if (!range) return null;
+    const point = (s) => {
+        const p = String(s).trim().split(".");
+        const bi = STEP_BOOK_ORDER.indexOf(p[0]);
+        const ch = parseInt(p[1], 10);
+        const v = p[2] ? parseInt(p[2], 10) : null;
+        if (bi < 0 || !ch) return null;
+        return { bi, ch, v };
+    };
+    const parts = String(range).split("-").map(s => s.trim()).filter(Boolean);
+    const a = point(parts[0]);
+    if (!a) return null;
+    const b = parts.length > 1 ? point(parts[parts.length - 1]) : a;
+    if (!b) return null;
+    const ord = (p, end) => p.bi * 1e9 + p.ch * 1e6 + (p.v == null ? (end ? 999999 : 0) : p.v);
+    return { start: ord(a, false), end: ord(b, true) };
+}
+
+/**
+ * How does a reference found inside a section relate to that section's own
+ * reference? Returns one of:
+ *   "self"     — same passage (no bar needed)
+ *   "nested"   — the target sits inside the section (detail within scope)
+ *   "encloses" — the target wraps the whole section
+ *   "external" — a genuine cross-reference elsewhere
+ */
+function scopeRelation(sectionCanon, targetCanon) {
+    const s = canonBounds(sectionCanon);
+    const t = canonBounds(targetCanon);
+    if (!s || !t) return "external";
+    if (t.start >= s.start && t.end <= s.end) {
+        return (t.start === s.start && t.end === s.end) ? "self" : "nested";
+    }
+    if (s.start >= t.start && s.end <= t.end) return "encloses";
+    return "external";
+}
 // END_TYPED_PARSER
 
 class StepBibleLinkerSettingTab extends PluginSettingTab {
@@ -3772,7 +3819,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const bookRefs = {}; // bookName -> Set of note basenames (whole-book references)
                 const files = this.app.vault.getMarkdownFiles();
                 const typedPrefix = (this.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
-                const linkRegex = /\(\[([^\]]+)\]\(([^)]+reference=([^)&]+)[^)]*)\)\)/g;
+                const linkRegex = /\[([^\]]+)\]\(([^)]*reference=([^)&]+)[^)]*)/g;
+                // Plain markdown links as well as the "([...])"-wrapped form STEP
+                // writes: notes outside the notes folder are hand-written, so they
+                // may use either.
+                // Popover content lives here for typed and ordinary notes alike: a
+                // plain note's entry shows the WHOLE file, scrolled to the first
+                // mention of the reference that drew the bar.
+                const typedData = { colourOf: {}, contentOf: {}, outlineOf: {} };
+                const plainColour = (this.settings && this.settings.noteLinesColour) || "#17758f";
 
                 for (const file of files) {
                     // Files in the note-types folder are typed bars, not ordinary green bars.
@@ -3780,7 +3835,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     const text = await this.app.vault.cachedRead(file);
                     if (!text.includes("reference=")) continue;
 
+                    let refN = 0;
                     for (const [, linkText, , refRaw] of text.matchAll(linkRegex)) {
+                        // One id per reference in the file, so every reference draws
+                        // its own bar instead of one bar stretching over all of them.
+                        // Path, not basename: two notes can share a name in
+                        // different folders and must not share bars.
+                        const id = "N:" + file.path + ":" + (refN++);
                         const decoded = decodeURIComponent(refRaw.trim());
                         const [left, right] = decoded.split("-").map(s => s.trim());
                         const canonL = toCanonical(left);
@@ -3801,6 +3862,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                         if (bookL !== bookR) continue; // cross-book ranges unsupported for bars
 
+                        // The popover shows the whole file, scrolled to the first
+                        // mention of this reference. No colourOf entry, so the bar
+                        // keeps the default solid style.
+                        typedData.contentOf[id] = {
+                            label: file.basename,
+                            refText: linkText.trim(),
+                            text: text,
+                            path: file.path,
+                            colour: plainColour,
+                            wholeNote: true,
+                        };
+
                         const maxV = (c) => this.getMaxVerse(bookL, parseInt(c, 10)) || 0;
 
                         for (let c = parseInt(chapL, 10); c <= parseInt(chapR, 10); c++) {
@@ -3812,7 +3885,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const firstV = (c === parseInt(chapL, 10)) ? (parseInt(verseL || "1", 10)) : 1;
                             for (let v = firstV; v <= lastV; v++) {
                                 const key = `${bookL}.${c}.${v}`;
-                                (map[key] = map[key] || new Set()).add(file.basename);
+                                (map[key] = map[key] || new Set()).add(id);
                             }
                         }
                     }
@@ -3823,7 +3896,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // per file. Entries become bars coloured by type; crosslinks
                 // (refs inside content) become bars in the crosslink colour
                 // pointing at the section they live in.
-                const typedData = { colourOf: {}, contentOf: {}, outlineOf: {} };
+                // (typedData is declared above: ordinary notes fill it too.)
+                const entryIdOf = {}; // raw section ref -> its typed entry id
                 const folderPath = (this.settings.noteTypesFolder || "").trim();
                 if (folderPath) {
                     const prefix = folderPath.replace(/\/+$/, "") + "/";
@@ -3883,12 +3957,20 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const id = "T:" + base + ":" + i;
                             const rp = refPart(e.refRaw);
                             if (rp) addTypedRef(rp, id);
+                            entryIdOf[e.refRaw] = id;
                             typedData.colourOf[id] = colour;
                             typedData.contentOf[id] = { label: base, refText: e.refText, text: e.content, colour: colour };
                         });
                         parsed.crosslinks.forEach((c, i) => {
                             const id = "X:" + base + ":" + i;
                             const rp = refPart(c.refRaw);
+                            // scope: how this ref relates to its own section
+                            // (self / nested / encloses / external), which decides
+                            // how the bar is drawn and labelled.
+                            const sectionCanon = canonRange(c.target.refRaw);
+                            const targetCanon = canonRange(c.refRaw);
+                            const scope = scopeRelation(sectionCanon, targetCanon);
+                            if (scope === "self") return; // the section itself: no extra bar
                             if (rp) addTypedRef(rp, id);
                             // Crosslink bars share the colour of the note type they
                             // come from, but are drawn as outlines, not solid bars.
@@ -3896,7 +3978,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             typedData.outlineOf[id] = true;
                             // sourceCanon: the section this crosslink lives in, so the
                             // note's own reference lights up alongside the linked one.
-                            typedData.contentOf[id] = { label: base, refText: c.target.refText, via: c.refText, text: c.target.content, colour: colour, sourceCanon: canonRange(c.target.refRaw), sourceRef: c.target.refText };
+                            typedData.contentOf[id] = { label: base, refText: c.target.refText, via: c.refText, text: c.target.content, colour: colour, sourceCanon: sectionCanon, sourceRef: c.target.refText, scope: scope, parentId: entryIdOf[c.target.refRaw] || null };
                         });
                     }
                     if (coloursDirty) this.saveSettings();
@@ -3959,7 +4041,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     "  border-radius: 1px;",
                                     "}",
                                     ".step-note-bar.book:hover { opacity: 1; width: 5px; }",
+                                    // Scoped refs are thinner and dimmer than a main bar.
+                                    // Listed before the hover rule so :hover still wins.
+                                    // Single quotes so the escaped \" survives into the
+                                    // guest page: this array is a template literal, where
+                                    // \" would collapse to a bare quote and break the string.
+                                    '.step-note-bar[data-scope="nested"] { width: 3px; opacity: 0.9; }',
+                                    '.step-note-bar[data-scope="encloses"] { width: 2px; opacity: 0.5; }',
                                     ".step-note-bar:hover { opacity: 1; width: 6px; }",
+                                    // Hovering a ref also widens the note section's own bar.
+                                    ".step-note-bar.step-bar-expand { opacity: 1; width: 6px; }",
                                     ".verse.step-ref-hover {",
                                     "  background-color: rgba(190, 190, 163, 0.19) !important;",
                                     "  outline: 1px solid #cacda600 !important;",
@@ -4069,7 +4160,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                             const fr = bar.getBoundingClientRect();
                                             const tip = document.createElement("div");
                                             tip.className = "step-note-tip";
-                                            tip.textContent = nb;
+                                            // Friendly label: note ids are "T:name:i",
+                                            // "X:name:i" or "N:path:i" — show the name,
+                                            // never the raw id or full path.
+                                            const parts = String(nb).split(":");
+                                            const fam = parts[0];
+                                            let lbl = nb;
+                                            if (fam === "N") {
+                                                const pth = parts.slice(1, -1).join(":");
+                                                lbl = pth.split("/").pop().replace(/\.md$/i, "");
+                                            } else if (fam === "T" || fam === "X") {
+                                                lbl = parts[1] || nb;
+                                            }
+                                            tip.textContent = lbl;
                                             tip.style.left = (fr.right + 10) + "px";
                                             tip.style.top = fr.top + "px";
                                             document.body.appendChild(tip);
@@ -4107,15 +4210,26 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     bar.dataset.ref = verses[item.e.min].canon + ".." + verses[item.e.max].canon;
                                     if (tinfo) bar.dataset.typed = "1";
                                     if (tinfo && tinfo.sourceCanon) bar.dataset.source = tinfo.sourceCanon;
+                                    // Scope of a ref relative to its own note section:
+                                    // nested (detail inside the note's range), encloses
+                                    // (a wider passage wrapping it) or external.
+                                    const scope = tinfo && tinfo.scope ? tinfo.scope : null;
+                                    if (scope) bar.dataset.scope = scope;
+                                    // The note section this ref belongs to, so hovering a
+                                    // scoped/crosslink bar can widen the section's own bar.
+                                    if (tinfo && tinfo.parentId) bar.dataset.parent = tinfo.parentId;
                                     if (tinfo && window.__stepTypedData.colourOf[item.nb]) {
                                         const typeCol = window.__stepTypedData.colourOf[item.nb];
                                         const isOutline = !!(window.__stepTypedData.outlineOf || {})[item.nb];
                                         if (isOutline) {
                                             // Crosslinks: outline only, in the source type's colour
                                             bar.style.background = "transparent";
-                                            bar.style.border = "1.5px solid " + typeCol;
+                                            bar.style.border = scope === "nested"
+                                                ? "1.5px dashed " + typeCol
+                                                : "1.5px solid " + typeCol;
                                             bar.style.boxSizing = "border-box";
-                                            bar.style.opacity = "0.9";
+                                            // Opacity lives in the stylesheet (keyed on
+                                            // data-scope) so :hover can still brighten it.
                                             bar.dataset.outline = "1";
                                         } else {
                                             bar.style.background = typeCol;
@@ -4124,7 +4238,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // Fixed gutter position: right of the grey book column
                                     // (if any book bars exist on this page) so the two never overlap.
                                     const hasBookBars = cont.querySelector(".step-note-bar.book") !== null;
-                                    bar.style.left = ((hasBookBars ? 6 : 2) + slot * 8) + "px";
+                                    const baseLeft = hasBookBars ? 6 : 2;
+                                    // Scoped refs keep their own lane (allocated above) but
+                                    // are drawn thinner than a main bar. The widths live in
+                                    // the stylesheet (keyed on data-scope) so the hover rule
+                                    // can still widen them — an inline width would win.
+                                    bar.style.left = (baseLeft + slot * 8) + "px";
 
                                     // Measure the range from viewport rects, converted
                                     // to container-content coordinates (accounting for
@@ -4199,8 +4318,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         // note's own reference as well as the linked one.
                         window.__stepHighlight = function(id, sourceRange) {
                             const clear = () => {
-                                if (window.__stepHl && window.__stepHl.els)
-                                    window.__stepHl.els.forEach(el => el.classList.remove("step-ref-hover"));
+                                if (window.__stepHl) {
+                                    if (window.__stepHl.els) window.__stepHl.els.forEach(el => el.classList.remove("step-ref-hover"));
+                                    if (window.__stepHl.bars) window.__stepHl.bars.forEach(el => el.classList.remove("step-bar-expand"));
+                                }
                                 window.__stepHl = null;
                             };
                             clear();
@@ -4216,7 +4337,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             if (bar && bar.__range) {
                                 for (let i = bar.__range.min; i <= bar.__range.max; i++) lit(verses[i]);
                             }
-                            const range = sourceRange || (bar && bar.dataset && bar.dataset.source) || "";
+                            // A ref bar lights only what it points at. The note section
+                            // it was written in is NOT repainted: hovering a crosslink
+                            // should show the linked passage, not wash out the text it
+                            // came from. That section's bar still widens instead (below).
+                            const scoped = bar && bar.dataset ? bar.dataset.scope : "";
+                            const range = scoped ? "" : (sourceRange || "");
                             if (range && verses.length) {
                                 const parts = (c) => {
                                     const a = String(c || "").split(".");
@@ -4232,7 +4358,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     if (cmp(q, lo) >= 0 && cmp(q, hi) <= 0) lit(v);
                                 });
                             }
-                            window.__stepHl = { els: els };
+                            // A ref inside (or around) a note widens that note's own
+                            // bar while it's hovered, so the relationship is visible
+                            // even when both bars are on screen.
+                            const bars = [];
+                            const parentId = bar && bar.dataset ? bar.dataset.parent : "";
+                            if (parentId) {
+                                const pb = document.querySelector('.step-note-bar[data-note="' + CSS.escape(parentId) + '"]');
+                                if (pb) { pb.classList.add("step-bar-expand"); bars.push(pb); }
+                            }
+                            window.__stepHl = { els: els, bars: bars };
                         };
 
                         // Hit-test for the plugin-side hover popover: which bar sits
@@ -4542,7 +4677,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (!info) return;
             const base = hit.id.split(":")[1];
             const folder = (this.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
-            const sourcePath = folder ? `${folder}/${base}.md` : `${base}.md`;
+            // Typed entries live in the notes folder; ordinary notes record
+            // their real path (they can sit anywhere in the vault).
+            const sourcePath = info.path || (folder ? `${folder}/${base}.md` : `${base}.md`);
 
             closePopover();
 
@@ -4565,6 +4702,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const body = pop.hoverEl || pop.contentEl || pop.el;
             if (!body) { pop.hide(); anchorEl.remove(); return; }
             body.addClass("step-bar-popover");
+            body.style.maxHeight = "60vh";
+            // Width hugs the content; the height hugs it too, capped to the
+            // viewport. Pinned and unpinned share the same measured height so
+            // the box doesn't jump size when it's fixed.
             body.style.width = "max-content";
             body.style.maxWidth = "560px";
             body.style.minWidth = "240px";
@@ -4602,12 +4743,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             header.style.position = "relative";
             header.style.padding = "8px 44px 6px 12px";
             const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
-            titleEl.setText(info.via ? `Link from ${info.sourceRef || info.refText}` : (info.refText || ""));
+            // The title is always the note's own reference, whether the ref is a
+            // link or sits inside the note. What differs is the line underneath
+            // (note name, plus the specific passage for scoped refs).
+            const titleText = (info.via ? (info.sourceRef || info.refText) : (info.refText || "")) || "";
+            titleEl.setText(titleText);
             titleEl.style.fontWeight = "700";
             titleEl.style.fontSize = "15px";
             titleEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
             const refEl = header.createDiv({ cls: "step-bar-popover-ref" });
-            refEl.setText(info.label || "");
+            // For scoped refs the note name alone is ambiguous, so show the
+            // passage too: "Note name — Genesis 1:3".
+            const scoped = info.via && (info.scope === "nested" || info.scope === "encloses");
+            refEl.setText(scoped ? `${info.label || ""} — ${info.via || ""}` : (info.label || ""));
             refEl.style.fontSize = "12px";
             refEl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
             const btns = header.createDiv({ cls: "step-bar-popover-buttons" });
@@ -4714,6 +4862,29 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // black URL box on hover.
             this.stripLinkTooltips(mdEl, sourcePath);
 
+
+            // Match heights: measure the natural content height (header + body)
+            // and use it for both the hover state and the pinned state, capped
+            // at 60% of the viewport. Below the cap the content scrolls.
+            body.style.height = "auto";
+            let naturalH = body.scrollHeight;
+            // A popover measured before layout lands can report 0; fall back to
+            // a sane default so the box never collapses.
+            if (!naturalH || naturalH < 60) naturalH = 210;
+            const fittedH = Math.min(naturalH, Math.round(window.innerHeight * 0.6));
+            body.style.height = fittedH + "px";
+            body.style.overflowY = "auto";
+
+            // Now that the box is clipped and scrollable, light up the first
+            // mention of the reference in the note and scroll it into view. A
+            // note on Genesis 3 that mentions Genesis 3:15 should show where.
+            // Crosslinks point at the ref they link to; a whole-note popover
+            // jumps to the first place the file mentions the ref that drew the bar.
+            const mentions = info.via
+                ? (info.scope === "nested" || info.scope === "encloses" ? [info.via, info.refText] : [info.via])
+                : (info.wholeNote && info.refText ? [info.refText] : []);
+            this.highlightFirstMention(mdEl, mentions, body);
+
             if (pinned) {
                 // Keep it where it is, movable and resizable, and stop the
                 // HoverPopover from hiding itself when the mouse leaves it.
@@ -4725,13 +4896,36 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 body.style.right = "auto";
                 body.style.overflow = "auto";
                 body.style.minWidth = "240px";
-                body.style.minHeight = "120px";
-
-                // Fixed height: content scrolls, width hugs content
-                body.style.height = "210px";
-                body.style.overflowY = "auto";
-                body.style.minWidth = "240px";
+                // Keep the measured height from the hover state (do not force a
+                // fixed 210px), so pinning doesn't change the box's size.
+                body.style.minHeight = "80px";
+                body.style.maxHeight = "none";
                 body.style.maxWidth = "560px";
+
+                // Vertical-only resize handle along the bottom edge: drag down
+                // to make the box taller (content scrolls inside).
+                const grip = body.createDiv({ cls: "step-bar-popover-grip" });
+                grip.style.position = "absolute";
+                grip.style.left = "0";
+                grip.style.right = "0";
+                grip.style.bottom = "0";
+                grip.style.height = "9px";
+                grip.style.cursor = "ns-resize";
+                grip.style.zIndex = "10";
+                grip.style.background = "transparent";
+                let vresize = null;
+                grip.addEventListener("pointerdown", (ev) => {
+                    ev.preventDefault();
+                    vresize = { sy: ev.clientY, h: body.offsetHeight };
+                    grip.setPointerCapture(ev.pointerId);
+                });
+                grip.addEventListener("pointermove", (ev) => {
+                    if (!vresize) return;
+                    body.style.height = Math.max(80, vresize.h + ev.clientY - vresize.sy) + "px";
+                });
+                const endV = () => { vresize = null; };
+                grip.addEventListener("pointerup", endV);
+                grip.addEventListener("pointercancel", endV);
                 const origHide = pop.hide.bind(pop);
                 pop.hide = () => {}; // pinned: only the close button closes it
                 this._barPopoverHide = origHide;
@@ -4765,6 +4959,49 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // Attributes are not enough: Obsidian attaches hover listeners to the
     // anchor, so each link is replaced with a clean clone (no listeners, no
     // tooltip attributes) and given our own click handling back.
+    // Highlight the first place a reference is mentioned in rendered note text,
+    // and (for a scrollable popover) centre it. Returns the span, or null.
+    highlightFirstMention(root, needles, scroller) {
+        const escape = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const patterns = [];
+        for (const n of needles) {
+            const t = String(n || "").replace(/\s+/g, " ").trim();
+            if (!t) continue;
+            const re = new RegExp(t.split(" ").map(escape).join("\\s+"), "i");
+            if (!patterns.some(p => p.source === re.source)) patterns.push(re);
+        }
+        if (!patterns.length) return null;
+        const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode: (n) => (n.parentElement && /^(SCRIPT|STYLE)$/.test(n.parentElement.tagName))
+                ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+        });
+        let node;
+        while ((node = walker.nextNode())) {
+            for (const re of patterns) {
+                const m = re.exec(node.nodeValue || "");
+                if (!m) continue;
+                const span = root.ownerDocument.createElement("span");
+                span.className = "step-popover-mention";
+                span.style.backgroundColor = "rgba(190, 190, 163, 0.16)";
+                span.style.borderRadius = "3px";
+                span.style.boxShadow = "0 0 0 2px rgba(190, 190, 163, 0.14)";
+                try {
+                    const after = node.splitText(m.index);
+                    after.splitText(m[0].length);
+                    after.parentNode.replaceChild(span, after);
+                    span.appendChild(after);
+                } catch (e) { return null; }
+                if (scroller && scroller.scrollHeight > scroller.clientHeight) {
+                    const cr = scroller.getBoundingClientRect();
+                    const sr = span.getBoundingClientRect();
+                    scroller.scrollTop += (sr.top - cr.top) - Math.max(0, (scroller.clientHeight - sr.height) / 2);
+                }
+                return span;
+            }
+        }
+        return null;
+    }
+
     stripLinkTooltips(root, sourcePath) {
         root.querySelectorAll("a").forEach(a => {
             const ext = a.classList.contains("external-link");

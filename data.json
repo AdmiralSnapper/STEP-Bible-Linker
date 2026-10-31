@@ -12,13 +12,14 @@
     "ESV"
   ],
   "noteLinesColour": "#226b37",
-  "crosslinkColour": "#3d8fe6",
   "typedColours": {
     "Notes": "#3b44c4",
     "Messiah": "#c05761",
-    "Day of the LORD": "#b99437"
+    "Day of the LORD": "#b99437",
+    "Sermons": "#ac4906"
   },
   "noteTypesFolder": "Second Brain/Bible",
+  "crosslinkColour": "#3d8fe6",
   "useLocalUrlPrefix": true,
   "enabledVersions": [
     "ESV",

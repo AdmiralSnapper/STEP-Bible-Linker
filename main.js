@@ -2082,7 +2082,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             this._hoverRefKey = null;
                             this.clearAllStepHighlights();
                         }
-                    }, 250);
+                    }, 400);
                 }, { once: true });
             });
 
@@ -4047,9 +4047,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // Crosslinks (refs inside note content) are hollow:
                                     // stroke only, a little wider so the stroke reads.
                                     ".step-note-bar[data-cross='1'] { width: 5px; background: transparent; }",
-                                    ".step-note-bar:hover { opacity: 1; width: 6px; }",
-                                    // Hovering a ref also widens the note section's own bar.
-                                    ".step-note-bar.step-bar-expand { opacity: 1; width: 6px; }",
+                                    // A typed bar widens the moment the pointer is on
+                                    // it. data-hold carries the same widened width so
+                                    // the bar stays wide while its popover is open —
+                                    // including after the pointer moves onto the
+                                    // popover, or onto another bar.
+                                    ".step-note-bar[data-typed='1']:hover { width: 6px; opacity: 1; }",
+                                    ".step-note-bar[data-typed='1'][data-cross='1']:hover { width: 7px; opacity: 1; }",
+                                    ".step-note-bar[data-hold='1'] { opacity: 1; width: 6px; }",
+                                    ".step-note-bar[data-hold='1'][data-cross='1'] { width: 7px; }",
                                     ".verse.step-ref-hover {",
                                     "  background-color: rgba(190, 190, 163, 0.19) !important;",
                                     "  outline: 1px solid #cacda600 !important;",
@@ -4290,6 +4296,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             window.__stepHl = { els: els, bars: [] };
                         };
 
+                        // Host-driven bar widening. The host sends the ids of every
+                        // note whose popover is currently open; a bar is wide exactly
+                        // while its id is in that list, so the popout and the bar
+                        // appear and disappear together.
+                        window.__stepHoldBars = function(ids) {
+                            const set = new Set(Array.isArray(ids) ? ids : []);
+                            document.querySelectorAll(".step-note-bar[data-hold='1']").forEach(b => {
+                                if (!set.has(b.dataset.note || "")) b.removeAttribute("data-hold");
+                            });
+                            set.forEach(id => {
+                                const b = document.querySelector('.step-note-bar[data-note="' + CSS.escape(id) + '"]');
+                                if (b) b.setAttribute("data-hold", "1");
+                            });
+                        };
+
                         // Hit-test for the plugin-side hover popover: which bar sits
                         // under this point? Coordinates are viewport-relative.
                         window.__stepBarAt = function(x, y) {
@@ -4521,14 +4542,26 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this._barPinned = false;
 
         // Popover styling (header + body), theme-aware via Obsidian variables.
-        if (!document.getElementById("step-bar-popover-style")) {
-            const st = document.createElement("style");
-            st.id = "step-bar-popover-style";
+        {
+            // Reuse the node if a previous load left one behind, but always
+            // rewrite its text: a stale stylesheet from an older build is how
+            // the box ended up with no background at all.
+            let st = document.getElementById("step-bar-popover-style");
+            if (!st) {
+                st = document.createElement("style");
+                st.id = "step-bar-popover-style";
+                document.head.appendChild(st);
+            }
             st.textContent = [
-                ".step-bar-popover { width: max-content; max-width: 560px; min-width: 240px; max-height: 60vh; overflow-y: auto; font-size: 13px; }",
+                // The box used to be Obsidian's HoverPopover, which supplied the
+                // theme surface. Now it's our own div, so we draw it ourselves.
+                ".step-bar-popover { width: max-content; max-width: 560px; min-width: 240px; max-height: 30vh; overflow: hidden; font-size: 13px;" +
+                "  background: var(--background-primary); color: var(--text-normal);" +
+                "  border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m, 8px);" +
+                "  box-shadow: 0 4px 18px rgba(0,0,0,0.28); }",
                 ".step-bar-popover .step-bar-popover-header {",
                 "  position: relative; display: flex; flex-direction: column; gap: 1px;",
-                "  padding: 8px 44px 6px 12px; margin-bottom: 0; border-bottom: 1px solid var(--background-modifier-border); }",
+                "  padding: 8px 44px 6px 12px; margin-bottom: 0; flex: 0 0 auto; border-bottom: 1px solid var(--background-modifier-border); }",
                 ".step-bar-popover .step-bar-popover-title {",
                 "  font-weight: 700; font-size: 15px; font-family: var(--font-interface); color: var(--text-normal); }",
                 ".step-bar-popover .step-bar-popover-ref {",
@@ -4541,29 +4574,47 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 "  width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }",
                 ".step-bar-popover .step-bar-popover-btn:hover { background: rgba(255,255,255,0.25); }",
                 ".step-bar-popover .step-bar-popover-btn svg { width: 16px; height: 16px; }",
-                ".step-bar-popover .step-bar-popover-body { padding: 8px 14px 10px 14px; }",
+                ".step-bar-popover .step-bar-popover-body { padding: 8px 14px 10px 14px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }",
             ].join("\n");
-            document.head.appendChild(st);
         }
 
         const dispose = (entry) => {
             if (!entry) return;
             const pop = entry.pop;
+            clearTimeout(this._hoverCloseTimer);
+            if (!entry.pinned) this._pointerInPopover = false;
+            // Drop the slot first, then sync: the bar narrows on the same tick
+            // the popover is torn down.
+            if (entry.pinned) {
+                if (this._pinnedPop === entry) this._pinnedPop = null;
+                this._barPinned = false;
+            } else if (this._hoverPop === entry) this._hoverPop = null;
             try { (entry.hide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
+            // Narrow the bars in the same tick the popover goes away.
+            this._syncBarHold();
             if (entry.anchorEl && entry.anchorEl.parentNode) entry.anchorEl.remove();
             if (!entry.pinned) {
                 // No fade-out: a hover note goes the instant the bar is left.
                 try { if (entry.body) { entry.body.style.display = "none"; entry.body.remove(); } } catch (e) {}
             }
             if (entry.pinned) {
-                if (this._pinnedPop === entry) this._pinnedPop = null;
-                this._barPinned = false;
                 // Closing the pinned note releases the lit passage.
                 try {
                     if (this._barWebview && this._barWebview.executeJavaScript)
                         this._barWebview.executeJavaScript(`window.__stepHighlight && window.__stepHighlight("")`).catch(() => {});
                 } catch (e) {}
-            } else if (this._hoverPop === entry) this._hoverPop = null;
+            }
+        };
+        // Keep the guest's widened bars in step with the open popovers.
+        this._syncBarHold = () => {
+            const ids = [];
+            if (this._pinnedPop && this._pinnedPop.id) ids.push(this._pinnedPop.id);
+            if (this._hoverPop && this._hoverPop.id) ids.push(this._hoverPop.id);
+            const wv = this._barWebview;
+            if (!wv || !wv.executeJavaScript) return;
+            try {
+                wv.executeJavaScript(`window.__stepHoldBars && window.__stepHoldBars(${JSON.stringify(ids)})`).catch(() => {});
+            } catch (e) {}
         };
         const closeHover = () => dispose(this._hoverPop);
         const closePinned = () => dispose(this._pinnedPop);
@@ -4572,6 +4623,41 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this._closeHoverPopover = closeHover;
         this._closePinnedPopover = closePinned;
         this._barOpenTimer = null;
+
+        // Moving between a bar and its popover crosses a gap, and the popover
+        // sits outside the webview (so the guest reports "no bar"). Close a
+        // hover note only after a short grace period, and never while the
+        // pointer is actually over the popover.
+        this._lastBarHit = null;
+        this._pointerInPopover = false;
+        this._lastPointer = null;
+        this.registerDomEvent(document, "mousemove", (e) => {
+            this._lastPointer = { x: e.clientX, y: e.clientY };
+        }, { passive: true, capture: true });
+        // True when the tracked pointer sits inside the open hover popover.
+        // Geometry is used instead of enter/leave flags: a flag can stay stuck
+        // when the element is removed or re-rendered under the cursor, which
+        // made notes linger for seconds.
+        const pointerOverHoverPop = () => {
+            if (!this._hoverPop) return false;
+            const c = document.querySelector(".step-bar-popover:not(.step-bar-popover-pinned)");
+            if (!c) return false;
+            const p = this._lastPointer;
+            if (!p) return this._pointerInPopover;
+            const r = c.getBoundingClientRect();
+            return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
+        };
+        this._scheduleHoverClose = () => {
+            clearTimeout(this._hoverCloseTimer);
+            this._hoverCloseTimer = setTimeout(() => {
+                if (pointerOverHoverPop()) return;
+                if (this._lastBarHit) return;
+                closeHover();
+                if (!this._barPinned && this._barWebview) {
+                    try { this._barWebview.executeJavaScript(`window.__stepHighlight && window.__stepHighlight("")`).catch(() => {}); } catch (e) {}
+                }
+            }, 90);
+        };
 
         // Called from the webview's ipc-message listener. A null hit means the
         // pointer is over no bar: close any open popover. A typed hit opens a
@@ -4585,12 +4671,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 webviewEl.executeJavaScript(`window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")})`).catch(() => {});
             };
             if (!hit || !hit.typed) {
+                // Cancel any pending open: a timer that fires after the pointer
+                // has left would pop a note up with no bar hovered under it.
+                clearTimeout(this._barOpenTimer);
+                this._lastBarHit = null;
                 // While pinned, moving off the bar must not close the pinned
                 // note — but a transient hover note still goes away.
-                closeHover();
-                if (!this._barPinned) pushHighlight("");
+                this._scheduleHoverClose();
                 return;
             }
+            this._lastBarHit = hit;
+            clearTimeout(this._hoverCloseTimer);
             pushHighlight(hit.id);
             // Already showing this bar (pinned or hovering): nothing to do.
             if (this._pinnedPop && this._pinnedPop.id === hit.id) { closeHover(); return; }
@@ -4618,12 +4709,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // resizable from the corner.
         this.openBarPopover = async (webviewEl, hit, pinned) => {
             const box = webviewEl.getBoundingClientRect();
-            if (!box.width) { if (!pinned) closePopover(); return; }
+            if (!box.width) { if (!pinned) closePopover(); this._syncBarHold(); return; }
 
             // Content from the cached typed scan (same ids the page uses)
             const td = this._noteDotsCache && this._noteDotsCache.typedData;
             const info = td && td.contentOf && td.contentOf[hit.id];
-            if (!info) return;
+            if (!info) { this._syncBarHold(); return; }
             const base = hit.id.split(":")[1];
             const folder = (this.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
             // Typed entries live in the notes folder; ordinary notes record
@@ -4643,38 +4734,59 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             document.body.appendChild(anchorEl);
 
             let pop = null;
-            const { HoverPopover } = require("obsidian");
-            const leaf = this.app.workspace.getLeavesOfType("webviewer")
-                .find(l => l.view && l.view.containerEl && l.view.containerEl.contains(webviewEl));
-            const parent = (leaf && leaf.view) || this;
-            try { pop = new HoverPopover(parent, anchorEl, 0); } catch (e) { pop = null; }
-            if (!pop) { try { pop = new HoverPopover({ parent: parent, target: anchorEl, waitTime: 0 }); } catch (e) { pop = null; } }
-            if (!pop) { anchorEl.remove(); return; }
-
-            const body = pop.hoverEl || pop.contentEl || pop.el;
-            if (!body) { pop.hide(); anchorEl.remove(); return; }
+            // Own element, not Obsidian's HoverPopover. HoverPopover keeps a
+            // single shared hover element for the whole app and hides itself on
+            // mouseleave; that closed pinned notes when the pointer moved off
+            // them and made two independent notes impossible. A plain div we
+            // own is torn down only when we say so.
+            const body = document.createElement("div");
+            pop = {
+                hoverEl: body,
+                hide() { try { body.remove(); } catch (e) {} },
+                position() {},
+                show() {}
+            };
+            document.body.appendChild(body);
             body.addClass("step-bar-popover");
             // A transient hover note must stack above the pinned one.
             body.style.zIndex = pinned ? "1000000" : "1000002";
-            try { if (getComputedStyle(body).position === "static") body.style.position = "relative"; } catch (e) {}
+            // Anchor at the top right of the webview: right-aligned by pulling
+            // the box back over its own width.
+            body.style.position = "fixed";
+            body.style.left = (box.right - 8) + "px";
+            body.style.top = (box.top + 8) + "px";
+            body.style.right = "auto";
+            body.style.bottom = "auto";
+            body.style.transform = "translateX(-100%)";
             // Register immediately: any later failure must still leave the
             // popover closeable (otherwise the X does nothing).
             const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body };
             if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
             else this._hoverPop = entry;
-            body.style.maxHeight = "60vh";
-            // Width hugs the content; the height hugs it too, capped to the
-            // viewport. Pinned and unpinned share the same measured height so
-            // the box doesn't jump size when it's fixed.
+            this._barWebview = webviewEl;
+            this._syncBarHold();
+            body.style.maxHeight = "30vh";
+            // Width hugs the content; height is a fixed length, scrolled
+            // inside. Pinned and unpinned are the same size.
             body.style.width = "max-content";
-            body.style.maxWidth = "560px";
-            body.style.minWidth = "240px";
-            body.style.maxHeight = "60vh";
             // HoverPopover's hoverEl is a flex row by default; force a column
             // so the title sits above the text.
             body.style.display = "flex";
             body.style.flexDirection = "column";
             body.style.alignItems = "stretch";
+            // Track whether the pointer is inside the popover: leaving a bar for
+            // its own note must not close it.
+            if (!pinned) {
+                this._pointerInPopover = false;
+                body.addEventListener("mouseenter", () => {
+                    this._pointerInPopover = true;
+                    clearTimeout(this._hoverCloseTimer);
+                });
+                body.addEventListener("mouseleave", () => {
+                    this._pointerInPopover = false;
+                    this._scheduleHoverClose();
+                });
+            }
 
             // Moving the pointer onto the popover no longer lights anything in
             // STEP: the passage highlight belongs to the bar hover alone.
@@ -4821,6 +4933,23 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             const mdEl = body.createDiv({ cls: "step-bar-popover-body" });
             mdEl.style.padding = "8px 14px 10px 14px";
+            // The markdown body is its own scroll container: the title block
+            // above it stays put and the note scrolls underneath. Without
+            // min-height:0 a flex child refuses to shrink, so the box grows
+            // instead of scrolling and the wheel does nothing.
+            mdEl.style.flex = "1 1 auto";
+            mdEl.style.minHeight = "0";
+            mdEl.style.overflowY = "auto";
+            mdEl.style.overflowX = "hidden";
+            mdEl.style.overscrollBehavior = "contain";
+            // Wheel over the popover scrolls the note even if the pointer is
+            // over the title block or the box's padding.
+            body.addEventListener("wheel", (ev) => {
+                if (!mdEl.style.display || mdEl.style.display === "none") return;
+                if (mdEl.scrollHeight <= mdEl.clientHeight) return;
+                mdEl.scrollTop += ev.deltaY;
+                ev.preventDefault();
+            }, { passive: false });
             try {
                 await MarkdownRenderer.render(this.app, info.text || "", mdEl, sourcePath, this);
             } catch (e) {
@@ -4854,16 +4983,59 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const mentions = this.findMentions(mdEl, info.searchRef, needles);
 
             // Match heights: measure the natural content height (header + body)
-            // and use it for both the hover state and the pinned state, capped
-            // at 60% of the viewport. Below the cap the content scrolls.
-            body.style.height = "auto";
-            let naturalH = body.scrollHeight;
-            // A popover measured before layout lands can report 0; fall back to
-            // a sane default so the box never collapses.
-            if (!naturalH || naturalH < 60) naturalH = 210;
-            const fittedH = Math.min(naturalH, Math.round(window.innerHeight * 0.6));
-            body.style.height = fittedH + "px";
-            body.style.overflowY = "auto";
+            // at the popover's final width and use it for both the hover state
+            // and the pinned state, capped at 60% of the viewport. Below the cap
+            // the content scrolls.
+            //
+            // The width has to settle first: `max-content` is only resolved by
+            // layout, and the markdown inside wraps to whatever width it ends up
+            // with. Measuring before that produces a height for the wrong wrap
+            // (far too tall when the box is measured narrow), which is why some
+            // notes came out much longer than their content. Measure with the
+            // height/max-height off, read the body's own scrollHeight, then cap.
+            // Fixed vertical length: half the old 60vh cap. Content past it
+            // scrolls inside; the box never grows to fit the whole note.
+            const capH = () => Math.max(180, Math.round(window.innerHeight * 0.3));
+            let fittedH = 0;
+            const fitHeight = () => {
+                // Once the user has dragged the box taller, their height wins.
+                if (body.dataset.stepUserH) return;
+                // A collapsed note (title bar only) has no content to size to.
+                if (body.classList.contains("step-bar-popover-collapsed")) {
+                    body.style.height = "auto";
+                    body.style.maxHeight = "none";
+                    body.style.overflow = "hidden";
+                    return;
+                }
+                fittedH = capH();
+                body.style.maxHeight = fittedH + "px";
+                body.style.height = fittedH + "px";
+                body.style.overflow = "hidden";
+                // One scroller only, and it is the markdown element: two nested
+                // scrollbars fought each other and swallowed the wheel.
+                body.style.overflowY = "hidden";
+            };
+            fitHeight();
+            // Re-measure once layout has settled, in case the initial pass ran
+            // before the width resolved (that produced the over-tall boxes).
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                try {
+                    fitHeight();
+                    if (pinned && !collapsedPopover) body.style.height = fittedH + "px";
+                    if (mentions.length) scrollToMention(0);
+                } catch (e) {}
+            }));
+            // Late layout (webfonts, images, markdown embeds) can change the
+            // wrapped height after the first two frames; settle the size again so
+            // a slow-loading note doesn't stay measured at the fallback height.
+            window.setTimeout(() => {
+                try {
+                    if (!body.isConnected) return;
+                    fitHeight();
+                    if (pinned && !collapsedPopover) body.style.height = fittedH + "px";
+                    if (mentions.length) scrollToMention(0);
+                } catch (e) {}
+            }, 180);
 
             // Scroll to the first mention, and (pinned) offer a counter button
             // to step through the rest.
@@ -4961,8 +5133,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     if (!needle) return;
                     while (leftover.includes(needle)) leftover = leftover.split(needle).join("");
                 });
-                // Drop punctuation-only remains ("|", "—", ":") too.
-                leftover = leftover.replace(/[|\-–—:;,·•·]/g, "");
+                // Drop punctuation-only remains ("|", "—", "()", ":") too.
+                leftover = leftover.replace(/[|\-–—:;,·•·()\[\]{}"“”'’«»]/g, "");
                 if (!leftover) {
                     mdEl.style.display = "none";
                     mdEl.style.padding = "0";
@@ -4975,19 +5147,34 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // Keep it where it is, movable and resizable, and stop the
                 // HoverPopover from hiding itself when the mouse leaves it.
                 body.classList.add("step-bar-popover-pinned");
+                // HoverPopover re-positions its element on mousemove via a
+                // transform; that fights the drag. Neutralise both hooks.
+                try { if (typeof pop.position === "function") pop.position = () => {}; } catch (e) {}
+                try { if (typeof pop.show === "function") pop.show = () => {}; } catch (e) {}
                 const r = anchorEl.getBoundingClientRect();
                 body.style.position = "fixed";
+                // Obsidian positions hover popovers with a CSS transform, which
+                // would override left/top entirely and make the box refuse to
+                // move. Take the transform off so the drag can use left/top.
+                body.style.transform = "none";
+                body.style.translate = "0 0";
+                body.style.maxHeight = capH() + "px";
+                body.style.inset = "auto";
                 body.style.zIndex = "1000000";
                 body.style.left = Math.max(4, r.left - body.offsetWidth) + "px";
                 body.style.top = r.top + "px";
                 body.style.right = "auto";
-                body.style.overflow = "auto";
+                body.style.overflow = "hidden";
                 body.style.minWidth = "240px";
                 // Keep the measured height from the hover state (do not force a
-                // fixed 210px), so pinning doesn't change the box's size.
+                // fixed 210px), so pinning doesn't change the box's size. The
+                // height must stay pinned too: with maxHeight:none the box just
+                // grows to fit the whole note and there is nothing left to
+                // scroll. Fixed height + the body's own scroller = scrollable.
                 body.style.minHeight = collapsedPopover ? "0" : "80px";
-                body.style.maxHeight = "none";
                 body.style.maxWidth = "560px";
+                body.style.maxHeight = collapsedPopover ? "none" : capH() + "px";
+                if (!collapsedPopover) body.style.height = capH() + "px";
 
                 // Vertical-only resize handle along the bottom edge: drag down
                 // to make the box taller (content scrolls inside).
@@ -5008,30 +5195,64 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 });
                 grip.addEventListener("pointermove", (ev) => {
                     if (!vresize) return;
+                    body.dataset.stepUserH = "1";
                     body.style.height = Math.max(80, vresize.h + ev.clientY - vresize.sy) + "px";
                 });
                 const endV = () => { vresize = null; };
                 grip.addEventListener("pointerup", endV);
                 grip.addEventListener("pointercancel", endV);
-                const origHide = pop.hide.bind(pop);
-                pop.hide = () => {}; // pinned: only the close button closes it
-                entry.hide = origHide;
-                this._barPopoverHide = origHide;
+                entry.hide = () => { try { body.remove(); } catch (e) {} };
 
-                // Drag by the header
+                // Drag by the header. Listeners go on document while dragging:
+                // element capture is unreliable here because Obsidian's
+                // HoverPopover owns the element and can re-render it mid-drag.
                 let drag = null;
-                header.addEventListener("pointerdown", (ev) => {
-                    if (ev.target.closest("button")) return;
-                    drag = { sx: ev.clientX, sy: ev.clientY, l: body.offsetLeft, t: body.offsetTop };
-                    header.setPointerCapture(ev.pointerId);
-                });
-                header.addEventListener("pointermove", (ev) => {
+                const onDragMove = (ev) => {
                     if (!drag) return;
+                    if (ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
                     body.style.left = Math.max(0, drag.l + ev.clientX - drag.sx) + "px";
                     body.style.top = Math.max(0, drag.t + ev.clientY - drag.sy) + "px";
+                    ev.preventDefault();
+                };
+                const onDragEnd = (ev) => {
+                    if (drag && ev && ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
+                    drag = null;
+                    document.removeEventListener("pointermove", onDragMove, true);
+                    document.removeEventListener("pointerup", onDragEnd, true);
+                    document.removeEventListener("pointercancel", onDragEnd, true);
+                    window.removeEventListener("pointermove", onDragMove, true);
+                    window.removeEventListener("pointerup", onDragEnd, true);
+                    window.removeEventListener("pointercancel", onDragEnd, true);
+                };
+                header.style.cursor = "move";
+                header.style.touchAction = "none";
+                header.addEventListener("pointerdown", (ev) => {
+                    if (ev.target.closest("button")) return;
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    const r = body.getBoundingClientRect();
+                    // The box is right-aligned with translateX(-100%); drop the
+                    // transform before dragging or it jumps a full width left.
+                    body.style.transform = "none";
+                    body.style.left = r.left + "px";
+                    body.style.top = r.top + "px";
+                    drag = { sx: ev.clientX, sy: ev.clientY, l: r.left, t: r.top, pid: ev.pointerId };
+                    // Element capture first (the pattern the resize grip uses
+                    // and which works); document/window listeners only as a
+                    // fallback for when the popover swallows pointer events.
+                    try { header.setPointerCapture(ev.pointerId); } catch (e) {}
+                    document.addEventListener("pointermove", onDragMove, true);
+                    document.addEventListener("pointerup", onDragEnd, true);
+                    document.addEventListener("pointercancel", onDragEnd, true);
+                    window.addEventListener("pointermove", onDragMove, true);
+                    window.addEventListener("pointerup", onDragEnd, true);
+                    window.addEventListener("pointercancel", onDragEnd, true);
+                    onDragMove(ev);
                 });
-                header.addEventListener("pointerup", () => { drag = null; });
-                header.addEventListener("pointercancel", () => { drag = null; });
+                header.addEventListener("pointermove", onDragMove);
+                header.addEventListener("pointerup", onDragEnd);
+                header.addEventListener("pointercancel", onDragEnd);
+                header.addEventListener("lostpointercapture", onDragEnd);
             }
 
             if (collapsedPopover) {
@@ -5055,7 +5276,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
 
             entry.anchorEl = anchorEl;
-            entry.hide = this._barPopoverHide || null;
 
             // Obsidian sets its own stacking on show; re-assert ours a frame
             // later so a hover note always sits above a pinned one.
@@ -5066,7 +5286,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         };
 
         // Leaving the window kills any open (unpinned) popover
-        this.registerDomEvent(document, "mouseleave", () => closeHover());
+        this.registerDomEvent(document, "mouseleave", () => this._scheduleHoverClose());
     }
 
     // Kill Obsidian's hover tooltips on links rendered into a custom panel.

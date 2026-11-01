@@ -4582,6 +4582,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (!entry) return;
             const pop = entry.pop;
             clearTimeout(this._hoverCloseTimer);
+            this._barDragging = false;
             if (!entry.pinned) this._pointerInPopover = false;
             // Drop the slot first, then sync: the bar narrows on the same tick
             // the popover is torn down.
@@ -4629,6 +4630,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // hover note only after a short grace period, and never while the
         // pointer is actually over the popover.
         this._lastBarHit = null;
+        this._barDragging = false;
         this._pointerInPopover = false;
         this._lastPointer = null;
         this.registerDomEvent(document, "mousemove", (e) => {
@@ -4664,6 +4666,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // popover after a short hover delay (later messages cancel the timer).
         this.handleBarHoverMessage = (webviewEl, hit) => {
             this._barWebview = webviewEl;
+            // Mid-drag the guest still reports whatever bar the box happens to
+            // sit over; rebuilding or closing popovers then would move the box
+            // out from under the pointer and kill the drag.
+            if (this._barDragging) return;
             // Push highlight state into the guest: the verses stay lit while
             // the mouse is on the bar OR on the popover (guest can't see the
             // popover, the host bridges it).
@@ -5206,53 +5212,76 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // Drag by the header. Listeners go on document while dragging:
                 // element capture is unreliable here because Obsidian's
                 // HoverPopover owns the element and can re-render it mid-drag.
+                // Drag the box. Deliberately capture-free: element pointer
+                // capture can be lost the moment anything re-renders the
+                // header (which happens on notes whose popover body is rebuilt,
+                // e.g. one referencing its own section), and a spurious
+                // `lostpointercapture` used to end the drag on its first tick.
+                // Everything runs off window-level capture listeners instead.
                 let drag = null;
+                let dragRaf = false;
                 const onDragMove = (ev) => {
                     if (!drag) return;
                     if (ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
-                    body.style.left = Math.max(0, drag.l + ev.clientX - drag.sx) + "px";
-                    body.style.top = Math.max(0, drag.t + ev.clientY - drag.sy) + "px";
-                    ev.preventDefault();
+                    const dx = ev.clientX - drag.sx;
+                    const dy = ev.clientY - drag.sy;
+                    if (!dx && !dy) return;
+                    drag.moved = true;
+                    body.style.left = Math.max(0, drag.l + dx) + "px";
+                    body.style.top = Math.max(0, drag.t + dy) + "px";
                 };
                 const onDragEnd = (ev) => {
-                    if (drag && ev && ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
+                    if (!drag) return;
+                    // Ignore a pointerup/cancel that belongs to another pointer.
+                    if (ev && ev.pointerId !== undefined && drag.pid !== undefined &&
+                        ev.pointerId !== drag.pid && ev.type !== "blur") return;
+                    // A pointerup while the button is still reported down, or a
+                    // pointercancel we did not ask for, must not kill the drag.
+                    if (ev && ev.type === "pointerup" && ev.buttons) return;
                     drag = null;
-                    document.removeEventListener("pointermove", onDragMove, true);
-                    document.removeEventListener("pointerup", onDragEnd, true);
-                    document.removeEventListener("pointercancel", onDragEnd, true);
+                    dragRaf = false;
+                    this._barDragging = false;
+                    try { body.style.userSelect = ""; body.style.cursor = "move"; } catch (e) {}
                     window.removeEventListener("pointermove", onDragMove, true);
                     window.removeEventListener("pointerup", onDragEnd, true);
                     window.removeEventListener("pointercancel", onDragEnd, true);
+                    window.removeEventListener("blur", onBlur, true);
                 };
+                const onBlur = () => onDragEnd({ type: "blur" });
                 header.style.cursor = "move";
                 header.style.touchAction = "none";
-                header.addEventListener("pointerdown", (ev) => {
-                    if (ev.target.closest("button")) return;
-                    ev.preventDefault();
-                    ev.stopPropagation();
+                header.style.userSelect = "none";
+                body.style.cursor = "move";
+                const startDrag = (ev) => {
+                    if (drag) return;
+                    if (ev.button !== undefined && ev.button !== 0) return;
+                    const t = ev.target;
+                    if (t && t.closest && t.closest("button, a, .step-bar-popover-grip")) return;
                     const r = body.getBoundingClientRect();
                     // The box is right-aligned with translateX(-100%); drop the
                     // transform before dragging or it jumps a full width left.
                     body.style.transform = "none";
                     body.style.left = r.left + "px";
                     body.style.top = r.top + "px";
-                    drag = { sx: ev.clientX, sy: ev.clientY, l: r.left, t: r.top, pid: ev.pointerId };
-                    // Element capture first (the pattern the resize grip uses
-                    // and which works); document/window listeners only as a
-                    // fallback for when the popover swallows pointer events.
-                    try { header.setPointerCapture(ev.pointerId); } catch (e) {}
-                    document.addEventListener("pointermove", onDragMove, true);
-                    document.addEventListener("pointerup", onDragEnd, true);
-                    document.addEventListener("pointercancel", onDragEnd, true);
+                    drag = { sx: ev.clientX, sy: ev.clientY, l: r.left, t: r.top, pid: ev.pointerId, moved: false };
+                    // Stop hover handling for the duration of the drag.
+                    this._barDragging = true;
+                    clearTimeout(this._barOpenTimer);
+                    clearTimeout(this._hoverCloseTimer);
+                    try { body.style.userSelect = "none"; body.style.cursor = "grabbing"; } catch (e) {}
+                    // Nothing else in Obsidian gets to see this press: link
+                    // handling, page preview and the editor all bail out.
+                    try { ev.preventDefault(); } catch (e) {}
+                    try { ev.stopPropagation(); } catch (e) {}
                     window.addEventListener("pointermove", onDragMove, true);
                     window.addEventListener("pointerup", onDragEnd, true);
                     window.addEventListener("pointercancel", onDragEnd, true);
-                    onDragMove(ev);
-                });
-                header.addEventListener("pointermove", onDragMove);
-                header.addEventListener("pointerup", onDragEnd);
-                header.addEventListener("pointercancel", onDragEnd);
-                header.addEventListener("lostpointercapture", onDragEnd);
+                    window.addEventListener("blur", onBlur, true);
+                };
+                // One entry point only. A single capture listener, so a press
+                // fires startDrag exactly once (the old body+header pair fired
+                // it twice and the second pass could clear the drag state).
+                body.addEventListener("pointerdown", startDrag, true);
             }
 
             if (collapsedPopover) {

@@ -3810,6 +3810,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     if (!text.includes("reference=")) continue;
 
                     let refN = 0;
+                    // A reference repeated in the same note draws a single bar;
+                    // the popover's mention stepper covers the repeated instances.
+                    const seenRefs = new Set();
                     for (const [, linkText, , refRaw] of text.matchAll(linkRegex)) {
                         // One id per reference in the file, so every reference draws
                         // its own bar instead of one bar stretching over all of them.
@@ -3834,6 +3837,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const canonL = toCanonical(left);
                         const canonR = right ? toCanonical(right) : null;
                         if (!canonL) continue;
+
+                        // Deduplicate on the resolved range, not the spelling,
+                        // so "Genesis.1.1" and "Genesis.1.1-1.1" share one bar.
+                        const refKey = canonL + (canonR ? "-" + canonR : "");
+                        if (seenRefs.has(refKey)) continue;
+                        seenRefs.add(refKey);
 
                         const [bookL, chapL, verseL] = canonL.split(".");
 
@@ -4306,6 +4315,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 lastHover = key;
                                 console.log("__STEPBAR__" + JSON.stringify(hit));
                             }, { passive: true });
+                            // Cursor leaving the page entirely never fires a
+                            // mousemove, so report the exit explicitly.
+                            const reportLeave = () => {
+                                if (!lastHover) return;
+                                lastHover = null;
+                                console.log("__STEPBAR__null");
+                            };
+                            document.addEventListener("mouseleave", reportLeave, { passive: true });
+                            window.addEventListener("mouseout", (e) => {
+                                if (!e.relatedTarget) reportLeave();
+                            }, { passive: true });
                             // Clicking a bar pins the popover (host-side)
                             document.addEventListener("click", (e) => {
                                 const hit = window.__stepBarAt
@@ -4494,8 +4514,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         if (this._barHoverReady) return;
         this._barHoverReady = true;
         this._barHoverTimer = null;
-        this._barPopover = null;
-        this._barPopoverId = null;
+        // Two slots so a pinned note and a hover note can coexist: the hover
+        // box stacks above the pinned one.
+        this._pinnedPop = null;
+        this._hoverPop = null;
         this._barPinned = false;
 
         // Popover styling (header + body), theme-aware via Obsidian variables.
@@ -4524,19 +4546,31 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             document.head.appendChild(st);
         }
 
-        const closePopover = () => {
-            if (this._barPopover) {
-                const pop = this._barPopover;
-                try { (this._barPopoverHide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
-                if (this._barPopover.anchorEl && this._barPopover.anchorEl.parentNode)
-                    this._barPopover.anchorEl.remove();
-                try { (this._barWebview || {}).executeJavaScript && this._barWebview.executeJavaScript(`window.__stepHighlight && window.__stepHighlight("")`).catch(() => {}); } catch (e) {}
-                this._barPopover = null;
-                this._barPopoverId = null;
-                this._barPopoverHide = null;
+        const dispose = (entry) => {
+            if (!entry) return;
+            const pop = entry.pop;
+            try { (entry.hide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
+            if (entry.anchorEl && entry.anchorEl.parentNode) entry.anchorEl.remove();
+            if (!entry.pinned) {
+                // No fade-out: a hover note goes the instant the bar is left.
+                try { if (entry.body) { entry.body.style.display = "none"; entry.body.remove(); } } catch (e) {}
             }
+            if (entry.pinned) {
+                if (this._pinnedPop === entry) this._pinnedPop = null;
+                this._barPinned = false;
+                // Closing the pinned note releases the lit passage.
+                try {
+                    if (this._barWebview && this._barWebview.executeJavaScript)
+                        this._barWebview.executeJavaScript(`window.__stepHighlight && window.__stepHighlight("")`).catch(() => {});
+                } catch (e) {}
+            } else if (this._hoverPop === entry) this._hoverPop = null;
         };
+        const closeHover = () => dispose(this._hoverPop);
+        const closePinned = () => dispose(this._pinnedPop);
+        const closePopover = () => { closeHover(); closePinned(); };
         this._closeBarPopover = closePopover;
+        this._closeHoverPopover = closeHover;
+        this._closePinnedPopover = closePinned;
         this._barOpenTimer = null;
 
         // Called from the webview's ipc-message listener. A null hit means the
@@ -4551,13 +4585,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 webviewEl.executeJavaScript(`window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")})`).catch(() => {});
             };
             if (!hit || !hit.typed) {
-                // While pinned, moving off the bar must not close the popover
-                if (!this._barPinned) { closePopover(); pushHighlight(""); }
+                // While pinned, moving off the bar must not close the pinned
+                // note — but a transient hover note still goes away.
+                closeHover();
+                if (!this._barPinned) pushHighlight("");
                 return;
             }
             pushHighlight(hit.id);
-            if (this._barPinned) return; // pinned popover ignores hovers
-            if (hit.id === this._barPopoverId) return; // already showing
+            // Already showing this bar (pinned or hovering): nothing to do.
+            if (this._pinnedPop && this._pinnedPop.id === hit.id) { closeHover(); return; }
+            if (this._hoverPop && this._hoverPop.id === hit.id) return;
+            clearTimeout(this._barOpenTimer);
             this._barOpenTimer = setTimeout(() => this.openBarPopover(webviewEl, hit, false), 150);
         };
 
@@ -4565,13 +4603,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this.handleBarClickMessage = (webviewEl, hit) => {
             clearTimeout(this._barOpenTimer);
             if (!hit || !hit.typed) return;
-            if (hit.id === this._barPopoverId && this._barPinned) {
+            if (this._pinnedPop && this._pinnedPop.id === hit.id) {
                 // second click on the same bar unpins and closes
-                this._barPinned = false;
-                closePopover();
+                closePinned();
+                closeHover();
                 return;
             }
-            this._barPinned = true;
+            // Clicking a different bar replaces the pinned note.
             this.openBarPopover(webviewEl, hit, true);
         };
 
@@ -4592,7 +4630,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // their real path (they can sit anywhere in the vault).
             const sourcePath = info.path || (folder ? `${folder}/${base}.md` : `${base}.md`);
 
-            closePopover();
+            // Pinning replaces the pinned note and any transient hover note;
+            // hovering keeps the pinned note where it is.
+            closeHover();
+            if (pinned) closePinned();
 
             // Anchor at the webview's top right corner
             const anchorEl = document.createElement("div");
@@ -4613,10 +4654,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const body = pop.hoverEl || pop.contentEl || pop.el;
             if (!body) { pop.hide(); anchorEl.remove(); return; }
             body.addClass("step-bar-popover");
+            // A transient hover note must stack above the pinned one.
+            body.style.zIndex = pinned ? "1000000" : "1000002";
+            try { if (getComputedStyle(body).position === "static") body.style.position = "relative"; } catch (e) {}
             // Register immediately: any later failure must still leave the
             // popover closeable (otherwise the X does nothing).
-            this._barPopover = pop;
-            this._barPopoverId = hit.id;
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body };
+            if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
+            else this._hoverPop = entry;
             body.style.maxHeight = "60vh";
             // Width hugs the content; the height hugs it too, capped to the
             // viewport. Pinned and unpinned share the same measured height so
@@ -4740,8 +4785,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             }
                         }
                     } catch (e) {}
-                    this._barPinned = false;
-                    closePopover();
+                    closePinned();
                 });
                 const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
                 closeBtn.style.background = "transparent";
@@ -4769,8 +4813,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 closeBtn.setAttribute("aria-label", "Close");
                 closeBtn.addEventListener("click", (ev) => {
                     ev.stopPropagation();
-                    this._barPinned = false;
-                    closePopover();
+                    closePinned();
                 });
             } else {
                 btns.addClass("step-bar-popover-buttons-hidden");
@@ -4885,6 +4928,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 counter.style.alignSelf = "center";
                 counter.setText(`${idx + 1}/${mentions.length}`);
                 counter.setAttribute("aria-label", "Next mention");
+                // Stepper sits left of Open/Close.
+                if (btns.firstChild !== counter) btns.insertBefore(counter, btns.firstChild);
                 counter.addEventListener("pointerdown", (ev) => ev.stopPropagation());
                 counter.addEventListener("click", (ev) => {
                     ev.stopPropagation();
@@ -4932,6 +4977,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 body.classList.add("step-bar-popover-pinned");
                 const r = anchorEl.getBoundingClientRect();
                 body.style.position = "fixed";
+                body.style.zIndex = "1000000";
                 body.style.left = Math.max(4, r.left - body.offsetWidth) + "px";
                 body.style.top = r.top + "px";
                 body.style.right = "auto";
@@ -4969,6 +5015,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 grip.addEventListener("pointercancel", endV);
                 const origHide = pop.hide.bind(pop);
                 pop.hide = () => {}; // pinned: only the close button closes it
+                entry.hide = origHide;
                 this._barPopoverHide = origHide;
 
                 // Drag by the header
@@ -5007,13 +5054,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 });
             }
 
-            this._barPopover = pop;
-            this._barPopover.anchorEl = anchorEl;
-            this._barPopoverId = hit.id;
+            entry.anchorEl = anchorEl;
+            entry.hide = this._barPopoverHide || null;
+
+            // Obsidian sets its own stacking on show; re-assert ours a frame
+            // later so a hover note always sits above a pinned one.
+            const wantZ = pinned ? "1000000" : "1000002";
+            const reassertZ = () => { try { body.style.zIndex = wantZ; } catch (e) {} };
+            reassertZ();
+            requestAnimationFrame(() => { reassertZ(); requestAnimationFrame(reassertZ); });
         };
 
         // Leaving the window kills any open (unpinned) popover
-        this.registerDomEvent(document, "mouseleave", () => { if (!this._barPinned) closePopover(); });
+        this.registerDomEvent(document, "mouseleave", () => closeHover());
     }
 
     // Kill Obsidian's hover tooltips on links rendered into a custom panel.

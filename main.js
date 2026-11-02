@@ -3963,11 +3963,23 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             if (rp) addTypedRef(rp, id);
                             entryIdOf[e.refRaw] = id;
                             typedData.colourOf[id] = colour;
-                            typedData.contentOf[id] = { label: base, refText: e.refText, refRaw: e.refRaw, text: e.content, colour: colour };
+                            // A note's own bar never marks or scrolls the note's
+                            // markdown: highlighting belongs to crosslinks only.
+                            typedData.contentOf[id] = { label: base, refText: e.refText, refRaw: e.refRaw, text: e.content, colour: colour, noMentions: true, ownCanon: canonRange(e.refRaw) };
                         });
+                        // A reference repeated inside the same note (the text
+                        // between one section's --- markers) draws a single bar,
+                        // keyed on the resolved range so "Genesis.1.1" and
+                        // "Genesis.1.1-1.1" collapse to one.
+                        const seenCross = new Map();
                         parsed.crosslinks.forEach((c, i) => {
                             const id = "X:" + base + ":" + i;
                             const rp = refPart(c.refRaw);
+                            const parentId = entryIdOf[c.target.refRaw] || null;
+                            const canon = canonRange(c.refRaw) || rp || "?" + i;
+                            const dedupeKey = (parentId || "-") + "\u0000" + canon;
+                            if (seenCross.has(dedupeKey)) return;
+                            seenCross.set(dedupeKey, id);
                             // Every reference in a note's content gets a bar,
                             // including refs scoped to the note's own section
                             // (e.g. Genesis 1.2 inside a note on Genesis 1). They
@@ -3985,11 +3997,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // was written in (the text under its parent entry),
                             // not the whole note file. The title stays the note's
                             // own reference either way.
-                            const parentId = entryIdOf[c.target.refRaw] || null;
                             const parentText = parentId && typedData.contentOf[parentId]
                                 ? typedData.contentOf[parentId].text
                                 : text;
-                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, text: parentText, colour: colour, wholeFile: true, parentId: parentId };
+                            // A crosslink pointing at the note's own reference would
+                            // otherwise mark and scroll to the note's heading line
+                            // first. That leading mention is dropped; only the
+                            // crosslink's own spot in the body is marked.
+                            const ownCanon = parentId && typedData.contentOf[parentId] ? typedData.contentOf[parentId].ownCanon : null;
+                            const dropFirstMention = !!(ownCanon && canonRange(c.refRaw) === ownCanon);
+                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, text: parentText, colour: colour, wholeFile: true, parentId: parentId, dropFirstMention: dropFirstMention };
                         });
                     }
                     if (coloursDirty) this.saveSettings();
@@ -5011,7 +5028,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 needles.push(String(r).split("-")[0]);
             });
             if (info.refText) needles.push(info.refText);
-            const mentions = this.findMentions(mdEl, info.searchRef, needles);
+            // A note's own bar shows the note unmarked, at the top. Only a
+            // crosslink marks and scrolls to its reference.
+            let mentions = info.noMentions ? [] : this.findMentions(mdEl, info.searchRef, needles);
+            // Skip the note's own heading line, which carries the same reference
+            // text as this crosslink. The crosslink's spot in the body is the
+            // first mention worth marking.
+            if (info.dropFirstMention && mentions.length) {
+                const firstBlock = mdEl.firstElementChild;
+                while (mentions.length > 1 && firstBlock &&
+                    (firstBlock === mentions[0] || firstBlock.contains(mentions[0]))) {
+                    mentions.shift();
+                }
+            }
 
             // Match heights: measure the natural content height (header + body)
             // at the popover's final width and use it for both the hover state
@@ -5108,7 +5137,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const max = sc.scrollHeight - sc.clientHeight;
                 sc.scrollTop = Math.min(max, Math.max(0, sc.scrollTop + delta));
             };
-            scrollToMention(0);
+            if (mentions.length) scrollToMention(0);
 
             if (pinned && mentions.length > 1) {
                 let idx = 0;

@@ -1715,8 +1715,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         console.log('STEP Bible Linker Loaded.');
         this.activePopover = null;
 
-        // Note-dots state (vault scan cache, 60s TTL)
+        // Note-dots state (vault scan derived from the per-file text cache)
         this._noteDotsCache = null;
+        this._noteDotsTextCache = {};
+        this._noteDotsRefreshTimer = null;
         this._localStepRunningCache = { value: null, time: 0 };
         this._lastSearchQueryRef = null;
         this.setupBarHover();
@@ -1889,6 +1891,28 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
             }
         });
+        // Saved/created/deleted/renamed notes: re-derive the bar map at once.
+        // modify fires when the editor flushes to disk (about 2s after typing
+        // stops); create/delete/rename never fire modify, so they are needed
+        // too or a new note would draw no bar until a reload.
+        this.registerEvent(this.app.vault.on("modify", (f) => {
+            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
+        }));
+        this.registerEvent(this.app.vault.on("create", (f) => {
+            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
+        }));
+        this.registerEvent(this.app.vault.on("delete", (f) => {
+            if (f && f.extension === "md") {
+                if (this._noteDotsTextCache) delete this._noteDotsTextCache[f.path];
+                this.scheduleNoteDotsRefresh();
+            }
+        }));
+        this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+            if (f && f.extension === "md") {
+                if (this._noteDotsTextCache && oldPath) delete this._noteDotsTextCache[oldPath];
+                this.scheduleNoteDotsRefresh();
+            }
+        }));
         // On tab switch
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
@@ -3759,6 +3783,31 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             console.error("STEP Plugin: executeJavaScript error:", err);
         }
     }
+    // Per-file text cache. Reading a markdown file is the costly part of a
+    // vault scan, so texts are kept keyed by mtime and only re-read when a
+    // file's mtime actually moves. Derived map data is rebuilt from these
+    // cached texts, which is cheap.
+    async readNoteText(file) {
+        if (!this._noteDotsTextCache) this._noteDotsTextCache = {};
+        const hit = this._noteDotsTextCache[file.path];
+        const mtime = file.stat && file.stat.mtime ? file.stat.mtime : 0;
+        if (hit && hit.mtime === mtime) return hit.text;
+        const text = await this.app.vault.cachedRead(file);
+        this._noteDotsTextCache[file.path] = { mtime, text };
+        return text;
+    }
+
+    // A saved note changes exactly one file, so the derived map is dropped and
+    // rebuilt from cached texts on the next injection. Debounced because a
+    // save can fire several events at once (e.g. sync + editor flush).
+    scheduleNoteDotsRefresh() {
+        if (this._noteDotsRefreshTimer) clearTimeout(this._noteDotsRefreshTimer);
+        this._noteDotsRefreshTimer = setTimeout(() => {
+            this._noteDotsRefreshTimer = null;
+            this.refreshNoteDots();
+        }, 150);
+    }
+
     // Re-scan the vault and re-inject bars into every open STEP webview.
     // Used after settings changes (e.g. type colours) so they apply immediately.
     refreshNoteDots() {
@@ -3786,9 +3835,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 return [full.replace(/\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
             };
 
-            // STEP 2: build/reuse the vault scan cache (60s TTL, cleared on rewriteStepLinks)
+            // STEP 2: derive the vault map from the per-file text cache. The
+            // cache is dropped whenever a note is saved, so there is no TTL: a
+            // rebuild only re-reads files whose mtime moved.
             const now = Date.now();
-            if (!this._noteDotsCache || now - this._noteDotsCache.time > 60000) {
+            if (!this._noteDotsCache) {
                 const map = {}; // canonicalVerse -> Set of note basenames
                 const bookRefs = {}; // bookName -> Set of note basenames (whole-book references)
                 const files = this.app.vault.getMarkdownFiles();
@@ -3806,7 +3857,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 for (const file of files) {
                     // Files in the note-types folder are typed bars, not ordinary green bars.
                     if (typedPrefix && file.path.startsWith(typedPrefix + "/")) continue;
-                    const text = await this.app.vault.cachedRead(file);
+                    const text = await this.readNoteText(file);
                     if (!text.includes("reference=")) continue;
 
                     let refN = 0;
@@ -3944,7 +3995,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             coloursDirty = true;
                         }
                         const colour = this.settings.typedColours[base];
-                        const text = await this.app.vault.cachedRead(f);
+                        const text = await this.readNoteText(f);
                         const parsed = parseTypedFile(text, base);
                         // Canonical range string for a raw reference, e.g.
                         // "Genesis.1.1" or "Genesis.1.1-Genesis.1.3" (null if unknown).

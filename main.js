@@ -3981,10 +3981,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // place the linked verse is mentioned in the note.
                             let searchRef = rp || "";
                             try { searchRef = decodeURIComponent(searchRef); } catch (e) {}
-                            // parentId: the bar of the section this reference was
-                            // written in. The parent widens whenever the crosslink
-                            // is hovered or open.
-                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, text: text, colour: colour, wholeFile: true, parentId: entryIdOf[c.target.refRaw] || null };
+                            // The popover shows only the section this reference
+                            // was written in (the text under its parent entry),
+                            // not the whole note file. The title stays the note's
+                            // own reference either way.
+                            const parentId = entryIdOf[c.target.refRaw] || null;
+                            const parentText = parentId && typedData.contentOf[parentId]
+                                ? typedData.contentOf[parentId].text
+                                : text;
+                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, text: parentText, colour: colour, wholeFile: true, parentId: parentId };
                         });
                     }
                     if (coloursDirty) this.saveSettings();

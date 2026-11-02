@@ -3968,16 +3968,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         parsed.crosslinks.forEach((c, i) => {
                             const id = "X:" + base + ":" + i;
                             const rp = refPart(c.refRaw);
-                            // scope: how this ref relates to its own section
-                            // (self / nested / encloses / external), which decides
-                            // how the bar is drawn and labelled.
-                            const sectionCanon = canonRange(c.target.refRaw);
-                            const targetCanon = canonRange(c.refRaw);
-                            const scope = scopeRelation(sectionCanon, targetCanon);
-                            // Only genuine references elsewhere get a bar. A ref
-                            // inside the section it was written in (nested) or one
-                            // that wraps it (encloses) is not a cross-reference.
-                            if (scope !== "external") return;
+                            // Every reference in a note's content gets a bar,
+                            // including refs scoped to the note's own section
+                            // (e.g. Genesis 1.2 inside a note on Genesis 1). They
+                            // are treated exactly like any other crosslink.
                             if (rp) addTypedRef(rp, id);
                             // Every crosslink bar is a solid bar in the note type's
                             // colour, exactly like the section's own bar.
@@ -3987,7 +3981,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // place the linked verse is mentioned in the note.
                             let searchRef = rp || "";
                             try { searchRef = decodeURIComponent(searchRef); } catch (e) {}
-                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, text: text, colour: colour, wholeFile: true };
+                            // parentId: the bar of the section this reference was
+                            // written in. The parent widens whenever the crosslink
+                            // is hovered or open.
+                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, text: text, colour: colour, wholeFile: true, parentId: entryIdOf[c.target.refRaw] || null };
                         });
                     }
                     if (coloursDirty) this.saveSettings();
@@ -4056,6 +4053,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     ".step-note-bar[data-typed='1'][data-cross='1']:hover { width: 7px; opacity: 1; }",
                                     ".step-note-bar[data-hold='1'] { opacity: 1; width: 6px; }",
                                     ".step-note-bar[data-hold='1'][data-cross='1'] { width: 7px; }",
+                                    // A crosslink widens its section bar on hover, the
+                                    // same instant the crosslink itself widens. Kept on
+                                    // its own attribute so the host's hold sync can't
+                                    // clear it.
+                                    ".step-note-bar[data-parent-lit='1'] { opacity: 1; width: 6px; }",
+                                    ".step-note-bar[data-parent-lit='1'][data-cross='1'] { width: 7px; }",
                                     ".verse.step-ref-hover {",
                                     "  background-color: rgba(190, 190, 163, 0.19) !important;",
                                     "  outline: 1px solid #cacda600 !important;",
@@ -4208,7 +4211,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // popover (plugin side), so no in-page tip for them.
                                     bar.addEventListener("mouseenter", () => {
                                         window.__stepHighlight(item.nb);
-                                        if (tinfo) return;
+                                        if (tinfo) {
+                                            // Widen this crosslink's section bar too.
+                                            const pid = tinfo.parentId;
+                                            if (pid) {
+                                                const pb = cont.querySelector('.step-note-bar[data-note="' + pid.replace(/"/g, "") + '"]');
+                                                if (pb) { pb.setAttribute("data-parent-lit", "1"); bar.__parentLit = pb; }
+                                            }
+                                            return;
+                                        }
                                         const fr2 = firstV.getBoundingClientRect();
                                         const tip = document.createElement("div");
                                         tip.className = "step-note-tip";
@@ -4233,6 +4244,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     bar.addEventListener("mouseleave", () => {
                                         // Don't wipe a highlight the popover is holding.
                                         if (!(window.__stepHl && window.__stepHl.hold)) window.__stepHighlight("");
+                                        if (bar.__parentLit) { bar.__parentLit.removeAttribute("data-parent-lit"); bar.__parentLit = null; }
                                         if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
                                     });
 
@@ -4609,8 +4621,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // Keep the guest's widened bars in step with the open popovers.
         this._syncBarHold = () => {
             const ids = [];
-            if (this._pinnedPop && this._pinnedPop.id) ids.push(this._pinnedPop.id);
-            if (this._hoverPop && this._hoverPop.id) ids.push(this._hoverPop.id);
+            const add = (id) => {
+                if (!id) return;
+                if (ids.indexOf(id) < 0) ids.push(id);
+                // A crosslink's section bar stays widened with it.
+                const td = this._noteDotsCache && this._noteDotsCache.typedData;
+                const p = td && td.contentOf && td.contentOf[id] && td.contentOf[id].parentId;
+                if (p && ids.indexOf(p) < 0) ids.push(p);
+            };
+            if (this._pinnedPop) add(this._pinnedPop.id);
+            if (this._hoverPop) add(this._hoverPop.id);
             const wv = this._barWebview;
             if (!wv || !wv.executeJavaScript) return;
             try {
@@ -5366,26 +5386,28 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         let node;
         while ((node = walker.nextNode())) nodes.push(node);
 
-        for (const n of nodes) {
-            if (!n.nodeValue || !n.parentNode) continue;
-            let cursor = 0;
-            for (const re of patterns) {
-                re.lastIndex = 0;
-                let m;
-                while ((m = re.exec(n.nodeValue)) !== null) {
-                    if (m.index < cursor) continue;
-                    const from = m.index - cursor;
-                    let textNode = n;
-                    if (from > 0) { textNode = n.splitText(from); cursor = m.index; }
-                    const after = textNode.splitText(m[0].length);
-                    const span = root.ownerDocument.createElement("span");
-                    span.textContent = textNode.nodeValue;
-                    textNode.parentNode.replaceChild(span, textNode);
-                    mark(span);
-                    cursor = m.index + m[0].length;
-                    n = after;
-                    if (!n.nodeValue) break;
-                }
+        for (const original of nodes) {
+            if (!original.nodeValue || !original.parentNode) continue;
+            // The node under the cursor is replaced as we split, so scan the
+            // tail of the split rather than the original node — hence `let`,
+            // not the for-of binding.
+            let n = original;
+            // One pass over a combined pattern: splitting the text mutates the
+            // node the other patterns were about to scan.
+            const combined = new RegExp(patterns.map(p => "(?:" + p.source + ")").join("|"), "gi");
+            let m;
+            while (n.nodeValue && (m = combined.exec(n.nodeValue)) !== null) {
+                if (!m[0].length) { combined.lastIndex++; continue; }
+                let textNode = n;
+                if (m.index > 0) textNode = n.splitText(m.index);
+                const after = textNode.splitText(m[0].length);
+                const span = root.ownerDocument.createElement("span");
+                span.textContent = textNode.nodeValue;
+                textNode.parentNode.replaceChild(span, textNode);
+                mark(span);
+                n = after;
+                if (!n.nodeValue) break;
+                combined.lastIndex = 0;
             }
         }
         return spans;

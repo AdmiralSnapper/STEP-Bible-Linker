@@ -4324,6 +4324,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     cont.appendChild(bar);
                                     added++;
                             });
+
+                            // Re-injection is a full sync, not an append: a bar
+                            // whose note no longer maps onto this page (the
+                            // reference was deleted from the note, or the note
+                            // itself went away) has to disappear without a
+                            // reload. Anything left over is stale.
+                            if (cont) {
+                                const keep = new Set(noteList.map(it => it.nb));
+                                cont.querySelectorAll('.step-note-bar').forEach(b => {
+                                    const id = b.getAttribute('data-note') || '';
+                                    if (keep.has(id)) return;
+                                    if (b.__tip) { b.__tip.remove(); b.__tip = null; }
+                                    if (b.__parentLit) { b.__parentLit.removeAttribute('data-parent-lit'); b.__parentLit = null; }
+                                    b.remove();
+                                });
+                            }
                             // Adaptive gutter: widen padding to fit the slot stack
                             if (cont && cont !== document.body) {
                                 cont.style.paddingLeft = (16 + maxSlot * 8) + "px";
@@ -4532,8 +4548,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
 
     async rewriteStepLinks() {
-        this._noteDotsCache = null;
-
+        // No cache invalidation here: every write below goes through
+        // vault.modify, which raises the modify event that rebuilds the map.
         const files = this.app.vault.getMarkdownFiles();
 
         const activeList = this.settings.localVersions || [];
@@ -5228,7 +5244,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             let collapsedPopover = false;
             try {
                 const tmp = mdEl.cloneNode(true);
-                tmp.querySelectorAll("a, img, video, audio, br, hr, .step-popover-mention").forEach(n => n.remove());
+                // Links are content, not chrome: a body whose only text is a
+                // link must still show. So anchors are kept here and also count
+                // as content when deciding whether to collapse.
+                const hasLink = !!mdEl.querySelector("a");
+                tmp.querySelectorAll("img, video, audio, br, hr, .step-popover-mention").forEach(n => n.remove());
                 // The reference can also arrive as plain text (a bare
                 // "Genesis 3:15", the note's own title line, frontmatter), so
                 // scrub every known spelling of it before deciding.
@@ -5246,7 +5266,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 });
                 // Drop punctuation-only remains ("|", "—", "()", ":") too.
                 leftover = leftover.replace(/[|\-–—:;,·•·()\[\]{}"“”'’«»]/g, "");
-                if (!leftover) {
+                if (!leftover && !hasLink) {
                     mdEl.style.display = "none";
                     mdEl.style.padding = "0";
                     body.classList.add("step-bar-popover-collapsed");

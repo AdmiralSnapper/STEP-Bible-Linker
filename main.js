@@ -143,9 +143,10 @@ function canonBounds(range) {
     const point = (s) => {
         const p = String(s).trim().split(".");
         const bi = STEP_BOOK_ORDER.indexOf(p[0]);
-        const ch = parseInt(p[1], 10);
+        const ch = parseInt(p[1], 10) || null;
         const v = p[2] ? parseInt(p[2], 10) : null;
-        if (bi < 0 || !ch) return null;
+        // A bare book name ("Numbers") is a whole-book reference: no chapter.
+        if (bi < 0) return null;
         return { bi, ch, v };
     };
     const parts = String(range).split("-").map(s => s.trim()).filter(Boolean);
@@ -153,7 +154,11 @@ function canonBounds(range) {
     if (!a) return null;
     const b = parts.length > 1 ? point(parts[parts.length - 1]) : a;
     if (!b) return null;
-    const ord = (p, end) => p.bi * 1e9 + p.ch * 1e6 + (p.v == null ? (end ? 999999 : 0) : p.v);
+    const ord = (p, end) => {
+        // No chapter = the whole book: start at its first verse, end at its last.
+        if (p.ch == null) return p.bi * 1e9 + (end ? 999999 * 1e6 + 999999 : 0);
+        return p.bi * 1e9 + p.ch * 1e6 + (p.v == null ? (end ? 999999 : 0) : p.v);
+    };
     return { start: ord(a, false), end: ord(b, true) };
 }
 
@@ -2053,7 +2058,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 maxHeight: "350px",
                 overflowY: "auto",
                 boxShadow: "0 4px 14px rgba(0,0,0,0.25)",
-                zIndex: "1000000",
+                // The scripture-text preview is the top layer: it must sit
+                // above every bar, note and Wider References list.
+                zIndex: "1000060",
                 color: "#d6d6d6",
                 fontSize: "13.5px",
                 lineHeight: "1.6",
@@ -3821,6 +3828,33 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         }
     }
 
+    // Small badge in the top right of the STEP page while the initial vault
+    // scan runs. A cold scan reads every markdown file, which can take a few
+    // seconds on a big vault; without it the page looks like nothing is
+    // happening.
+    async setNotesLoading(webviewEl, on) {
+        if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
+        try {
+            await webviewEl.executeJavaScript(`(function(){
+                var id = "step-linker-loading";
+                var el = document.getElementById(id);
+                if (${on ? "true" : "false"}) {
+                    if (!el) {
+                        el = document.createElement("div");
+                        el.id = id;
+                        el.textContent = "Loading notes\u2026";
+                        el.style.cssText = "position:fixed;top:8px;right:12px;z-index:2147483647;"
+                            + "background:rgba(0,0,0,0.72);color:#fff;font:12px/1.4 sans-serif;"
+                            + "padding:5px 10px;border-radius:4px;pointer-events:none;";
+                        document.body.appendChild(el);
+                    }
+                } else if (el) {
+                    el.remove();
+                }
+            })();`);
+        } catch (e) {}
+    }
+
     async injectNoteDots(webviewEl) {
         if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
 
@@ -3840,6 +3874,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // rebuild only re-reads files whose mtime moved.
             const now = Date.now();
             if (!this._noteDotsCache) {
+                await this.setNotesLoading(webviewEl, true);
+                try {
                 const map = {}; // canonicalVerse -> Set of note basenames
                 const bookRefs = {}; // bookName -> Set of note basenames (whole-book references)
                 const files = this.app.vault.getMarkdownFiles();
@@ -3966,7 +4002,20 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const canonR = right ? toCanonical(right) : null;
                         if (!canonL) return;
                         const [bookL, chapL, verseL] = canonL.split(".");
-                        if (!chapL) return; // typed whole-book refs: not supported yet
+                        // A typed whole-book reference ("Numbers") covers every
+                        // verse of the book, so it still draws a bar and appears
+                        // in the overflow list.
+                        if (!chapL) {
+                            const lastC = this.getMaxChapter(bookL) || 0;
+                            for (let c = 1; c <= lastC; c++) {
+                                const mv = this.getMaxVerse(bookL, c) || 0;
+                                for (let v = 1; v <= mv; v++) {
+                                    const k2 = `${bookL}.${c}.${v}`;
+                                    (map[k2] = map[k2] || new Set()).add(key);
+                                }
+                            }
+                            return;
+                        }
                         const bookR = canonR ? canonR.split(".")[0] : bookL;
                         const chapR = canonR ? canonR.split(".")[1] : chapL;
                         const verseR = canonR ? (canonR.split(".")[2] || null) : null;
@@ -4067,7 +4116,27 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 for (const k of Object.keys(map)) serialised[k] = Array.from(map[k]);
                 const serialisedBookRefs = {};
                 for (const k of bookRefKeys) serialisedBookRefs[k] = Array.from(bookRefs[k]);
-                this._noteDotsCache = { time: now, map: serialised, bookRefs: serialisedBookRefs, typedData };
+                // True extent of each note in the whole Bible, not just on this
+                // page: the page uses it to spot notes whose range runs off the
+                // top or bottom of the screen (Numbers 22-24 while viewing
+                // Numbers 23, say move to the overflow lane).
+                const bounds = {};
+                for (const k of Object.keys(serialised)) {
+                    const b = canonBounds(k);
+                    if (!b) continue;
+                    for (const nb of serialised[k]) {
+                        const cur = bounds[nb];
+                        if (!cur) bounds[nb] = { start: b.start, end: b.end };
+                        else {
+                            if (b.start < cur.start) cur.start = b.start;
+                            if (b.end > cur.end) cur.end = b.end;
+                        }
+                    }
+                }
+                this._noteDotsCache = { time: now, map: serialised, bookRefs: serialisedBookRefs, typedData, bounds };
+                } finally {
+                    await this.setNotesLoading(webviewEl, false);
+                }
             }
 
             // STEP 3: push the FULL vault map + bookMap once per webview.
@@ -4078,7 +4147,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 `window.__stepDotFullMap = ${JSON.stringify(this._noteDotsCache.map)};` +
                 `window.__stepDotBookMap = ${JSON.stringify(bookMap)};` +
                 `window.__stepBookRefs = ${JSON.stringify(this._noteDotsCache.bookRefs || {})};` +
-                `window.__stepTypedData = ${JSON.stringify(this._noteDotsCache.typedData || { colourOf: {}, contentOf: {}, outlineOf: {} })};`);
+                `window.__stepTypedData = ${JSON.stringify(this._noteDotsCache.typedData || { colourOf: {}, contentOf: {}, outlineOf: {} })};` +
+                `window.__stepNoteBounds = ${JSON.stringify(this._noteDotsCache.bounds || {})};` +
+                `window.__stepBookOrder = ${JSON.stringify(STEP_BOOK_ORDER)};`);
 
             // 4b. Define the in-page injector + MutationObserver:
             //  - observes document.body (survives STEP's container swaps)
@@ -4132,6 +4203,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // clear it.
                                     ".step-note-bar[data-parent-lit='1'] { opacity: 1; width: 6px; }",
                                     ".step-note-bar[data-parent-lit='1'][data-cross='1'] { width: 7px; }",
+                                    // The overflow lane: one thin grey bar standing
+                                    // for every note that runs past this page.
+                                    // The lane widens and shrinks on exactly the same
+                                    // widths as a note bar, so a held lane and a held
+                                    // note read as the same weight.
+                                    ".step-note-overflow { width: 4px; opacity: 0.55; }" ,
+                                    ".step-note-overflow:hover { width: 6px; opacity: 1; }",
+                                    ".step-note-overflow[data-hold='1'] { width: 6px; opacity: 1; }",
+                                    ".step-note-overflow[data-lane-hover='1'] { width: 6px; opacity: 1; }",
                                     ".verse.step-ref-hover {",
                                     "  background-color: rgba(190, 190, 163, 0.19) !important;",
                                     "  outline: 1px solid #cacda600 !important;",
@@ -4206,6 +4286,52 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 // Longer spans first so the longest bar lands in the
                                 // leftmost slot and bars funnel large-to-small left to right.
                                 .sort((a, b) => (b.e.max - b.e.min) - (a.e.max - a.e.min) || a.e.min - b.e.min);
+
+                            // Notes whose true range runs off the top (or bottom)
+                            // of this page get no gutter of their own: a bar that
+                            // starts above the screen or ends below it can only be
+                            // drawn as a misleading fragment. They share one grey
+                            // lane on the far left instead.
+                            const boundsOf = window.__stepNoteBounds || {};
+                            const order = window.__stepBookOrder || [];
+                            const ordOf = (canon) => {
+                                const p = String(canon).split(".");
+                                const bi = order.indexOf(p[0]);
+                                const ch = parseInt(p[1], 10);
+                                const v = p[2] ? parseInt(p[2], 10) : 0;
+                                if (bi < 0 || !ch) return null;
+                                return bi * 1e9 + ch * 1e6 + (v || 0);
+                            };
+                            let pageStart = null, pageEnd = null;
+                            verses.forEach(v => {
+                                const o = ordOf(v.canon);
+                                if (o == null) return;
+                                if (pageStart === null || o < pageStart) pageStart = o;
+                                if (pageEnd === null || o > pageEnd) pageEnd = o;
+                            });
+                            const overflowList = [];
+                            const drawnList = [];
+                            noteList.forEach(item => {
+                                const b = boundsOf[item.nb];
+                                // A note covering the whole page and running
+                                // off either end hides where it actually
+                                // starts or stops, so it goes to the lane.
+                                // A note that covers the page exactly keeps
+                                // its own (full-height) bar, and one that
+                                // starts inside the page keeps its bar too.
+                                const coversPage = b && pageStart !== null
+                                    && b.start <= pageStart && b.end >= pageEnd;
+                                const overflowOne =
+                                    b.start < pageStart || b.end > pageEnd;
+                                if (coversPage && overflowOne) {
+                                    overflowList.push(item);
+                                } else {
+                                    drawnList.push(item);
+                                }
+                            });
+                            noteList.length = 0;
+                            drawnList.forEach(it => noteList.push(it));
+
                             const slotEnds = [];   // slot -> max verse index used
                             const slotOf = {};
                             noteList.forEach(item => {
@@ -4234,6 +4360,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     const existing = cont.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
                                     if (existing) return;
 
+                                    // Slots sit to the right of the overflow lane,
+                                    // which is always 12px wide.
+                                    const slotX = slot + 1;
+
                                     // Typed bars take their colour from the note-type
                                     // settings (or the crosslink colour for X: ids).
                                     const tinfo = (window.__stepTypedData || {}).contentOf && window.__stepTypedData.contentOf[item.nb];
@@ -4258,7 +4388,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // Fixed gutter position; widths live in the
                                     // stylesheet so :hover can still widen a bar.
                                     const baseLeft = 2;
-                                    bar.style.left = (baseLeft + slot * 8) + "px";
+                                    bar.style.left = (baseLeft + slotX * 8) + "px";
 
                                     // Measure the range from viewport rects, converted
                                     // to container-content coordinates (accounting for
@@ -4325,6 +4455,61 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     added++;
                             });
 
+                            // The overflow lane: one thin grey bar for every note
+                            // that reaches outside this page. It sits at the very
+                            // left and is as tall as the list it stands for.
+                            const OVF_ID = "__STEPOVF__";
+                            if (cont) {
+                                if (!overflowList.length) {
+                                    const oldBar = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
+                                    if (oldBar) oldBar.remove();
+                                    window.__stepOverflowList = [];
+                                } else {
+                                    // Least verses first, so the smallest note (the
+                                    // most specific reference) is at the top.
+                                    const spanOf = (it) => {
+                                        const b = boundsOf[it.nb];
+                                        return b ? (b.end - b.start) : (it.e.max - it.e.min);
+                                    };
+                                    const ovf = overflowList.slice().sort((a, b) => spanOf(a) - spanOf(b));
+                                    window.__stepOverflowList = ovf.map(it => it.nb);
+                                    window.__stepOverflowPage = (pageStart === null ? "" : pageStart + "-" + pageEnd);
+                                    let ob = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
+                                    if (!ob) {
+                                        ob = document.createElement("div");
+                                        ob.className = "step-note-bar step-note-overflow";
+                                        ob.dataset.note = OVF_ID;
+                                        ob.style.background = "rgba(150,150,150,0.55)";
+                                        ob.style.left = "2px";
+                                        // No inline width: it would override both
+                                        // the 4px base and the 6px :hover rule,
+                                        // leaving the lane permanently wide.
+                                        ob.addEventListener("mouseenter", () => {
+                                            ob.setAttribute("data-ovf-hover", "1");
+                                        });
+                                        ob.addEventListener("mouseleave", () => {
+                                            ob.removeAttribute("data-ovf-hover");
+                                        });
+                                        cont.appendChild(ob);
+                                    }
+                                    // The lane spans the passage itself — from the
+                                    // top of the first verse to the bottom of the
+                                    // last — so it is a full-height target that does
+                                    // not dodge the cursor.
+                                    if (verses.length && contRect) {
+                                        const firstR = verses[0].verse.getBoundingClientRect();
+                                        const lastR = verses[verses.length - 1].verse.getBoundingClientRect();
+                                        const topY = firstR.top - contRect.top + cont.scrollTop;
+                                        const botY = lastR.bottom - contRect.top + cont.scrollTop;
+                                        ob.style.top = topY + "px";
+                                        ob.style.height = Math.max(40, botY - topY) + "px";
+                                    } else {
+                                        ob.style.top = (cont.scrollTop + 40) + "px";
+                                        ob.style.height = Math.max(14, ovf.length * 12 + 8) + "px";
+                                    }
+                                }
+                            }
+
                             // Re-injection is a full sync, not an append: a bar
                             // whose note no longer maps onto this page (the
                             // reference was deleted from the note, or the note
@@ -4332,6 +4517,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // reload. Anything left over is stale.
                             if (cont) {
                                 const keep = new Set(noteList.map(it => it.nb));
+                                keep.add("__STEPOVF__");
                                 cont.querySelectorAll('.step-note-bar').forEach(b => {
                                     const id = b.getAttribute('data-note') || '';
                                     if (keep.has(id)) return;
@@ -4342,7 +4528,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             }
                             // Adaptive gutter: widen padding to fit the slot stack
                             if (cont && cont !== document.body) {
-                                cont.style.paddingLeft = (16 + maxSlot * 8) + "px";
+                                cont.style.paddingLeft = (20 + maxSlot * 8) + "px";
                             }
                             if (dbg.length) {
                                 // debug info goes to the console log in the plugin; no title edit
@@ -4397,6 +4583,26 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             window.__stepHl = { els: els, bars: [] };
                         };
 
+                        // A bar belongs to the grey lane if its note does, or
+                        // if the crosslink it stands for belongs to a note
+                        // that does: a crosslink bar carries the crosslink's
+                        // own id, not its parent's.
+                        window.__stepInLane = function(id) {
+                            const ids = window.__stepOverflowList;
+                            if (!Array.isArray(ids) || !id) return false;
+                            if (ids.indexOf(id) >= 0) return true;
+                            const td = window.__stepTypedData || {};
+                            const contentOf = td.contentOf || {};
+                            const seen = new Set();
+                            let cur = contentOf[id] && contentOf[id].parentId;
+                            while (cur && !seen.has(cur)) {
+                                if (ids.indexOf(cur) >= 0) return true;
+                                seen.add(cur);
+                                cur = contentOf[cur] && contentOf[cur].parentId;
+                            }
+                            return false;
+                        };
+
                         // Host-driven bar widening. The host sends the ids of every
                         // note whose popover is currently open; a bar is wide exactly
                         // while its id is in that list, so the popout and the bar
@@ -4419,7 +4625,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 .filter(el => el.classList && el.classList.contains("step-note-bar"));
                             if (!hits.length) return null;
                             const b = hits[0];
-                            return { id: b.dataset.note || "", ref: b.dataset.ref || "", typed: b.dataset.typed === "1" };
+                            if (b.dataset.note === "__STEPOVF__") {
+                                // The grey lane stands for every note that reaches
+                                // past this page; the host renders them as a list.
+                                return { id: "__STEPOVF__", overflow: true, list: window.__stepOverflowList || [], page: window.__stepOverflowPage || "" };
+                            }
+                            return {
+                                id: b.dataset.note || "",
+                                ref: b.dataset.ref || "",
+                                typed: b.dataset.typed === "1",
+                                laneParent: !!window.__stepInLane && window.__stepInLane(b.dataset.note),
+                                // True when this bar also stands in the grey
+                                // lane, so the host can widen it for hovers and
+                                // pins that never go through the list.
+                                ovf: window.__stepInLane ? window.__stepInLane(b.dataset.note) : false
+                            };
                         };
 
                         // Mouse events over the guest page never reach the host
@@ -4432,6 +4652,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             document.addEventListener("mousemove", (e) => {
                                 const hit = window.__stepBarAt
                                     ? window.__stepBarAt(e.clientX, e.clientY) : null;
+                                // A child of the grey lane widens it locally as
+                                // well: the host round trip is not needed for a
+                                // highlight that lives entirely in this page.
+                                try {
+                                    const lane = document.querySelector('.step-note-bar[data-note="__STEPOVF__"]');
+                                    if (lane) {
+                                        if (hit && hit.laneParent) lane.setAttribute("data-lane-hover", "1");
+                                        else lane.removeAttribute("data-lane-hover");
+                                    }
+                                } catch (e) {}
                                 const key = hit ? hit.id : "";
                                 if (key === lastHover) return; // only report changes
                                 lastHover = key;
@@ -4681,15 +4911,39 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         const dispose = (entry) => {
             if (!entry) return;
+            if (this._ovfList && this._ovfList.body === entry.body) this._ovfList = null;
             const pop = entry.pop;
             clearTimeout(this._hoverCloseTimer);
             this._barDragging = false;
             if (!entry.pinned) this._pointerInPopover = false;
             // Drop the slot first, then sync: the bar narrows on the same tick
             // the popover is torn down.
+            // A row-owned note has nothing left to belong to.
+            if (entry._xGuard) { try { document.removeEventListener("pointerdown", entry._xGuard, true); } catch (e) {} entry._xGuard = null; }
+            if (entry._docWheel) { try { document.removeEventListener("wheel", entry._docWheel, true); } catch (e) {} entry._docWheel = null; }
+            try { if (entry.adjChild) entry.adjChild(); } catch (e) {}
+            // The stretched title bar belongs to this note, not to the list:
+            // it goes when the note goes, and the list's bookkeeping is cleared.
+            if (entry._adjBar) {
+                const b = entry._adjBar;
+                entry._adjBar = null;
+                try { b.style.opacity = "0"; } catch (e) {}
+                window.setTimeout(() => { try { b.remove(); } catch (e) {} }, 140);
+                if (entry._adjSlot === "pinned") {
+                    if (this._adjPinned && this._adjPinned.note === entry) this._adjPinned = null;
+                } else {
+                    if (this._adjHover && this._adjHover.note === entry) this._adjHover = null;
+                }
+            }
             if (entry.pinned) {
                 if (this._pinnedPop === entry) this._pinnedPop = null;
                 this._barPinned = false;
+                // Closing a pinned box with its X is host-side: the guest never
+                // sees the pointer leave the bar, so the last hit it reported
+                // would stay "current" and hold the next hover note open until
+                // the pointer re-entered the page. Closing by clicking the bar
+                // already clears it; this makes every close path do the same.
+                this._lastBarHit = null;
             } else if (this._hoverPop === entry) this._hoverPop = null;
             try { (entry.hide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
             // Narrow the bars in the same tick the popover goes away.
@@ -4720,6 +4974,26 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             };
             if (this._pinnedPop) add(this._pinnedPop.id);
             if (this._hoverPop) add(this._hoverPop.id);
+            // A note opened from the Wider References list lives in the list's
+            // own slots, not in the hover/pinned ones, so it has to be added
+            // separately or its bar (and the lane it belongs to) never widen.
+            if (this._adjPinned && this._adjPinned.note) add(this._adjPinned.note.id);
+            if (this._adjHover && this._adjHover.note) add(this._adjHover.note.id);
+            // The grey lane stands for its whole list, so it stays wide while
+            // any note in that list is open — including a crosslink inside one
+            // of those notes, whose id only reaches the note through
+            // parentId above.
+            if (this._barHitOvf ||
+                (this._pinnedPop && this._pinnedPop.ovf) ||
+                (this._hoverPop && this._hoverPop.ovf)) {
+                add("__STEPOVF__");
+            }
+            const ovf = this._ovfList;
+            if (ovf && ovf.ids && ovf.ids.length) {
+                for (const id of ids.slice()) {
+                    if (ovf.ids.indexOf(id) >= 0) { add("__STEPOVF__"); break; }
+                }
+            }
             const wv = this._barWebview;
             if (!wv || !wv.executeJavaScript) return;
             try {
@@ -4739,11 +5013,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // hover note only after a short grace period, and never while the
         // pointer is actually over the popover.
         this._lastBarHit = null;
+        // Whether the bar under the pointer also stands in the grey lane.
+        this._barHitOvf = false;
         this._barDragging = false;
         this._pointerInPopover = false;
         this._lastPointer = null;
         this.registerDomEvent(document, "mousemove", (e) => {
             this._lastPointer = { x: e.clientX, y: e.clientY };
+            // Bar hits are only reported from inside the webview. Once the
+            // pointer moves onto one of our own popovers or bars the reports
+            // stop, so the last hit would otherwise stay "current" and keep a
+            // hover note alive for as long as the pointer stayed there.
+            const t = e.target;
+            if (t && t.closest && t.closest(".step-bar-popover, .step-adj-bar")) {
+                this._lastBarHit = null;
+            }
         }, { passive: true, capture: true });
         // True when the tracked pointer sits inside the open hover popover.
         // Geometry is used instead of enter/leave flags: a flag can stay stuck
@@ -4751,8 +5035,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // made notes linger for seconds.
         const pointerOverHoverPop = () => {
             if (!this._hoverPop) return false;
-            const c = document.querySelector(".step-bar-popover:not(.step-bar-popover-pinned)");
-            if (!c) return false;
+            // Use the tracked popover's own element. A pinned Wider References
+            // list is also a .step-bar-popover (it never takes the -pinned
+            // class), so a document-wide query could pick that list instead of
+            // the hover note and keep the note alive for as long as the
+            // pointer happened to sit over the list.
+            const own = this._hoverPop.body;
+            // Only the tracked hover note counts. A document-wide fallback can
+            // match a pinned Wider References list (which never takes the
+            // -pinned class) and hold the note open forever.
+            if (!own || !own.isConnected) return false;
+            const c = own;
             const p = this._lastPointer;
             if (!p) return this._pointerInPopover;
             const r = c.getBoundingClientRect();
@@ -4761,6 +5054,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this._scheduleHoverClose = () => {
             clearTimeout(this._hoverCloseTimer);
             this._hoverCloseTimer = setTimeout(() => {
+                // Only a hovered stretched bar keeps a hover note alive; a
+                // pinned note (or a pinned Wider References list) is no reason
+                // to leave a transient note on screen.
+                if (this._adjHover) return;
                 if (pointerOverHoverPop()) return;
                 if (this._lastBarHit) return;
                 closeHover();
@@ -4785,17 +5082,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const pushHighlight = (id) => {
                 webviewEl.executeJavaScript(`window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")})`).catch(() => {});
             };
-            if (!hit || !hit.typed) {
+            if (!hit || (!hit.typed && !hit.overflow)) {
                 // Cancel any pending open: a timer that fires after the pointer
                 // has left would pop a note up with no bar hovered under it.
                 clearTimeout(this._barOpenTimer);
                 this._lastBarHit = null;
+                this._barHitOvf = false;
+                this._syncBarHold();
                 // While pinned, moving off the bar must not close the pinned
                 // note — but a transient hover note still goes away.
                 this._scheduleHoverClose();
                 return;
             }
             this._lastBarHit = hit;
+            this._barHitOvf = !!hit.ovf;
+            this._syncBarHold();
             clearTimeout(this._hoverCloseTimer);
             pushHighlight(hit.id);
             // Already showing this bar (pinned or hovering): nothing to do.
@@ -4808,22 +5109,455 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // Click on a bar: pin the popover (stays put, movable, resizable)
         this.handleBarClickMessage = (webviewEl, hit) => {
             clearTimeout(this._barOpenTimer);
-            if (!hit || !hit.typed) return;
+            // The click opens a popover outside the webview, so the guest will
+            // never report "no bar" for it. A hit left over from the hover that
+            // preceded the click would then keep every later hover note alive
+            // until the pointer re-entered the page and left a bar again.
+            this._lastBarHit = null;
+            if (!hit || (!hit.typed && !hit.overflow)) return;
+            // Clicking the grey lane closes the list only if that list is
+            // pinned — same as pressing its X. A hovered list is not closed:
+            // the click pins it, as clicking any other bar would.
+            if (hit.overflow && this._ovfList && this._ovfList.pinned
+                && this._ovfList.page === (hit.page || "")) {
+                try { this._ovfList.closeAll(); } catch (e) {}
+                return;
+            }
             if (this._pinnedPop && this._pinnedPop.id === hit.id) {
                 // second click on the same bar unpins and closes
                 closePinned();
                 closeHover();
                 return;
             }
-            // Clicking a different bar replaces the pinned note.
+            // Anything that pins replaces whatever was pinned before — and a
+            // pinned Wider References list counts. (Clicks on one of the
+            // list's own rows never come through here, so opening a note from
+            // the list does not close the list underneath it.)
+            if (this._ovfList && this._ovfList.pinned) {
+                try { this._ovfList.closeAll(); } catch (e) {}
+            }
             this.openBarPopover(webviewEl, hit, true);
+        };
+
+        // The overflow lane's popover: a scrollable list of title bars, one per
+        // note that reaches outside the page. Clicking one opens that note
+        // exactly as clicking its own bar would.
+        this.openOverflowPopover = async (webviewEl, hit, pinned) => {
+            const box = webviewEl.getBoundingClientRect();
+            const td = this._noteDotsCache && this._noteDotsCache.typedData;
+            const contentOf = (td && td.contentOf) || {};
+            const ids = (hit.list || []).filter(id => contentOf[id]);
+            // Pinning the lane on another page retires the list left open
+            // there — notes, bars and all.
+            if (pinned && this._ovfList) { try { this._ovfList.closeAll(); } catch (e) {} }
+            closeHover();
+            if (pinned) closePinned();
+            if (!ids.length) { this._syncBarHold(); return; }
+
+            const anchorEl = document.createElement("div");
+            anchorEl.style.cssText = "position:fixed;width:0;height:0;pointer-events:none;";
+            anchorEl.style.left = (box.right - 8) + "px";
+            anchorEl.style.top = (box.top + 8) + "px";
+            document.body.appendChild(anchorEl);
+
+            const body = document.createElement("div");
+            const pop = {
+                hoverEl: body,
+                hide() { try { body.remove(); } catch (e) {} },
+                position() {},
+                show() {}
+            };
+            document.body.appendChild(body);
+            body.addClass("step-bar-popover");
+            // The list sits above the stretched bars it owns, so its single X
+            // stays clickable once a row is pinned.
+            // Hovered popovers outrank every pinned one; a pinned list still
+            // sits above a pinned note.
+            body.style.zIndex = pinned ? "1000014" : "1000034";
+            body.style.position = "fixed";
+            body.style.left = (box.right - 8) + "px";
+            body.style.top = (box.top + 8) + "px";
+            body.style.right = "auto";
+            body.style.bottom = "auto";
+            body.style.transform = "translateX(-100%)";
+            body.style.display = "flex";
+            body.style.flexDirection = "column";
+            body.style.width = "260px";
+            body.style.maxHeight = "45vh";
+            body.style.overflow = "hidden";
+
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body };
+            if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
+            else this._hoverPop = entry;
+            this._barWebview = webviewEl;
+            this._syncBarHold();
+
+            if (!pinned) {
+                this._pointerInPopover = false;
+                body.addEventListener("mouseenter", () => {
+                    this._pointerInPopover = true;
+                    clearTimeout(this._hoverCloseTimer);
+                });
+                body.addEventListener("mouseleave", () => {
+                    this._pointerInPopover = false;
+                    this._scheduleHoverClose();
+                });
+            }
+
+            // The list's own entry, held in this closure so no other popover
+            // can overwrite the slot it used to live in.
+            const listEntry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "", ids: ids.slice() };
+            this._ovfList = listEntry;
+            const header = body.createDiv({ cls: "step-bar-popover-header" });
+            header.style.position = "sticky";
+            header.style.top = "0";
+            header.style.zIndex = "5";
+            header.style.flex = "0 0 auto";
+            header.style.padding = "8px 44px 6px 12px";
+            header.style.backgroundColor = "var(--background-secondary)";
+            const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
+            titleEl.setText("Wider References");
+            titleEl.style.fontWeight = "700";
+            titleEl.style.fontSize = "14px";
+            const countEl = header.createDiv({ cls: "step-bar-popover-ref" });
+            countEl.setText(ids.length + (ids.length === 1 ? " note" : " notes"));
+            countEl.style.fontSize = "12px";
+            countEl.style.opacity = "0.7";
+
+            // One X for the whole list.
+            const btns = header.createDiv({ cls: "step-bar-popover-buttons" });
+            btns.style.position = "absolute";
+            btns.style.top = "6px";
+            btns.style.right = "6px";
+            const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
+            closeBtn.style.cssText = "background:transparent;border:none;border-radius:50%;width:26px;height:26px;padding:0;font-size:16px;display:flex;align-items:center;justify-content:center;cursor:pointer;";
+            closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(128,128,128,0.35)"; });
+            closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "transparent"; });
+            setIcon(closeBtn, "lucide-x");
+            if (!closeBtn.querySelector("svg")) {
+                closeBtn.setText("\u2715");
+                closeBtn.style.fontSize = "14px";
+                closeBtn.style.lineHeight = "26px";
+            }
+            closeBtn.setAttribute("aria-label", "Close");
+            // One X for the whole thing. It disposes the list's own entry,
+            // never this._pinnedPop: a note opened from a row takes that slot,
+            // so closing through it left the list stranded on screen.
+            const closeAll = () => {
+                killAdj("pinned");
+                killAdj("hover");
+                if (this._ovfList === listEntry) this._ovfList = null;
+                // `entry` holds the slot (`_pinnedPop` / `_hoverPop`), so it
+                // has to be disposed too or the dead popover stays registered.
+                try { dispose(entry); } catch (e) {}
+                try { dispose(listEntry); } catch (e) {}
+                closeHover();
+            };
+            closeBtn.addEventListener("click", (ev) => { ev.stopPropagation(); closeAll(); });
+            listEntry.closeAll = closeAll;
+            // The X can end up beneath a note or a stretched bar (notes paint
+            // over the list). Catch the press in the capture phase, before the
+            // covering element sees it.
+            const xGuard = (ev) => {
+                if (!listEntry || !listEntry.body || !listEntry.body.isConnected) return;
+                const r = closeBtn.getBoundingClientRect();
+                if (ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom) {
+                    ev.stopPropagation();
+                    ev.preventDefault();
+                    closeAll();
+                }
+            };
+            document.addEventListener("pointerdown", xGuard, true);
+            listEntry._xGuard = xGuard;
+
+            const listEl = body.createDiv({ cls: "step-bar-popover-body" });
+            listEl.style.padding = "6px";
+            listEl.style.flex = "1 1 auto";
+            listEl.style.minHeight = "0";
+            listEl.style.overflowY = "auto";
+            listEl.style.overscrollBehavior = "contain";
+            // Wheel scrolling for the list. A capture-phase listener on the
+            // document is needed as well as the local one: a row's stretched
+            // note (and Obsidian's own panes) sit inside the popover, and the
+            // wheel event can be consumed before it ever reaches `body`.
+            // Whichever arrives first scrolls the list; a `_wheelDone` stamp
+            // stops the same event scrolling it twice.
+            const cons = Math.max(1, window.devicePixelRatio || 1);
+            const wheelList = (ev) => {
+                if (!body.isConnected) return false;
+                const br = body.getBoundingClientRect();
+                if (ev.clientX < br.left || ev.clientX > br.right ||
+                    ev.clientY < br.top || ev.clientY > br.bottom) return false;
+                // Let the note's own body scroll itself when it can.
+                const over = document.elementFromPoint(ev.clientX, ev.clientY);
+                const scroller = over && over.closest ? over.closest(".step-bar-popover-body") : null;
+                const target = scroller && body.contains(scroller) ? scroller : listEl;
+                if (target.scrollHeight <= target.clientHeight) return false;
+                if (ev._wheelDone) return false;
+                ev._wheelDone = true;
+                target.scrollTop += ev.deltaY;
+                ev.preventDefault();
+                ev.stopPropagation();
+                return true;
+            };
+            body.addEventListener("wheel", wheelList, { passive: false });
+            const docWheel = (ev) => {
+                if (!body.isConnected) {
+                    document.removeEventListener("wheel", docWheel, true);
+                    return;
+                }
+                wheelList(ev);
+            };
+            document.addEventListener("wheel", docWheel, true);
+            listEntry._docWheel = docWheel;
+
+            // A row opens its note to the left: the row clones itself into a
+            // bar that stretches left over the note's top edge, and the note
+            // slides out underneath its left end. The stretched bar IS the
+            // note's title bar, so the note's own header is suppressed.
+            this._adjPinned = null;
+            this._adjHover = null;
+            const killAdj = (which) => {
+                const ent = which === "pinned" ? this._adjPinned : this._adjHover;
+                if (!ent) return;
+                if (which === "pinned") this._adjPinned = null; else this._adjHover = null;
+                clearTimeout(ent.timer);
+                dispose(ent.note);
+            };
+            const makeAdj = async (id, row, makePinned) => {
+                const existing = makePinned ? this._adjPinned : this._adjHover;
+                if (existing && existing.id === id) return;
+                if (!makePinned) killAdj("hover");
+                if (makePinned && this._adjPinned) killAdj("pinned");
+                const lr = listEl.getBoundingClientRect();
+                const rr = row.getBoundingClientRect();
+                const width = Math.max(300, Math.min(460, Math.round(window.innerWidth * 0.3)));
+                const left = Math.max(8, lr.left - 10 - width);
+                const top = rr.bottom;
+
+                // Clone, not a fresh div: same colour, outline, text, sizes.
+                // cloneNode drops the row's listeners, which is what we want.
+                const bar = row.cloneNode(true);
+                bar.addClass("step-adj-bar");
+                bar.style.position = "fixed";
+                bar.style.margin = "0";
+                bar.style.boxSizing = "border-box";
+                bar.style.top = rr.top + "px";
+                bar.style.height = rr.height + "px";
+                bar.style.left = rr.left + "px";
+                bar.style.width = rr.width + "px";
+                // The bar and its note are one visual unit: same level.
+                bar.style.zIndex = makePinned ? "1000020" : "1000038";
+                bar.style.cursor = "default";
+                // Only the hover preview slides out; a pinned bar inherits the
+                // position of the bar it replaces, already extended.
+                bar.style.transition = makePinned
+                    ? "opacity .12s linear"
+                    : "left .18s ease, width .18s ease, opacity .12s linear";
+                // Buttons live at the far right so the note can be minimised
+                // even when another note covers the bar's left end.
+                const barBtns = document.createElement("div");
+                barBtns.style.cssText = "position:absolute;right:5px;top:50%;transform:translateY(-50%);display:flex;gap:2px;";
+                const goto = document.createElement("button");
+                goto.textContent = "\u2197";
+                goto.title = "Open in Obsidian at this reference";
+                goto.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
+                goto.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                goto.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    try {
+                        if (note && note.goToNote) await note.goToNote();
+                        killAdj(makePinned ? "pinned" : "hover");
+                    } catch (e) {}
+                });
+                const mini = document.createElement("button");
+                mini.textContent = "\u2192";
+                mini.title = "Minimise";
+                mini.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
+                mini.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                mini.addEventListener("click", (ev) => {
+                    ev.stopPropagation();
+                    killAdj(makePinned ? "pinned" : "hover");
+                });
+                barBtns.appendChild(goto);
+                // Only a pinned bar can be minimised; a hovered one goes on
+                // its own the moment the pointer leaves it.
+                if (makePinned) barBtns.appendChild(mini);
+                bar.appendChild(barBtns);
+                document.body.appendChild(bar);
+                if (makePinned) {
+                    bar.style.left = left + "px";
+                    bar.style.width = (rr.right - left) + "px";
+                } else {
+                    requestAnimationFrame(() => {
+                        bar.style.left = left + "px";
+                        bar.style.width = (rr.right - left) + "px";
+                    });
+                }
+
+                const note = await this.openBarPopover(webviewEl, { id, typed: true }, !!makePinned, {
+                    adjacent: { left, top, width },
+                    suppressHoverClose: true
+                });
+                if (!note) { try { bar.remove(); } catch (e) {} return; }
+                // A hovered note paints over the pinned note's title bar.
+                // Notes paint over the list they belong to; the bars they
+                // hang from stay beneath it so its X is never covered.
+                note.body.style.zIndex = makePinned ? "1000020" : "1000038";
+                note.body.dataset.stepAdjacent = "1";
+                // Close the seam between the stretched bar and the note: the
+                // body is pulled up so its top edge meets the bar's bottom,
+                // whatever border/margin the list rows carry.
+                const seamShut = () => {
+                    try {
+                        if (!bar.isConnected || !note.body || !note.body.isConnected) return;
+                        const br = bar.getBoundingClientRect();
+                        const nr = note.body.getBoundingClientRect();
+                        const gap = Math.round(nr.top - br.bottom);
+                        if (gap > 0) note.body.style.top = (parseFloat(note.body.style.top || "0") - gap) + "px";
+                    } catch (e) {}
+                };
+                requestAnimationFrame(() => { seamShut(); requestAnimationFrame(seamShut); });
+
+                // The bar follows its row as the list scrolls. Once the row
+                // would leave the popover, the bar parks at the top or bottom
+                // edge until the row comes back into view. The note tracks the
+                // bar, so the pair always reads as one unit.
+                const followRows = () => {
+                    if (!bar.isConnected) return;
+                    try {
+                        const rr2 = row.getBoundingClientRect();
+                        const pr = body.getBoundingClientRect();
+                        const h = bar.offsetHeight || rr2.height;
+                        const headH = header.offsetHeight || 0;
+                        const minTop = pr.top + headH;
+                        const maxTop = Math.max(minTop, pr.bottom - h);
+                        let top = rr2.top;
+                        if (top < minTop) top = minTop;
+                        else if (top > maxTop) top = maxTop;
+                        bar.style.top = top + "px";
+                        if (note && note.body && note.body.isConnected) {
+                            note.body.style.top = (top + h) + "px";
+                        }
+                    } catch (e) {}
+                };
+                listEl.addEventListener("scroll", followRows, { passive: true });
+
+                const ent = { id, bar, note, timer: null, followRows };
+                if (makePinned) this._adjPinned = ent; else this._adjHover = ent;
+                this._syncBarHold();
+                note._adjBar = bar;
+                note._adjSlot = makePinned ? "pinned" : "hover";
+
+                if (!makePinned) {
+                    // Alive while the pointer is on the bar, the row, or the
+                    // note itself — and gone the moment it leaves all three.
+                    const inRect = (r, p) => p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
+                    const still = () => {
+                        const p = this._lastPointer;
+                        if (!p) return true;
+                        try {
+                            if (bar.isConnected && inRect(bar.getBoundingClientRect(), p)) return true;
+                            if (note.body && note.body.isConnected && inRect(note.body.getBoundingClientRect(), p)) return true;
+                            if (row.isConnected && inRect(row.getBoundingClientRect(), p)) return true;
+                        } catch (e) {}
+                        return false;
+                    };
+                    const maybe = () => {
+                        clearTimeout(ent.timer);
+                        ent.timer = window.setTimeout(() => {
+                            if (this._adjHover !== ent) return;
+                            if (still()) return;
+                            // A pinned note elsewhere in the list is a
+                            // different note: it must not keep this one alive.
+                            dispose(note);
+                        }, 90);
+                    };
+                    ent.maybe = maybe;
+                    bar.addEventListener("mouseenter", () => clearTimeout(ent.timer));
+                    bar.addEventListener("mouseleave", maybe);
+                    note.body.addEventListener("mouseenter", () => clearTimeout(ent.timer));
+                    note.body.addEventListener("mouseleave", maybe);
+                }
+
+                // Clicking the stretched bar pins that note; a pinned note is
+                // replaced only by another click, never by mere hovering.
+                bar.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    // A pinned bar is already extended: clicking it minimises
+                    // it again, exactly like the arrow button.
+                    if (makePinned) { killAdj("pinned"); return; }
+                    killAdj("hover");
+                    await makeAdj(id, row, true);
+                });
+            };
+
+            // The list owns whatever note is open beside it: close it with the
+            // list, however the list is closed.
+            entry.adjChild = () => { killAdj("pinned"); killAdj("hover"); };
+
+            ids.forEach(id => {
+                const info = contentOf[id];
+                const isCross = id.indexOf("X:") === 0;
+                const row = listEl.createDiv({ cls: "step-bar-popover-titlebar" });
+                row.style.position = "relative";
+                row.style.padding = "6px 8px";
+                row.style.margin = "0 0 4px 0";
+                row.style.borderRadius = "4px";
+                row.style.cursor = "pointer";
+                const col = info.colour || "#17758f";
+                if (isCross) {
+                    // Crosslink: hollow — dark grey fill, colour stroke.
+                    row.style.background = "#3a3a3a";
+                    row.style.boxShadow = "inset 0 0 0 2px " + col;
+                } else {
+                    row.style.background = col;
+                }
+                const hex = String(col).replace("#", "");
+                const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
+                const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+                const darkText = !isCross && lum > 0.6;
+                const nameEl = row.createDiv();
+                nameEl.setText(info.refText || "");
+                nameEl.style.fontWeight = "700";
+                nameEl.style.fontSize = "13px";
+                nameEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
+                if (info.label) {
+                    const lbl = row.createDiv();
+                    lbl.setText(info.label);
+                    lbl.style.fontSize = "11px";
+                    lbl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
+                }
+                row.addEventListener("mouseenter", () => {
+                    row.style.filter = "brightness(1.12)";
+                    // Preview to the left. Hovering replaces a hover preview and
+                    // sits on top of a pinned note; it never replaces it.
+                    makeAdj(id, row, false);
+                });
+                row.addEventListener("mouseleave", () => { row.style.filter = ""; });
+                row.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    // Pin it exactly as clicking the stretched bar would.
+                    killAdj("hover");
+                    await makeAdj(id, row, true);
+                });
+            });
         };
 
         // Create the popover for one bar hit. Pinned popovers get a header
         // toolbar (open-in-Obsidian button), are draggable by the header and
         // resizable from the corner.
-        this.openBarPopover = async (webviewEl, hit, pinned) => {
+        this.openBarPopover = async (webviewEl, hit, pinned, opts) => {
+            // opts.adjacent: the note belongs to a row in the "Wider
+            // References" list. Its own title bar is unused — the row, stretched
+            // leftwards, becomes the title bar — and it anchors to the row
+            // instead of to a bar in the page.
+            const adjacent = (opts && opts.adjacent) || null;
             const box = webviewEl.getBoundingClientRect();
+            if (hit && hit.overflow) {
+                await this.openOverflowPopover(webviewEl, hit, pinned);
+                return;
+            }
             if (!box.width) { if (!pinned) closePopover(); this._syncBarHold(); return; }
 
             // Content from the cached typed scan (same ids the page uses)
@@ -4836,10 +5570,55 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // their real path (they can sit anywhere in the vault).
             const sourcePath = info.path || (folder ? `${folder}/${base}.md` : `${base}.md`);
 
+            // Open the note in Obsidian and land the cursor on its reference
+            // line. Shared by the note's own toolbar button and by the
+            // "go to note" button on a row's stretched title bar.
+            const goToNote = async () => {
+                try {
+
+                    const leaf2 = await this.app.workspace.openLinkText(sourcePath, "", true);
+                    const view = leaf2 && leaf2.view;
+                    if (view && view.getMode && view.getMode() === "source" && view.editor) {
+                        const ed = view.editor;
+                        const value = ed.getValue();
+                        const lines = value.split("\n");
+                        const wantRaw = String(info.refRaw || "").trim();
+                        const wantText = String(info.refText || "").replace(/[\[\]]/g, "").trim();
+                        let lineNo = -1;
+                        if (wantRaw) {
+                            for (let i = 0; i < lines.length; i++) {
+                                if (!lines[i].includes("reference=")) continue;
+                                const m = lines[i].match(/reference=([^)&\s]+)/);
+                                if (!m) continue;
+                                let got = m[1];
+                                try { got = decodeURIComponent(got); } catch (e) {}
+                                if (got.trim() === wantRaw) { lineNo = i; break; }
+                            }
+                        }
+                        // Fallback: the line that names the reference, so a
+                        // hand-written or odd-encoded link still lands right.
+                        if (lineNo < 0 && wantText) {
+                            for (let i = 0; i < lines.length; i++) {
+                                if (lines[i].includes("reference=") && lines[i].includes(wantText)) { lineNo = i; break; }
+                            }
+                        }
+                        if (lineNo >= 0) {
+                            const pos = { line: lineNo, ch: 0 };
+                            // Select the whole line: scrolling lands there and
+                            // the line is visibly highlighted.
+                            ed.setSelection(pos, { line: lineNo, ch: lines[lineNo].length });
+                            ed.scrollIntoView({ from: pos, to: pos }, true);
+                        }
+                    }
+            
+                } catch (e) {}
+            };
+
             // Pinning replaces the pinned note and any transient hover note;
             // hovering keeps the pinned note where it is.
-            closeHover();
-            if (pinned) closePinned();
+            // An adjacent note belongs to the "Wider References" list, so
+            // opening it must not close the very popover that owns it.
+            if (!adjacent) { closeHover(); if (pinned) closePinned(); }
 
             // Anchor at the webview's top right corner
             const anchorEl = document.createElement("div");
@@ -4864,7 +5643,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             document.body.appendChild(body);
             body.addClass("step-bar-popover");
             // A transient hover note must stack above the pinned one.
-            body.style.zIndex = pinned ? "1000000" : "1000002";
+            // An adjacent note sits above the list it was opened from (and
+            // above every title bar it hangs from).
+            body.style.zIndex = adjacent
+                ? (pinned ? "1000020" : "1000038")
+                : (pinned ? "1000010" : "1000050");
             // Anchor at the top right of the webview: right-aligned by pulling
             // the box back over its own width.
             body.style.position = "fixed";
@@ -4873,9 +5656,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             body.style.right = "auto";
             body.style.bottom = "auto";
             body.style.transform = "translateX(-100%)";
+            if (adjacent) {
+                body.style.transform = "none";
+                body.style.left = adjacent.left + "px";
+                body.style.top = adjacent.top + "px";
+                body.style.width = adjacent.width + "px";
+                body.dataset.stepAdjacent = "1";
+            }
             // Register immediately: any later failure must still leave the
             // popover closeable (otherwise the X does nothing).
-            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body };
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, ovf: !!hit.ovf };
+            entry.goToNote = goToNote;
             if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
             else this._hoverPop = entry;
             this._barWebview = webviewEl;
@@ -4883,15 +5674,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             body.style.maxHeight = "30vh";
             // Width hugs the content; height is a fixed length, scrolled
             // inside. Pinned and unpinned are the same size.
-            body.style.width = "max-content";
+            body.style.width = adjacent ? adjacent.width + "px" : "max-content";
             // HoverPopover's hoverEl is a flex row by default; force a column
             // so the title sits above the text.
             body.style.display = "flex";
             body.style.flexDirection = "column";
             body.style.alignItems = "stretch";
             // Track whether the pointer is inside the popover: leaving a bar for
-            // its own note must not close it.
-            if (!pinned) {
+            // its own note must not close it. An adjacent note is the exception:
+            // the "Wider References" list owns its lifetime, so the built-in
+            // hover-close would fight that.
+            if (!pinned && !(adjacent && opts && opts.suppressHoverClose)) {
                 this._pointerInPopover = false;
                 body.addEventListener("mouseenter", () => {
                     this._pointerInPopover = true;
@@ -4918,6 +5711,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const darkText = lum > 0.6;
             if (info.colour) header.style.backgroundColor = info.colour;
             else header.style.backgroundColor = "var(--background-secondary)";
+            // Its title bar is the row stretched over it, so hide the header.
+            if (adjacent) header.style.display = "none";
             // Pin the title block: it stays in view while the note scrolls under it.
             header.style.position = "sticky";
             header.style.top = "0";
@@ -4976,42 +5771,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 openBtn.setAttribute("aria-label", "Open in Obsidian at this reference");
                 openBtn.addEventListener("click", async (ev) => {
                     ev.stopPropagation();
-                    try {
-                        const leaf2 = await this.app.workspace.openLinkText(sourcePath, "", true);
-                        const view = leaf2 && leaf2.view;
-                        if (view && view.getMode && view.getMode() === "source" && view.editor) {
-                            const ed = view.editor;
-                            const value = ed.getValue();
-                            const lines = value.split("\n");
-                            const wantRaw = String(info.refRaw || "").trim();
-                            const wantText = String(info.refText || "").replace(/[\[\]]/g, "").trim();
-                            let lineNo = -1;
-                            if (wantRaw) {
-                                for (let i = 0; i < lines.length; i++) {
-                                    if (!lines[i].includes("reference=")) continue;
-                                    const m = lines[i].match(/reference=([^)&\s]+)/);
-                                    if (!m) continue;
-                                    let got = m[1];
-                                    try { got = decodeURIComponent(got); } catch (e) {}
-                                    if (got.trim() === wantRaw) { lineNo = i; break; }
-                                }
-                            }
-                            // Fallback: the line that names the reference, so a
-                            // hand-written or odd-encoded link still lands right.
-                            if (lineNo < 0 && wantText) {
-                                for (let i = 0; i < lines.length; i++) {
-                                    if (lines[i].includes("reference=") && lines[i].includes(wantText)) { lineNo = i; break; }
-                                }
-                            }
-                            if (lineNo >= 0) {
-                                const pos = { line: lineNo, ch: 0 };
-                                // Select the whole line: scrolling lands there and
-                                // the line is visibly highlighted.
-                                ed.setSelection(pos, { line: lineNo, ch: lines[lineNo].length });
-                                ed.scrollIntoView({ from: pos, to: pos }, true);
-                            }
-                        }
-                    } catch (e) {}
+                    await goToNote();
                     closePinned();
                 });
                 const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
@@ -5282,8 +6042,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // transform; that fights the drag. Neutralise both hooks.
                 try { if (typeof pop.position === "function") pop.position = () => {}; } catch (e) {}
                 try { if (typeof pop.show === "function") pop.show = () => {}; } catch (e) {}
-                const r = anchorEl.getBoundingClientRect();
+                const r = adjacent
+                    ? { left: adjacent.left, top: adjacent.top }
+                    : anchorEl.getBoundingClientRect();
                 body.style.position = "fixed";
+                body.style.width = adjacent ? adjacent.width + "px" : body.style.width;
                 // Obsidian positions hover popovers with a CSS transform, which
                 // would override left/top entirely and make the box refuse to
                 // move. Take the transform off so the drag can use left/top.
@@ -5291,8 +6054,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 body.style.translate = "0 0";
                 body.style.maxHeight = capH() + "px";
                 body.style.inset = "auto";
-                body.style.zIndex = "1000000";
-                body.style.left = Math.max(4, r.left - body.offsetWidth) + "px";
+                body.style.zIndex = adjacent
+                    ? (pinned ? "1000020" : "1000038")
+                    : (pinned ? "1000010" : "1000050");
+                body.style.left = adjacent
+                    ? adjacent.left + "px"
+                    : Math.max(4, r.left - body.offsetWidth) + "px";
                 body.style.top = r.top + "px";
                 body.style.right = "auto";
                 body.style.overflow = "hidden";
@@ -5433,14 +6200,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
             // Obsidian sets its own stacking on show; re-assert ours a frame
             // later so a hover note always sits above a pinned one.
-            const wantZ = pinned ? "1000000" : "1000002";
+            const wantZ = adjacent
+                ? (pinned ? "1000020" : "1000038")
+                : (pinned ? "1000010" : "1000050");
             const reassertZ = () => { try { body.style.zIndex = wantZ; } catch (e) {} };
             reassertZ();
             requestAnimationFrame(() => { reassertZ(); requestAnimationFrame(reassertZ); });
+            entry.adjacent = adjacent;
+            return entry;
         };
 
         // Leaving the window kills any open (unpinned) popover
-        this.registerDomEvent(document, "mouseleave", () => this._scheduleHoverClose());
+        this.registerDomEvent(document, "mouseleave", () => {
+            // Pointer has left the window: no bar can be under it any more.
+            this._lastBarHit = null;
+            this._scheduleHoverClose();
+        });
     }
 
     // Kill Obsidian's hover tooltips on links rendered into a custom panel.

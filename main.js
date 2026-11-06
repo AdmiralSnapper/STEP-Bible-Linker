@@ -4623,8 +4623,30 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         window.__stepBarAt = function(x, y) {
                             const hits = document.elementsFromPoint(x, y)
                                 .filter(el => el.classList && el.classList.contains("step-note-bar"));
-                            if (!hits.length) return null;
-                            const b = hits[0];
+                            let b = hits.length ? hits[0] : null;
+                            if (!b) {
+                                // Geometric fallback. elementsFromPoint rounds the
+                                // point to whole pixels and skips the bars'
+                                // rounded corners, so a pointer resting on the very
+                                // left edge of a 4px bar can miss it — while
+                                // :hover and mouseenter (exact, fractional hit
+                                // testing) both fire. The bar widens and the text
+                                // highlights, but no popover opens and clicking it
+                                // pins nothing. Match against the rects instead,
+                                // with a small tolerance for that same edge.
+                                let bestD = Infinity;
+                                document.querySelectorAll(".step-note-bar").forEach(el => {
+                                    const r = el.getBoundingClientRect();
+                                    if (!r.width || !r.height) return;
+                                    const pad = 2;
+                                    if (x < r.left - pad || x > r.right + pad || y < r.top - pad || y > r.bottom + pad) return;
+                                    const dx = Math.max(r.left - x, 0, x - r.right);
+                                    const dy = Math.max(r.top - y, 0, y - r.bottom);
+                                    const d = dx * dx + dy * dy;
+                                    if (d < bestD) { bestD = d; b = el; }
+                                });
+                            }
+                            if (!b) return null;
                             if (b.dataset.note === "__STEPOVF__") {
                                 // The grey lane stands for every note that reaches
                                 // past this page; the host renders them as a list.
@@ -5099,6 +5121,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             this._syncBarHold();
             clearTimeout(this._hoverCloseTimer);
             pushHighlight(hit.id);
+            // A pinned list for this page already stands for the lane. Hovering
+            // the lane must not build a second one beside it: the new list
+            // would take over `_ovfList`, stranding the pinned list on screen
+            // and leaving nothing that closes it (the lane click then saw an
+            // unpinned list and made a third).
+            if (hit.overflow && this._ovfList && this._ovfList.pinned
+                && this._ovfList.page === (hit.page || "")) {
+                closeHover();
+                return;
+            }
             // Already showing this bar (pinned or hovering): nothing to do.
             if (this._pinnedPop && this._pinnedPop.id === hit.id) { closeHover(); return; }
             if (this._hoverPop && this._hoverPop.id === hit.id) return;
@@ -5147,8 +5179,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const td = this._noteDotsCache && this._noteDotsCache.typedData;
             const contentOf = (td && td.contentOf) || {};
             const ids = (hit.list || []).filter(id => contentOf[id]);
-            // Pinning the lane on another page retires the list left open
-            // there — notes, bars and all.
+            // A page can only have one list. A hover on a lane that is already
+            // pinned for this page keeps the pinned one; and pinning anywhere
+            // retires whatever list was open before.
+            if (!pinned && this._ovfList && this._ovfList.pinned
+                && this._ovfList.page === (hit.page || "")) {
+                this._syncBarHold();
+                return;
+            }
             if (pinned && this._ovfList) { try { this._ovfList.closeAll(); } catch (e) {} }
             closeHover();
             if (pinned) closePinned();
@@ -5269,6 +5307,75 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             };
             document.addEventListener("pointerdown", xGuard, true);
             listEntry._xGuard = xGuard;
+
+            // Dragging the list by its header carries every note it has out
+            // along with it: a stretched title bar and its note are positioned
+            // independently of the list, so they have to be shifted by the
+            // same delta rather than left behind.
+            const shiftAdj = (ent, dx, dy) => {
+                if (!ent) return;
+                try { if (ent.bar && ent.bar.isConnected) ent.bar.style.left = (parseFloat(ent.bar.style.left || "0") + dx) + "px"; } catch (e) {}
+                try {
+                    if (ent.note && ent.note.body && ent.note.body.isConnected) {
+                        ent.note.body.style.left = (parseFloat(ent.note.body.style.left || "0") + dx) + "px";
+                    }
+                } catch (e) {}
+                try { if (ent.followRows) ent.followRows(); } catch (e) {}
+            };
+            let listDrag = null;
+            header.style.cursor = "move";
+            header.style.touchAction = "none";
+            header.style.userSelect = "none";
+            const onListDragMove = (ev) => {
+                if (!listDrag || !body.isConnected) return;
+                if (ev.pointerId !== undefined && listDrag.pid !== undefined && ev.pointerId !== listDrag.pid) return;
+                const dx = ev.clientX - listDrag.x;
+                const dy = ev.clientY - listDrag.y;
+                if (!dx && !dy) return;
+                listDrag.x = ev.clientX; listDrag.y = ev.clientY;
+                try {
+                    body.style.left = Math.max(0, parseFloat(body.style.left || "0") + dx) + "px";
+                    body.style.top = Math.max(0, parseFloat(body.style.top || "0") + dy) + "px";
+                } catch (e) {}
+                // Both slots move: a hovered row can sit over a pinned one.
+                shiftAdj(this._adjPinned, dx, dy);
+                shiftAdj(this._adjHover, dx, dy);
+            };
+            const endListDrag = (ev) => {
+                if (!listDrag) return;
+                if (ev && ev.type === "pointerup" && ev.buttons) return;
+                listDrag = null;
+                this._barDragging = false;
+                try { body.style.cursor = ""; } catch (e) {}
+                window.removeEventListener("pointermove", onListDragMove, true);
+                window.removeEventListener("pointerup", endListDrag, true);
+                window.removeEventListener("pointercancel", endListDrag, true);
+                window.removeEventListener("blur", endListDrag, true);
+            };
+            const startListDrag = (ev) => {
+                if (listDrag) return;
+                if (ev.button !== undefined && ev.button !== 0) return;
+                const t = ev.target;
+                if (t && t.closest && t.closest("button, a")) return;
+                const r = body.getBoundingClientRect();
+                // Drop the translateX(-100%) right-alignment before dragging,
+                // or the box jumps a full width sideways on the first move.
+                body.style.transform = "none";
+                body.style.left = r.left + "px";
+                body.style.top = r.top + "px";
+                listDrag = { x: ev.clientX, y: ev.clientY, pid: ev.pointerId };
+                this._barDragging = true;
+                clearTimeout(this._barOpenTimer);
+                clearTimeout(this._hoverCloseTimer);
+                try { body.style.cursor = "grabbing"; } catch (e) {}
+                try { ev.preventDefault(); } catch (e) {}
+                window.addEventListener("pointermove", onListDragMove, true);
+                window.addEventListener("pointerup", endListDrag, true);
+                window.addEventListener("pointercancel", endListDrag, true);
+                window.addEventListener("blur", endListDrag, true);
+            };
+            header.addEventListener("pointerdown", startListDrag, true);
+            if (listEntry) listEntry.startListDrag = startListDrag;
 
             const listEl = body.createDiv({ cls: "step-bar-popover-body" });
             listEl.style.padding = "6px";

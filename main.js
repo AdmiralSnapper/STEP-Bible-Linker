@@ -3334,943 +3334,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 `window.__stepBookRefs = ${JSON.stringify(this._noteDotsCache.bookRefs || {})};` +
                 `window.__stepTypedData = ${JSON.stringify(this._noteDotsCache.typedData || { colourOf: {}, contentOf: {}, outlineOf: {} })};` +
                 `window.__stepNoteBounds = ${JSON.stringify(this._noteDotsCache.bounds || {})};` +
-                `window.__stepBookOrder = ${JSON.stringify(BibleInformation.getBookOrder())};`);
+                `window.__stepBookOrder = ${JSON.stringify(BibleInformation.getBookOrder())};` +
+                `window.__stepBarColour = ${JSON.stringify((this.settings && this.settings.noteLinesColour) || "#17758f")};`);
 
-            // 4b. Define the in-page injector + MutationObserver:
-            //  - observes document.body (survives STEP's container swaps)
-            //  - disconnects around injection so our own bar-appends never feed back
-            //  - debounced 300ms, idempotent injector (duplicate-guarded per note)
-            res = await webviewEl.executeJavaScript(`
-                (function() {
-                    try {
-                        // The injector: idempotent, safe to run any number of times
-                        window.__stepInjectDots = function() {
-                            const fullMap = window.__stepDotFullMap || {};
-                            const bookMap = window.__stepDotBookMap || {};
-                            const toCanon = (ref) => {
-                                const parts = ref.split(".");
-                                const full = bookMap[parts[0].toLowerCase()];
-                                if (!full) return null;
-                                return [full.replace(/\\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
-                            };
-
-                            if (!document.getElementById("step-linker-dot-style")) {
-                                const style = document.createElement("style");
-                                style.id = "step-linker-dot-style";
-                                style.textContent = [
-                                    "div.verse { position: relative; }",
-                                    // NOTE: no padding rule here — the adaptive gutter is set
-                                    // as an inline style on the passage container below, and a
-                                    // stylesheet !important would override it.
-                                    ".step-note-bar {",
-                                    "  position: absolute; top: 0;",
-                                    "  width: 4px; min-height: 10px;",
-                                    "  background: ${(this.settings && this.settings.noteLinesColour) || "#17758f"}; opacity: 0.7;",
-                                    "  border-radius: 2px;",
-                                    "  cursor: pointer; z-index: 10;",
-                                    "  transition: opacity 0.12s ease, width 0.12s ease;",
-                                    "}",
-                                    // Crosslinks (refs inside note content) are hollow:
-                                    // stroke only, a little wider so the stroke reads.
-                                    ".step-note-bar[data-cross='1'] { width: 5px; background: transparent; }",
-                                    // A typed bar widens the moment the pointer is on
-                                    // it. data-hold carries the same widened width so
-                                    // the bar stays wide while its popover is open —
-                                    // including after the pointer moves onto the
-                                    // popover, or onto another bar.
-                                    ".step-note-bar[data-typed='1']:hover { width: 6px; opacity: 1; }",
-                                    ".step-note-bar[data-typed='1'][data-cross='1']:hover { width: 7px; opacity: 1; }",
-                                    ".step-note-bar[data-hold='1'] { opacity: 1; width: 6px; }",
-                                    ".step-note-bar[data-hold='1'][data-cross='1'] { width: 7px; }",
-                                    // A crosslink widens its section bar on hover, the
-                                    // same instant the crosslink itself widens. Kept on
-                                    // its own attribute so the host's hold sync can't
-                                    // clear it.
-                                    ".step-note-bar[data-parent-lit='1'] { opacity: 1; width: 6px; }",
-                                    ".step-note-bar[data-parent-lit='1'][data-cross='1'] { width: 7px; }",
-                                    // The overflow lane: one thin grey bar standing
-                                    // for every note that runs past this page.
-                                    // The lane widens and shrinks on exactly the same
-                                    // widths as a note bar, so a held lane and a held
-                                    // note read as the same weight.
-                                    ".step-note-overflow { width: 4px; opacity: 0.55; }" ,
-                                    ".step-note-overflow:hover { width: 6px; opacity: 1; }",
-                                    ".step-note-overflow[data-hold='1'] { width: 6px; opacity: 1; }",
-                                    ".step-note-overflow[data-lane-hover='1'] { width: 6px; opacity: 1; }",
-                                    ".verse.step-ref-hover {",
-                                    "  background-color: rgba(190, 190, 163, 0.19) !important;",
-                                    "  outline: 1px solid #cacda600 !important;",
-                                    "  border-radius: 3px;",
-                                    "}",
-                                    ".step-note-tip {",
-                                    "  position: fixed; z-index: 1000000;",
-                                    "  background: #1e1e1e; color: #d6d6d6;",
-                                    "  border: 1px solid var(--border-color);",
-                                    "  border-radius: 4px; padding: 4px 8px;",
-                                    "  font-size: 12px; font-family: var(--font-interface);",
-                                    "  pointer-events: none; white-space: nowrap;",
-                                    "  box-shadow: 0 2px 8px rgba(0,0,0,0.3);",
-                                    "}",
-                                    ".step-note-tip.wide {",
-                                    "  white-space: pre-line; max-width: 480px;",
-                                    "  padding: 8px 12px; line-height: 1.5;",
-                                    "  max-height: 50vh; overflow: hidden;",
-                                    "}"
-                                ].join("\\n");
-                                document.head.appendChild(style);
-                            }
-
-                            // Canonical ordering: needed to sort each panel's
-                            // verses before its bars are measured.
-                            const order = window.__stepBookOrder || [];
-                            const ordOf = (canon) => {
-                                const p = String(canon).split(".");
-                                const bi = order.indexOf(p[0]);
-                                const ch = parseInt(p[1], 10);
-                                const v = p[2] ? parseInt(p[2], 10) : 0;
-                                if (bi < 0 || !ch) return null;
-                                return bi * 1e9 + ch * 1e6 + (v || 0);
-                            };
-
-                            // Collect the page's verses, grouped by the passage
-                            // panel they live in. STEP can show two columns at
-                            // once — following a footnote opens a second passage
-                            // alongside the first — and each panel needs its own
-                            // independent set of bars. Bars are absolutely
-                            // positioned inside their panel, so a single mixed
-                            // set measured some bars against the wrong container
-                            // (and drew them all in the first panel).
-                            const panelOf = (verseEl) =>
-                                verseEl.closest(".passageContentHolder") ||
-                                verseEl.closest("[class*='passage']") ||
-                                document.body;
-                            const panels = [];
-                            const panelFor = (cont) => {
-                                let p = panels.find(x => x.cont === cont);
-                                if (!p) { p = { cont, verses: [], page: "", list: [], start: 0, x: 0 }; panels.push(p); }
-                                return p;
-                            };
-                            const seenVerses = new Set();
-                            document.querySelectorAll("a.verseLink").forEach(anchor => {
-                                const name = anchor.getAttribute("name");
-                                if (!name) return;
-                                const canon = toCanon(name);
-                                if (!canon) return;
-                                const verseEl = anchor.closest(".verse") || anchor.parentElement;
-                                if (!verseEl || seenVerses.has(verseEl)) return;
-                                seenVerses.add(verseEl);
-                                panelFor(panelOf(verseEl)).verses.push({ verse: verseEl, canon });
-                            });
-                            // Document order stops being canonical order once a
-                            // second panel can start anywhere, so sort per panel.
-                            // STEP's second passage panel (opened by following a
-                            // footnote) is not always its own passageContentHolder:
-                            // it can render as a second column inside the same
-                            // article. One holder then means one "page" spanning
-                            // both passages, so notes that cover a single column
-                            // stop looking like page-covering references and every
-                            // bar is drawn in the first column's gutter. Split any
-                            // holder whose verses form more than one horizontal
-                            // column, and give each split its own subtree root as a
-                            // bar container.
-                            const splitColumns = (list) => {
-                                const items = list.map(v => {
-                                    const r = v.verse.getBoundingClientRect();
-                                    return { v, left: r.left, right: r.right, top: r.top, h: r.height };
-                                });
-                                const cols = [];
-                                items.forEach(it => {
-                                    const c = cols.find(c => Math.abs(c.left - it.left) < 40);
-                                    if (c) {
-                                        c.items.push(it);
-                                        if (it.left < c.left) c.left = it.left;
-                                        if (it.right > c.right) c.right = it.right;
-                                    } else cols.push({ left: it.left, right: it.right, items: [it] });
-                                });
-                                if (cols.length < 2) return null;
-                                cols.sort((a, b) => a.left - b.left);
-                                // Indentation can push a verse's left edge past
-                                // the 40px grouping tolerance and fake a second
-                                // "column" inside a single passage. Two real
-                                // columns are horizontally disjoint: each must
-                                // clear the previous column's right edge, and no
-                                // stray verse may form a column of its own.
-                                for (let i = 0; i < cols.length; i++) {
-                                    if (cols[i].items.length < 3) return null;
-                                    if (i > 0 && cols[i].left - cols[i - 1].right < 40) return null;
-                                }
-                                return cols.map(c => {
-                                    const mine = c.items.map(it => it.v);
-                                    let root = mine[0].verse;
-                                    while (root && !mine.every(m => root.contains(m.verse))) root = root.parentElement;
-                                    while (root && root !== document.body
-                                        && items.some(o => mine.indexOf(o.v) < 0 && o.v.verse && root.contains(o.v.verse))) {
-                                        root = root.parentElement;
-                                    }
-                                    if (!root || root === document.body) root = null;
-                                    return { verses: mine, root };
-                                });
-                            };
-                            const refined = [];
-                            panels.forEach(p => {
-                                const split = splitColumns(p.verses);
-                                if (!split) { refined.push(p); return; }
-                                const paneRect = p.cont === document.body ? null : p.cont.getBoundingClientRect();
-                                split.forEach(col => {
-                                    const root = col.root || p.cont;
-                                    const rr = root === document.body ? null : root.getBoundingClientRect();
-                                    refined.push({
-                                        cont: root,
-                                        verses: col.verses,
-                                        page: "", list: [], start: 0,
-                                        // Bars are absolute inside cont; when the
-                                        // column has no container of its own, shift
-                                        // them right to the column's own edge.
-                                        x: (rr && paneRect) ? Math.max(0, Math.round(rr.left - paneRect.left)) : 0
-                                    });
-                                });
-                            });
-                            panels.length = 0;
-                            refined.forEach(p => panels.push(p));
-
-                            panels.forEach(p => p.verses.sort((a, b) => {
-                                const oa = ordOf(a.canon), ob = ordOf(b.canon);
-                                if (oa == null || ob == null) return 0;
-                                return oa - ob;
-                            }));
-                            // One flat, panel-by-panel list: a bar's __range
-                            // indexes straight into it for highlighting.
-                            const verses = [];
-                            panels.forEach(p => {
-                                p.start = verses.length;
-                                p.verses.forEach(v => { v.__page = p.page || ""; verses.push(v); });
-                            });
-                            window.__stepVerses = verses; // exposed for host-driven highlight
-                            window.__stepPanels = panels;
-
-                            let totalAdded = 0;
-                            const allDbg = [];
-                            panels.forEach((panel, pi) => {
-                            const verses = panel.verses;
-                            const cont = panel.cont;
-                            let contRect = null;
-                            if (cont) {
-                                cont.style.position = "relative";
-                                contRect = cont.getBoundingClientRect();
-                            }
-                            panel.page = "#" + pi;
-                            panel.list = [];
-
-                            // For each note, the min/max verse index present in
-                            // this panel
-                            const noteIdx = {};
-                            verses.forEach((v, i) => {
-                                const notes = fullMap[v.canon];
-                                if (!notes) return;
-                                notes.forEach(nb => {
-                                    const e = noteIdx[nb] || (noteIdx[nb] = { min: i, max: i });
-                                    if (i < e.min) e.min = i;
-                                    if (i > e.max) e.max = i;
-                                });
-                            });
-
-                            // Build note list in verse order, then assign slots by
-                            // vertical overlap: each bar gets the first slot whose
-                            // previous occupant doesn't overlap its range. This makes
-                            // overlapping bars sit in separate columns and makes the
-                            // gutter width adapt to how many overlap at once.
-                            const noteList = Object.keys(noteIdx)
-                                .map(nb => ({ nb, e: noteIdx[nb] }))
-                                // Longer spans first so the longest bar lands in the
-                                // leftmost slot and bars funnel large-to-small left to right.
-                                .sort((a, b) => (b.e.max - b.e.min) - (a.e.max - a.e.min) || a.e.min - b.e.min);
-
-                            // Notes whose true range runs off the top (or bottom)
-                            // of this page get no gutter of their own: a bar that
-                            // starts above the screen or ends below it can only be
-                            // drawn as a misleading fragment. They share one grey
-                            // lane on the far left instead.
-                            const boundsOf = window.__stepNoteBounds || {};
-                            let pageStart = null, pageEnd = null;
-                            verses.forEach(v => {
-                                const o = ordOf(v.canon);
-                                if (o == null) return;
-                                if (pageStart === null || o < pageStart) pageStart = o;
-                                if (pageEnd === null || o > pageEnd) pageEnd = o;
-                            });
-                            // The page key identifies one lane. Two panels can be
-                            // on the same passage, so the panel index is part of
-                            // it — otherwise a list pinned in panel one would be
-                            // treated as the lane for panel two.
-                            panel.page = (pageStart === null ? "" : pageStart + "-" + pageEnd) + "#" + pi;
-                            // Retag this panel's verses with its final page key.
-                            // The flat list was built before the key existed, so
-                            // __page was left empty and every page-scoped
-                            // highlight (bar hover) filtered every verse out.
-                            for (let vi = panel.start; vi < panel.start + verses.length; vi++) {
-                                if (verses[vi]) verses[vi].__page = panel.page;
-                            }
-                            const overflowList = [];
-                            const drawnList = [];
-                            noteList.forEach(item => {
-                                const b = boundsOf[item.nb];
-                                // A note covering the whole page and running
-                                // off either end hides where it actually
-                                // starts or stops, so it goes to the lane.
-                                // A note that covers the page exactly keeps
-                                // its own (full-height) bar, and one that
-                                // starts inside the page keeps its bar too.
-                                const coversPage = b && pageStart !== null
-                                    && b.start <= pageStart && b.end >= pageEnd;
-                                const overflowOne =
-                                    b.start < pageStart || b.end > pageEnd;
-                                if (coversPage && overflowOne) {
-                                    overflowList.push(item);
-                                } else {
-                                    drawnList.push(item);
-                                }
-                            });
-                            noteList.length = 0;
-                            drawnList.forEach(it => noteList.push(it));
-
-                            const slotEnds = [];   // slot -> max verse index used
-                            const slotOf = {};
-                            noteList.forEach(item => {
-                                let s = 0;
-                                while (s < slotEnds.length && slotEnds[s] >= item.e.min) s++;
-                                slotOf[item.nb] = s;
-                                slotEnds[s] = item.e.max;
-                            });
-
-                            const dbg = [];
-                            let maxSlot = 0;
-                            let added = 0;
-
-                            // Every bar is a plain solid bar: whole-book references
-                            // are expanded to the book's verses when the map is built.
-                            noteList.forEach(item => {
-                                const slot = slotOf[item.nb];
-                                // Track widest slot regardless of whether the bar is
-                                // newly added — otherwise re-injection (bars already
-                                // exist) collapses the gutter back to the base padding.
-                                maxSlot = Math.max(maxSlot, slot);
-                                    const firstV = verses[item.e.min].verse;
-                                    const lastV = verses[item.e.max].verse;
-
-                                    // Idempotency: one bar per note per page
-                                    const existing = cont.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
-                                    if (existing) return;
-
-                                    // Slots sit to the right of the overflow lane,
-                                    // which is always 12px wide.
-                                    const slotX = slot + 1;
-
-                                    // Typed bars take their colour from the note-type
-                                    // settings (or the crosslink colour for X: ids).
-                                    const tinfo = (window.__stepTypedData || {}).contentOf && window.__stepTypedData.contentOf[item.nb];
-                                    const bar = document.createElement("div");
-                                    bar.className = "step-note-bar";
-                                    bar.dataset.note = item.nb;
-                                    // Metadata for the plugin-side hover popover: the
-                                    // verse range and whether this is a typed/crosslink bar.
-                                    bar.dataset.ref = verses[item.e.min].canon + ".." + verses[item.e.max].canon;
-                                    if (tinfo) bar.dataset.typed = "1";
-                                    if (tinfo && window.__stepTypedData.colourOf[item.nb]) {
-                                        const typeCol = window.__stepTypedData.colourOf[item.nb];
-                                        bar.style.background = typeCol;
-                                    }
-                                    if (item.nb.indexOf("X:") === 0) {
-                                        // Crosslink: hollow bar, stroke only.
-                                        const stroke = (window.__stepTypedData.colourOf || {})[item.nb] || "currentColor";
-                                        bar.dataset.cross = "1";
-                                        bar.style.background = "transparent";
-                                        bar.style.boxShadow = "inset 0 0 0 2px " + stroke;
-                                    }
-                                    // Fixed gutter position; widths live in the
-                                    // stylesheet so :hover can still widen a bar.
-                                    const baseLeft = 2;
-                                    bar.style.left = ((panel.x || 0) + baseLeft + slotX * 8) + "px";
-
-                                    // Measure the range from viewport rects, converted
-                                    // to container-content coordinates (accounting for
-                                    // container scroll) so inline spans can't inflate it.
-                                    const r1 = firstV.getBoundingClientRect();
-                                    const r2 = lastV.getBoundingClientRect();
-                                    // The verse span includes the raised verse number,
-                                    // so its rect top sits above the text line. Align the
-                                    // bar to the text's own line box instead.
-                                    const lineH1 = parseFloat(getComputedStyle(firstV).lineHeight) || r1.height;
-                                    // Stretch the bar to cover the full vertical extent of the
-                                    // referenced text: top of the verse number down to the bottom
-                                    // of the last verse's final line.
-                                    const top1 = r1.top - contRect.top + cont.scrollTop;
-                                    const bottom2 = r2.bottom - contRect.top + cont.scrollTop;
-                                    bar.style.top = top1 + "px";
-                                    bar.style.height = Math.max(10, bottom2 - top1) + "px";
-                                    dbg.push("#" + added + " s" + slot + " t" + Math.round(top1) + " h" + Math.round(bottom2 - top1) + " " + verses[item.e.min].canon + ".." + verses[item.e.max].canon);
-
-                                    bar.__range = { min: panel.start + item.e.min, max: panel.start + item.e.max };
-                                    // Which passage panel this bar belongs to. Two
-                                    // columns on one page are independent: a hover
-                                    // or hold must never touch the other column.
-                                    bar.__page = panel.page;
-                                    // Hover: highlight the whole referenced range in-page.
-                                    // Typed bars show their content in an Obsidian-managed
-                                    // popover (plugin side), so no in-page tip for them.
-                                    bar.addEventListener("mouseenter", () => {
-                                        window.__stepHighlight(item.nb, "", panel.page);
-                                        if (tinfo) {
-                                            // Widen this crosslink's section bar too.
-                                            const pid = tinfo.parentId;
-                                            if (pid) {
-                                                const pb = cont.querySelector('.step-note-bar[data-note="' + pid.replace(/"/g, "") + '"]');
-                                                if (pb) { pb.setAttribute("data-parent-lit", "1"); bar.__parentLit = pb; }
-                                            }
-                                            return;
-                                        }
-                                        const fr2 = firstV.getBoundingClientRect();
-                                        const tip = document.createElement("div");
-                                        tip.className = "step-note-tip";
-                                        if (tinfo) {
-                                            tip.classList.add("wide");
-                                            tip.textContent = tinfo.label + "\\n\\n" + tinfo.text;
-                                        } else {
-                                            tip.textContent = item.nb;
-                                        }
-                                        tip.style.left = (fr2.right + 10) + "px";
-                                        tip.style.top = fr2.top + "px";
-                                        document.body.appendChild(tip);
-                                        // Clamp inside the viewport: verses near the right
-                                        // or bottom edge would otherwise push the tip off screen.
-                                        const tr = tip.getBoundingClientRect();
-                                        const lx = Math.max(4, Math.min(fr2.right + 10, window.innerWidth - tr.width - 4));
-                                        const ty = Math.max(4, Math.min(fr2.top, window.innerHeight - tr.height - 4));
-                                        tip.style.left = lx + "px";
-                                        tip.style.top = ty + "px";
-                                        bar.__tip = tip;
-                                    });
-                                    bar.addEventListener("mouseleave", () => {
-                                        // Don't wipe a highlight the popover is holding.
-                                        if (!(window.__stepHl && window.__stepHl.hold)) window.__stepHighlight("", "", panel.page);
-                                        if (bar.__parentLit) { bar.__parentLit.removeAttribute("data-parent-lit"); bar.__parentLit = null; }
-                                        if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
-                                    });
-
-                                    cont.appendChild(bar);
-                                    added++;
-                            });
-
-                            // The overflow lane: one thin grey bar for every note
-                            // that reaches outside this page. It sits at the very
-                            // left and is as tall as the list it stands for.
-                            const OVF_ID = "__STEPOVF__";
-                            if (cont) {
-                                if (!overflowList.length) {
-                                    const oldBar = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
-                                    if (oldBar) oldBar.remove();
-                                    panel.list = [];
-                                } else {
-                                    // Least verses first, so the smallest note (the
-                                    // most specific reference) is at the top.
-                                    const spanOf = (it) => {
-                                        const b = boundsOf[it.nb];
-                                        return b ? (b.end - b.start) : (it.e.max - it.e.min);
-                                    };
-                                    const ovf = overflowList.slice().sort((a, b) => spanOf(a) - spanOf(b));
-                                    // This panel's lane contents. The host keys a
-                                    // list by hit.page, which now carries the
-                                    // panel index, so the two lanes stay apart.
-                                    panel.list = ovf.slice();
-                                    panel.list = ovf.map(it => it.nb);
-                                    let ob = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
-                                    if (ob) { ob.__panel = panel; ob.__page = panel.page; ob.style.left = ((panel.x || 0) + 2) + "px"; }
-                                    if (!ob) {
-                                        ob = document.createElement("div");
-                                        ob.className = "step-note-bar step-note-overflow";
-                                        ob.dataset.note = OVF_ID;
-                                        ob.__panel = panel;
-                                        ob.__page = panel.page;
-                                        ob.style.background = "rgba(150,150,150,0.55)";
-                                        ob.style.left = ((panel.x || 0) + 2) + "px";
-                                        // No inline width: it would override both
-                                        // the 4px base and the 6px :hover rule,
-                                        // leaving the lane permanently wide.
-                                        ob.addEventListener("mouseenter", () => {
-                                            ob.setAttribute("data-ovf-hover", "1");
-                                        });
-                                        ob.addEventListener("mouseleave", () => {
-                                            ob.removeAttribute("data-ovf-hover");
-                                        });
-                                        cont.appendChild(ob);
-                                    }
-                                    // The lane spans the passage itself — from the
-                                    // top of the first verse to the bottom of the
-                                    // last — so it is a full-height target that does
-                                    // not dodge the cursor.
-                                    if (verses.length && contRect) {
-                                        const firstR = verses[0].verse.getBoundingClientRect();
-                                        const lastR = verses[verses.length - 1].verse.getBoundingClientRect();
-                                        const topY = firstR.top - contRect.top + cont.scrollTop;
-                                        const botY = lastR.bottom - contRect.top + cont.scrollTop;
-                                        ob.style.top = topY + "px";
-                                        ob.style.height = Math.max(40, botY - topY) + "px";
-                                    } else {
-                                        ob.style.top = (cont.scrollTop + 40) + "px";
-                                        ob.style.height = Math.max(14, ovf.length * 12 + 8) + "px";
-                                    }
-                                }
-                            }
-
-                            // Re-injection is a full sync, not an append: a bar
-                            // whose note no longer maps onto this page (the
-                            // reference was deleted from the note, or the note
-                            // itself went away) has to disappear without a
-                            // reload. Anything left over is stale.
-                            if (cont) {
-                                const keep = new Set(noteList.map(it => it.nb));
-                                keep.add("__STEPOVF__");
-                                cont.querySelectorAll('.step-note-bar').forEach(b => {
-                                    const id = b.getAttribute('data-note') || '';
-                                    if (keep.has(id)) return;
-                                    if (b.__tip) { b.__tip.remove(); b.__tip = null; }
-                                    if (b.__parentLit) { b.__parentLit.removeAttribute('data-parent-lit'); b.__parentLit = null; }
-                                    b.remove();
-                                });
-                            }
-                            // Adaptive gutter: widen padding to fit the slot stack
-                            if (cont && cont !== document.body) {
-                                cont.style.paddingLeft = (20 + maxSlot * 8) + "px";
-                            }
-                            if (dbg.length) {
-                                // debug info goes to the console log in the plugin; no title edit
-                            }
-                            totalAdded += added;
-                            allDbg.push(dbg.join(" | "));
-                            });
-
-                            // The union of every panel's lane, for the in-page
-                            // helpers that only need "is this note in a lane".
-                            window.__stepOverflowList = [].concat.apply([], panels.map(p => p.list));
-                            return {
-                                added: totalAdded,
-                                dbg: allDbg.join(" || "),
-                                cont: panels.length > 1 ? ("PANELS:" + panels.length)
-                                    : (panels[0] ? (panels[0].cont === document.body ? "BODY" : (panels[0].cont && panels[0].cont.className) || "?") : "NONE"),
-                                verses: verses.length,
-                                panels: panels.length
-                            };
-                        };
-
-                        // Host-driven highlight: while the mouse is over a bar or
-                        // its popover, the referenced verses stay lit. An optional
-                        // second argument adds a canonical range ("Gen.1.1" or
-                        // "Gen.1.1-Gen.1.3") — used by crosslinks to light up the
-                        // note's own reference as well as the linked one.
-                        window.__stepHighlight = function(id, sourceRange, page) {
-                            if (page === undefined) page = "";
-                            const clear = (onlyPage) => {
-                                if (window.__stepHl) {
-                                    if (window.__stepHl.els) window.__stepHl.els.forEach(el => { if (!onlyPage || el.__page === onlyPage) el.classList.remove("step-ref-hover"); });
-                                    if (window.__stepHl.bars) window.__stepHl.bars.forEach(el => el.classList.remove("step-bar-expand"));
-                                }
-                                window.__stepHl = null;
-                            };
-                            // Scoped to this panel: moving along a bar in one
-                            // column must not unlight the other column's verses.
-                            clear(page || undefined);
-                            if (!id) return;
-                            const verses = window.__stepVerses || [];
-                            const els = [];
-                            // With a page given, only that panel's verses can light up.
-                            const lit = (v) => {
-                                if (!v || !v.verse || els.indexOf(v.verse) !== -1) return;
-                                if (page && v.__page !== page) return;
-                                v.verse.classList.add("step-ref-hover");
-                                els.push(v.verse);
-                            };
-                            // The same note can have a bar in each panel; light
-                            // only the one(s) in the panel being hovered.
-                            document.querySelectorAll('.step-note-bar[data-note="' + CSS.escape(id) + '"]').forEach(bar => {
-                                if (!bar.__range) return;
-                                if (page && bar.__page !== page) return;
-                                for (let i = bar.__range.min; i <= bar.__range.max; i++) lit(verses[i]);
-                            });
-                            // A ref bar lights only what it points at — never the
-                            // note text the ref was written in.
-                            const range = sourceRange || "";
-                            if (range && verses.length) {
-                                const parts = (c) => {
-                                    const a = String(c || "").split(".");
-                                    return [a[0] || "", parseInt(a[1], 10) || 0, parseInt(a[2], 10) || 0];
-                                };
-                                const halves = range.split("-");
-                                const lo = parts(halves[0]);
-                                const hi = halves[1] ? parts(halves[1]) : lo;
-                                const cmp = (x, y) => (x[0] !== y[0] ? (x[0] < y[0] ? -1 : 1) : (x[1] - y[1]) || (x[2] - y[2]));
-                                verses.forEach(v => {
-                                    const q = parts(v.canon);
-                                    if (!q[0]) return;
-                                    if (cmp(q, lo) >= 0 && cmp(q, hi) <= 0) lit(v);
-                                });
-                            }
-                            window.__stepHl = { els: els, bars: [], page: page || "" };
-                        };
-
-                        // A bar belongs to the grey lane if its note does, or
-                        // if the crosslink it stands for belongs to a note
-                        // that does: a crosslink bar carries the crosslink's
-                        // own id, not its parent's.
-                        window.__stepInLane = function(id, page) {
-                            // Lanes are per panel: a note reaching past the left
-                            // column says nothing about the right one.
-                            let ids = null;
-                            if (page && Array.isArray(window.__stepPanels)) {
-                                const pn = window.__stepPanels.filter(p => p.page === page)[0];
-                                if (pn) ids = pn.list;
-                            }
-                            if (!Array.isArray(ids)) ids = window.__stepOverflowList;
-                            if (!Array.isArray(ids) || !id) return false;
-                            if (ids.indexOf(id) >= 0) return true;
-                            const td = window.__stepTypedData || {};
-                            const contentOf = td.contentOf || {};
-                            const seen = new Set();
-                            let cur = contentOf[id] && contentOf[id].parentId;
-                            while (cur && !seen.has(cur)) {
-                                if (ids.indexOf(cur) >= 0) return true;
-                                seen.add(cur);
-                                cur = contentOf[cur] && contentOf[cur].parentId;
-                            }
-                            return false;
-                        };
-
-                        // Host-driven bar widening. The host sends the ids of every
-                        // note whose popover is currently open; a bar is wide exactly
-                        // while its id is in that list, so the popout and the bar
-                        // appear and disappear together.
-                        window.__stepHoldBars = function(byPage) {
-                            // A map of panel page -> ids, so each column is handled
-                            // on its own. A bare array means the unnamed panel.
-                            let map = byPage;
-                            if (!map || Array.isArray(map)) map = { "": Array.isArray(map) ? map : [] };
-                            const sets = {};
-                            Object.keys(map).forEach(k => { sets[k] = new Set(map[k] || []); });
-                            // A note open from the lane must widen the lane in the
-                            // panel it was opened from — and only that panel. The
-                            // id reaching us here is the note, not "__STEPOVF__"
-                            // (the host only adds the lane id when the pointer is
-                            // directly on a lane), so membership is checked
-                            // against that panel's own list.
-                            const lanePage = {};
-                            if (Array.isArray(window.__stepPanels)) {
-                                window.__stepPanels.forEach(pn => {
-                                    const ids = pn.list || [];
-                                    const hit = (sets[pn.page || ""] || new Set());
-                                    lanePage[pn.page || ""] = ids.some(id => hit.has(id));
-                                });
-                            }
-                            document.querySelectorAll(".step-note-bar").forEach(b => {
-                                const page = b.__page || "";
-                                const set = sets[page];
-                                const id = b.dataset.note || "";
-                                if (id === "__STEPOVF__") {
-                                    if (set && (set.has(id) || lanePage[page])) b.setAttribute("data-hold", "1");
-                                    else if (b.getAttribute("data-hold") === "1") b.removeAttribute("data-hold");
-                                    return;
-                                }
-                                if (set && set.has(id)) b.setAttribute("data-hold", "1");
-                                else if (b.getAttribute("data-hold") === "1") b.removeAttribute("data-hold");
-                            });
-                        };
-
-                        // Widening and highlighting arrive as one message, in
-                        // one call, with a sequence number. Applying both here,
-                        // in order, means the page can never show a wide bar
-                        // with no lit text (or the reverse) and can never apply
-                        // an older state after a newer one.
-                        window.__stepBarState = function(state) {
-                            if (!state || typeof state.seq !== "number") return;
-                            if (typeof window.__stepBarStateSeq === "number"
-                                && state.seq < window.__stepBarStateSeq) return;
-                            window.__stepBarStateSeq = state.seq;
-                            try { if (window.__stepHoldBars) window.__stepHoldBars(state.hold || {}); } catch (e) {}
-                            try { if (window.__stepHighlight) window.__stepHighlight(state.id || "", "", state.page || ""); } catch (e) {}
-                        };
-
-                        // The grey lane belonging to one panel page. Looked up
-                        // through that panel's own container, so a page can only
-                        // ever resolve to its own lane. Returns null when the
-                        // page is unknown: better no highlight than the wrong
-                        // passage's lane.
-                        window.__stepLaneOf = function(page) {
-                            if (!Array.isArray(window.__stepPanels)) return null;
-                            const pn = window.__stepPanels.filter(p => p.page === (page || ""))[0];
-                            if (!pn || !pn.cont) return null;
-                            return pn.cont.querySelector('.step-note-bar[data-note="__STEPOVF__"]');
-                        };
-
-                        // Hit-test for the plugin-side hover popover: which bar sits
-                        // under this point? Coordinates are viewport-relative.
-                        window.__stepBarAt = function(x, y) {
-                            const hits = document.elementsFromPoint(x, y)
-                                .filter(el => el.classList && el.classList.contains("step-note-bar"));
-                            let b = hits.length ? hits[0] : null;
-                            if (!b) {
-                                // Geometric fallback. elementsFromPoint rounds the
-                                // point to whole pixels and skips the bars'
-                                // rounded corners, so a pointer resting on the very
-                                // left edge of a 4px bar can miss it — while
-                                // :hover and mouseenter (exact, fractional hit
-                                // testing) both fire. The bar widens and the text
-                                // highlights, but no popover opens and clicking it
-                                // pins nothing. Match against the rects instead,
-                                // with a small tolerance for that same edge.
-                                let bestD = Infinity;
-                                document.querySelectorAll(".step-note-bar").forEach(el => {
-                                    const r = el.getBoundingClientRect();
-                                    if (!r.width || !r.height) return;
-                                    const pad = 2;
-                                    if (x < r.left - pad || x > r.right + pad || y < r.top - pad || y > r.bottom + pad) return;
-                                    const dx = Math.max(r.left - x, 0, x - r.right);
-                                    const dy = Math.max(r.top - y, 0, y - r.bottom);
-                                    const d = dx * dx + dy * dy;
-                                    if (d < bestD) { bestD = d; b = el; }
-                                });
-                            }
-                            if (!b) return null;
-                            if (b.dataset.note === "__STEPOVF__") {
-                                // The grey lane stands for every note that reaches
-                                // past this page; the host renders them as a list.
-                                const pn = b.__panel;
-                                return {
-                                    id: "__STEPOVF__",
-                                    overflow: true,
-                                    list: pn ? pn.list : (window.__stepOverflowList || []),
-                                    page: pn ? pn.page : "",
-                                    panel: pn ? pn.page : "",
-                                    // The lane element itself. Every highlight of
-                                    // a lane must use the lane the pointer is on,
-                                    // never a document-wide lookup (two columns
-                                    // each have one, and the first found belongs
-                                    // to the other passage).
-                                    laneEl: b
-                                };
-                            }
-                            return {
-                                id: b.dataset.note || "",
-                                ref: b.dataset.ref || "",
-                                typed: b.dataset.typed === "1",
-                                page: b.__page || "",
-                                // This bar's own panel lane, for lighting when
-                                // the bar's note lives in that lane.
-                                ovfEl: window.__stepLaneOf ? window.__stepLaneOf(b.__page || "") : null,
-                                laneParent: !!window.__stepInLane && window.__stepInLane(b.dataset.note, b.__page || ""),
-                                // True when this bar also stands in the grey
-                                // lane, so the host can widen it for hovers and
-                                // pins that never go through the list.
-                                ovf: window.__stepInLane ? window.__stepInLane(b.dataset.note, b.__page || "") : false
-                            };
-                        };
-
-                        // Mouse events over the guest page never reach the host
-                        // document, and the guest has no node integration (no
-                        // ipcRenderer), so bar hovers are reported through the
-                        // console-message channel, which webview forwards to the host.
-                        if (!window.__stepBarHoverHook) {
-                            window.__stepBarHoverHook = true;
-                            let lastHover = null;
-                            document.addEventListener("mousemove", (e) => {
-                                const hit = window.__stepBarAt
-                                    ? window.__stepBarAt(e.clientX, e.clientY) : null;
-                                // A child of the grey lane widens it locally as
-                                // well: the host round trip is not needed for a
-                                // highlight that lives entirely in this page.
-                                try {
-                                    // Each column has its own lane. Light only the
-                                    // lane of the bar under the pointer, resolved
-                                    // through that bar's own panel; then clear every
-                                    // other lane so a highlight can never linger on
-                                    // the opposite column after the pointer moves.
-                                    let lane = null;
-                                    if (hit && (hit.id === "__STEPOVF__")) lane = hit.laneEl || null;
-                                    else if (hit && hit.laneParent) lane = hit.ovfEl || null;
-                                    document.querySelectorAll('.step-note-bar[data-lane-hover="1"]').forEach(el => {
-                                        if (el !== lane) el.removeAttribute("data-lane-hover");
-                                    });
-                                    if (lane) {
-                                        if (hit && (hit.id === "__STEPOVF__" || hit.laneParent)) lane.setAttribute("data-lane-hover", "1");
-                                        else lane.removeAttribute("data-lane-hover");
-                                    }
-                                } catch (e) {}
-                                // Keyed by page as well as id: each panel has its
-                                // own grey lane with the same id, and moving
-                                // between them must still be reported.
-                                const key = hit ? (hit.id + "|" + (hit.page || "")) : "";
-                                if (key === lastHover) return; // only report changes
-                                lastHover = key;
-                                console.log("__STEPBAR__" + JSON.stringify(hit));
-                            }, { passive: true });
-                            // Cursor leaving the page entirely never fires a
-                            // mousemove, so report the exit explicitly.
-                            const reportLeave = () => {
-                                if (!lastHover) return;
-                                lastHover = null;
-                                console.log("__STEPBAR__null");
-                            };
-                            document.addEventListener("mouseleave", reportLeave, { passive: true });
-                            window.addEventListener("mouseout", (e) => {
-                                if (!e.relatedTarget) reportLeave();
-                            }, { passive: true });
-                            // Clicking a bar pins the popover (host-side)
-                            document.addEventListener("click", (e) => {
-                                const hit = window.__stepBarAt
-                                    ? window.__stepBarAt(e.clientX, e.clientY) : null;
-                                console.log("__STEPBARCLICK__" + JSON.stringify(hit));
-                            }, { passive: true });
-                        }
-
-                        // Observe document.body — the only element guaranteed to survive
-                        // STEP's navigation. Feedback from our own bar-appends is
-                        // suppressed by disconnect-around-inject below.
-                        const getTargets = () => [document.body];
-
-                        if (!window.__stepDotObserver) {
-                            let pending = null;
-                            const run = () => {
-                                clearTimeout(pending);
-                                pending = setTimeout(() => {
-                                    try {
-                                        if (!window.__stepInjectDots) return;
-                                        if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
-                                        let n;
-                                        try { n = window.__stepInjectDots(); }
-                                        finally { if (window.__stepDotObserve) window.__stepDotObserve(); }
-                                        // A DOM swap that moved us to a new
-                                        // passage still needs a host re-scan:
-                                        // the note index comes from the vault.
-                                        try { if (window.__stepNotifyPage) window.__stepNotifyPage(); } catch (e) {}
-                                    } catch (e) {
-                                        console.log("[step-dots] OBS ERR " + (e && e.message ? e.message.slice(0, 80) : e));
-                                    }
-                                }, 300);
-                            };
-                            // Re-measure bars when layout changes: bars are absolutely
-                            // positioned, so their tops/heights go stale when text rewraps
-                            // (window resize, fonts loading, scrollbar appearing).
-                            if (!window.__stepBarResizeHooked) {
-                                window.__stepBarResizeHooked = true;
-                                const remeasure = () => {
-                                    try {
-                                        document.querySelectorAll(".step-note-bar").forEach(b => b.remove());
-                                        if (window.__stepInjectDots) window.__stepInjectDots();
-                                    } catch (e) {
-                                        console.log("[step-dots] RESIZE ERR " + (e && e.message ? e.message.slice(0, 80) : e));
-                                    }
-                                };
-                                let rt;
-                                const debounced = () => { clearTimeout(rt); rt = setTimeout(remeasure, 200); };
-                                window.addEventListener("resize", debounced);
-                                // Watch the passage container itself: pane resizes, scrollbar
-                                // changes and rewraps all change its size without a window event.
-                                if (window.ResizeObserver) {
-                                    // Every passage panel, not just the first: a
-                                    // second column opened from a footnote resizes
-                                    // without a window event and its bars go stale.
-                                    const hookCont = () => {
-                                        const cs = Array.from(document.querySelectorAll(".passageContentHolder"));
-                                        if (!cs.length) cs.push(document.body);
-                                        const key = cs.join(",");
-                                        if (window.__stepBarRO && window.__stepBarRO._key === key) return;
-                                        if (window.__stepBarRO) window.__stepBarRO.disconnect();
-                                        window.__stepBarRO = new ResizeObserver(debounced);
-                                        window.__stepBarRO._key = key;
-                                        cs.forEach(c => window.__stepBarRO.observe(c));
-                                    };
-                                    hookCont();
-                                    setTimeout(hookCont, 1500);
-                                }
-                                // Fonts finish loading after first paint and rewrap text;
-                                // re-measure once they do, plus one late safety pass.
-                                if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => setTimeout(remeasure, 100));
-                                setTimeout(remeasure, 1200);
-                            }
-                            const obs = new MutationObserver(run);
-                            window.__stepDotObserver = obs;
-                            window.__stepDotObserve = () => {
-                                try { obs.disconnect(); } catch (e) {}
-                                getTargets().forEach(t => obs.observe(t, { childList: true, subtree: true }));
-                                obs.__root = document.body;
-                            };
-                            window.__stepDotObserve();
-                        }
-
-                        // Inject once now, observer suppressed during our own DOM writes
-                        if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
-                        let res = null;
-                        try { res = window.__stepInjectDots(); } finally {
-                            if (window.__stepDotObserve) window.__stepDotObserve();
-                        }
-
-                        // STEP navigates in place: following a footnote link
-                        // swaps the article and opens a second passage column
-                        // without a page load, so the host never learns the
-                        // page changed. Watch for that here and tell the host.
-                        // Fenced off and run AFTER injection: this must never
-                        // be able to stop the bars being drawn.
-                        try {
-                            const pageKey = () => location.href
-                                + "|" + document.querySelectorAll(".passageContentHolder").length
-                                + "|" + document.querySelectorAll(".verse").length;
-                            if (typeof window.__stepLastPageKey !== "string") {
-                                window.__stepLastPageKey = pageKey();
-                            }
-                            window.__stepNotifyPage = () => {
-                                let k;
-                                try {
-                                    if (!document.querySelectorAll(".verse").length) return;
-                                    k = pageKey();
-                                } catch (e) { return; }
-                                if (k === window.__stepLastPageKey) return;
-                                window.__stepLastPageKey = k;
-                                try { console.log("__STEPPAGE__"); } catch (e) {}
-                            };
-                            if (!window.__stepPageWatchHooked) {
-                                window.__stepPageWatchHooked = true;
-                                const fire = () => setTimeout(() => {
-                                    try { window.__stepNotifyPage && window.__stepNotifyPage(); } catch (e) {}
-                                }, 500);
-                                window.addEventListener("hashchange", fire);
-                                window.addEventListener("popstate", fire);
-                                try {
-                                    ["pushState", "replaceState"].forEach((n) => {
-                                        const orig = history[n];
-                                        if (!orig || orig.__stepWrapped) return;
-                                        const w = function (...a) { const r = orig.apply(this, a); fire(); return r; };
-                                        w.__stepWrapped = true;
-                                        history[n] = w;
-                                    });
-                                } catch (e) {}
-                                setInterval(() => {
-                                    try {
-                                        if (window.__stepDotObserver && window.__stepDotObserver.__root !== document.body) {
-                                            window.__stepDotObserve && window.__stepDotObserve();
-                                        }
-                                        window.__stepNotifyPage && window.__stepNotifyPage();
-                                    } catch (e) {}
-                                }, 1500);
-                            }
-                        } catch (e) {
-                            window.__stepLastPageWatchError = e && e.message ? e.message : String(e);
-                        }
-
-                        window.__stepLastInjectError = null;
-                        return res;
-
-                    } catch (e) {
-                        window.__stepLastInjectError = e && e.message ? e.message : String(e);
-                        return null;
-                    }
-                })();
-            `);
+            // 4b. Hand the page its DOM layer. StepInterfaceDOM is authored as
+            // a real class at the bottom of this file and shipped across the
+            // webview boundary as source, so this side only ever deals with the
+            // result object it returns.
+            res = await webviewEl.executeJavaScript(
+                "(function(){" +
+                StepInterfaceDOM.toString() +
+                ";window.__stepDOM = new StepInterfaceDOM();" +
+                "return window.__stepDOM.mount();})()"
+            );
 
         } catch (err) {
             console.error("STEP Plugin: injectNoteDots error:", err);
@@ -4593,8 +3669,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this._barDragging = false;
         this._pointerInPopover = false;
         this._lastPointer = null;
+        // True while the pointer is known to be over the guest page rather
+        // than over our own chrome. A bar report can only come from inside the
+        // webview, so it sets this; any host mousemove clears it.
+        this._inGuestPage = false;
         this.registerDomEvent(document, "mousemove", (e) => {
             this._lastPointer = { x: e.clientX, y: e.clientY };
+            // A host mousemove means the pointer is over host DOM, never over
+            // the page's content.
+            this._inGuestPage = false;
             // Bar hits are only reported from inside the webview. Once the
             // pointer moves onto one of our own popovers or bars the reports
             // stop, so the last hit would otherwise stay "current" and keep a
@@ -4612,6 +3695,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (!this._hoverPop) return false;
             const own = this._hoverPop.body;
             if (!own || !own.isConnected) return false;
+            // A report from the guest proves the pointer is over the page, so
+            // it cannot be over the note. Without this, the note's enter/leave
+            // flag was authoritative whenever a guest report arrived (guest
+            // reports null _lastPointer), and that flag can stay stuck: the
+            // pointer leaving the note into the webview fires no mouseleave in
+            // the host, because events over the guest never reach it. One stuck
+            // `true` then kept every later hover note open forever — the
+            // "after I pin something and close it with the X" bug.
+            if (this._inGuestPage) return false;
             const c = own;
             const p = this._lastPointer;
             if (!p) return this._pointerInPopover;
@@ -4665,6 +3757,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // popover after a short hover delay (later messages cancel the timer).
         this.handleBarHoverMessage = (webviewEl, hit) => {
             this._barWebview = webviewEl;
+            // Any report at all came from inside the webview, so the pointer is
+            // over the page and not over one of our popovers.
+            this._inGuestPage = true;
             // Attach the focus safety net once per webview element. Coming back
             // into the page is the moment any state left behind by our own
             // chrome can be corrected, whatever caused it.
@@ -6898,5 +5993,981 @@ class BibleInformation {
     static getBookOverview(book) {
         if (!book) return null;
         return BibleInformation._overviews[book] || null;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// StepInterfaceDOM - the in-page half of the bar overlay.
+//
+// This class is authored here, in the plugin, but it never runs here: the
+// whole class is String()-ed and evaluated inside the STEP <webview>, a
+// separate document with its own window. window.__stepDOM holds the live
+// instance there, and mount() returns the result object the plugin reads back.
+//
+// It knows nothing about Obsidian, the vault, or the plugin: everything it
+// needs arrives in the window.__step* payload the plugin writes first, and
+// everything it reports goes out through console.log('__STEPBAR__...'), which
+// the host picks up on the webview console-message channel.
+//
+// Written as a real class rather than a template literal so that node --check
+// parses it, editors highlight it, and a syntax error is a plugin load failure
+// instead of a silent 'no bars anywhere'.
+// ---------------------------------------------------------------------------
+class StepInterfaceDOM {
+    constructor() {
+        // Latest layout pass. Mounting always builds a new instance, so these
+        // start empty; the payload arrives on window.__step* before mount().
+        this.panels = [];
+        this.verses = [];
+    }
+
+    // Entry point. Installs the window.__step* aliases, the listeners and
+    // the observer, then does one synchronous layout pass and returns its
+    // summary. Any throw is recorded for the host to read back instead of
+    // failing invisibly.
+    mount() {
+        try {
+            this.installAliases();
+            this.installHoverHooks();
+            this.installObserver();
+
+            if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
+            let res = null;
+            try { res = this.inject(); } finally {
+                if (window.__stepDotObserve) window.__stepDotObserve();
+            }
+            this.installPageWatch();
+            window.__stepLastInjectError = null;
+            return res;
+        } catch (e) {
+            window.__stepLastInjectError = e && e.message ? e.message : String(e);
+            return null;
+        }
+    }
+
+    // The window.__step* entry points that this class and the host both call.
+    // Re-bound on every mount, resolving through window.__stepDOM, so a
+    // rebuilt page never runs a stale copy of this code.
+    installAliases() {
+        window.__stepInjectDots = () => window.__stepDOM.inject();
+        window.__stepHighlight = (id, range, page) => window.__stepDOM.highlight(id, range, page);
+        window.__stepInLane = (id, page) => window.__stepDOM.inLane(id, page);
+        window.__stepHoldBars = (byPage) => window.__stepDOM.holdBars(byPage);
+        window.__stepBarState = (state) => window.__stepDOM.barState(state);
+        window.__stepLaneOf = (page) => window.__stepDOM.laneOf(page);
+        window.__stepBarAt = (x, y) => window.__stepDOM.barAt(x, y);
+        // window.__stepNotifyPage is installed by installPageWatch(), which
+        // owns the page key it compares against.
+    }
+
+    // One layout pass. Idempotent: bars are duplicate-guarded per note and
+    // stale ones are removed, so calling it any number of times is safe.
+    inject() {
+        const fullMap = window.__stepDotFullMap || {};
+        const bookMap = window.__stepDotBookMap || {};
+        const toCanon = (ref) => {
+            const parts = ref.split(".");
+            const full = bookMap[parts[0].toLowerCase()];
+            if (!full) return null;
+            return [full.replace(/\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
+        };
+
+        if (!document.getElementById("step-linker-dot-style")) {
+            const style = document.createElement("style");
+            style.id = "step-linker-dot-style";
+            style.textContent = [
+                "div.verse { position: relative; }",
+                // NOTE: no padding rule here — the adaptive gutter is set
+                // as an inline style on the passage container below, and a
+                // stylesheet !important would override it.
+                ".step-note-bar {",
+                "  position: absolute; top: 0;",
+                "  width: 4px; min-height: 10px;",
+                "  background: " + (window.__stepBarColour || "#17758f") + "; opacity: 0.7;",
+                "  border-radius: 2px;",
+                "  cursor: pointer; z-index: 10;",
+                "  transition: opacity 0.12s ease, width 0.12s ease;",
+                "}",
+                // Crosslinks (refs inside note content) are hollow:
+                // stroke only, a little wider so the stroke reads.
+                ".step-note-bar[data-cross='1'] { width: 5px; background: transparent; }",
+                // A typed bar widens the moment the pointer is on
+                // it. data-hold carries the same widened width so
+                // the bar stays wide while its popover is open —
+                // including after the pointer moves onto the
+                // popover, or onto another bar.
+                ".step-note-bar[data-typed='1']:hover { width: 6px; opacity: 1; }",
+                ".step-note-bar[data-typed='1'][data-cross='1']:hover { width: 7px; opacity: 1; }",
+                ".step-note-bar[data-hold='1'] { opacity: 1; width: 6px; }",
+                ".step-note-bar[data-hold='1'][data-cross='1'] { width: 7px; }",
+                // A crosslink widens its section bar on hover, the
+                // same instant the crosslink itself widens. Kept on
+                // its own attribute so the host's hold sync can't
+                // clear it.
+                ".step-note-bar[data-parent-lit='1'] { opacity: 1; width: 6px; }",
+                ".step-note-bar[data-parent-lit='1'][data-cross='1'] { width: 7px; }",
+                // The overflow lane: one thin grey bar standing
+                // for every note that runs past this page.
+                // The lane widens and shrinks on exactly the same
+                // widths as a note bar, so a held lane and a held
+                // note read as the same weight.
+                ".step-note-overflow { width: 4px; opacity: 0.55; }" ,
+                ".step-note-overflow:hover { width: 6px; opacity: 1; }",
+                ".step-note-overflow[data-hold='1'] { width: 6px; opacity: 1; }",
+                ".step-note-overflow[data-lane-hover='1'] { width: 6px; opacity: 1; }",
+                ".verse.step-ref-hover {",
+                "  background-color: rgba(190, 190, 163, 0.19) !important;",
+                "  outline: 1px solid #cacda600 !important;",
+                "  border-radius: 3px;",
+                "}",
+                ".step-note-tip {",
+                "  position: fixed; z-index: 1000000;",
+                "  background: #1e1e1e; color: #d6d6d6;",
+                "  border: 1px solid var(--border-color);",
+                "  border-radius: 4px; padding: 4px 8px;",
+                "  font-size: 12px; font-family: var(--font-interface);",
+                "  pointer-events: none; white-space: nowrap;",
+                "  box-shadow: 0 2px 8px rgba(0,0,0,0.3);",
+                "}",
+                ".step-note-tip.wide {",
+                "  white-space: pre-line; max-width: 480px;",
+                "  padding: 8px 12px; line-height: 1.5;",
+                "  max-height: 50vh; overflow: hidden;",
+                "}"
+            ].join("\n");
+            document.head.appendChild(style);
+        }
+
+        // Canonical ordering: needed to sort each panel's
+        // verses before its bars are measured.
+        const order = window.__stepBookOrder || [];
+        const ordOf = (canon) => {
+            const p = String(canon).split(".");
+            const bi = order.indexOf(p[0]);
+            const ch = parseInt(p[1], 10);
+            const v = p[2] ? parseInt(p[2], 10) : 0;
+            if (bi < 0 || !ch) return null;
+            return bi * 1e9 + ch * 1e6 + (v || 0);
+        };
+
+        // Collect the page's verses, grouped by the passage
+        // panel they live in. STEP can show two columns at
+        // once — following a footnote opens a second passage
+        // alongside the first — and each panel needs its own
+        // independent set of bars. Bars are absolutely
+        // positioned inside their panel, so a single mixed
+        // set measured some bars against the wrong container
+        // (and drew them all in the first panel).
+        const panelOf = (verseEl) =>
+            verseEl.closest(".passageContentHolder") ||
+            verseEl.closest("[class*='passage']") ||
+            document.body;
+        const panels = [];
+        const panelFor = (cont) => {
+            let p = panels.find(x => x.cont === cont);
+            if (!p) { p = { cont, verses: [], page: "", list: [], start: 0, x: 0 }; panels.push(p); }
+            return p;
+        };
+        const seenVerses = new Set();
+        document.querySelectorAll("a.verseLink").forEach(anchor => {
+            const name = anchor.getAttribute("name");
+            if (!name) return;
+            const canon = toCanon(name);
+            if (!canon) return;
+            const verseEl = anchor.closest(".verse") || anchor.parentElement;
+            if (!verseEl || seenVerses.has(verseEl)) return;
+            seenVerses.add(verseEl);
+            panelFor(panelOf(verseEl)).verses.push({ verse: verseEl, canon });
+        });
+        // Document order stops being canonical order once a
+        // second panel can start anywhere, so sort per panel.
+        // STEP's second passage panel (opened by following a
+        // footnote) is not always its own passageContentHolder:
+        // it can render as a second column inside the same
+        // article. One holder then means one "page" spanning
+        // both passages, so notes that cover a single column
+        // stop looking like page-covering references and every
+        // bar is drawn in the first column's gutter. Split any
+        // holder whose verses form more than one horizontal
+        // column, and give each split its own subtree root as a
+        // bar container.
+        const splitColumns = (list) => {
+            const items = list.map(v => {
+                const r = v.verse.getBoundingClientRect();
+                return { v, left: r.left, right: r.right, top: r.top, h: r.height };
+            });
+            const cols = [];
+            items.forEach(it => {
+                const c = cols.find(c => Math.abs(c.left - it.left) < 40);
+                if (c) {
+                    c.items.push(it);
+                    if (it.left < c.left) c.left = it.left;
+                    if (it.right > c.right) c.right = it.right;
+                } else cols.push({ left: it.left, right: it.right, items: [it] });
+            });
+            if (cols.length < 2) return null;
+            cols.sort((a, b) => a.left - b.left);
+            // Indentation can push a verse's left edge past
+            // the 40px grouping tolerance and fake a second
+            // "column" inside a single passage. Two real
+            // columns are horizontally disjoint: each must
+            // clear the previous column's right edge, and no
+            // stray verse may form a column of its own.
+            for (let i = 0; i < cols.length; i++) {
+                if (cols[i].items.length < 3) return null;
+                if (i > 0 && cols[i].left - cols[i - 1].right < 40) return null;
+            }
+            return cols.map(c => {
+                const mine = c.items.map(it => it.v);
+                let root = mine[0].verse;
+                while (root && !mine.every(m => root.contains(m.verse))) root = root.parentElement;
+                while (root && root !== document.body
+                    && items.some(o => mine.indexOf(o.v) < 0 && o.v.verse && root.contains(o.v.verse))) {
+                    root = root.parentElement;
+                }
+                if (!root || root === document.body) root = null;
+                return { verses: mine, root };
+            });
+        };
+        const refined = [];
+        panels.forEach(p => {
+            const split = splitColumns(p.verses);
+            if (!split) { refined.push(p); return; }
+            const paneRect = p.cont === document.body ? null : p.cont.getBoundingClientRect();
+            split.forEach(col => {
+                const root = col.root || p.cont;
+                const rr = root === document.body ? null : root.getBoundingClientRect();
+                refined.push({
+                    cont: root,
+                    verses: col.verses,
+                    page: "", list: [], start: 0,
+                    // Bars are absolute inside cont; when the
+                    // column has no container of its own, shift
+                    // them right to the column's own edge.
+                    x: (rr && paneRect) ? Math.max(0, Math.round(rr.left - paneRect.left)) : 0
+                });
+            });
+        });
+        panels.length = 0;
+        refined.forEach(p => panels.push(p));
+
+        panels.forEach(p => p.verses.sort((a, b) => {
+            const oa = ordOf(a.canon), ob = ordOf(b.canon);
+            if (oa == null || ob == null) return 0;
+            return oa - ob;
+        }));
+        // One flat, panel-by-panel list: a bar's __range
+        // indexes straight into it for highlighting.
+        const verses = [];
+        panels.forEach(p => {
+            p.start = verses.length;
+            p.verses.forEach(v => { v.__page = p.page || ""; verses.push(v); });
+        });
+        window.__stepVerses = verses; // exposed for host-driven highlight
+        window.__stepPanels = panels;
+
+        let totalAdded = 0;
+        const allDbg = [];
+        panels.forEach((panel, pi) => {
+        const verses = panel.verses;
+        const cont = panel.cont;
+        let contRect = null;
+        if (cont) {
+            cont.style.position = "relative";
+            contRect = cont.getBoundingClientRect();
+        }
+        panel.page = "#" + pi;
+        panel.list = [];
+
+        // For each note, the min/max verse index present in
+        // this panel
+        const noteIdx = {};
+        verses.forEach((v, i) => {
+            const notes = fullMap[v.canon];
+            if (!notes) return;
+            notes.forEach(nb => {
+                const e = noteIdx[nb] || (noteIdx[nb] = { min: i, max: i });
+                if (i < e.min) e.min = i;
+                if (i > e.max) e.max = i;
+            });
+        });
+
+        // Build note list in verse order, then assign slots by
+        // vertical overlap: each bar gets the first slot whose
+        // previous occupant doesn't overlap its range. This makes
+        // overlapping bars sit in separate columns and makes the
+        // gutter width adapt to how many overlap at once.
+        const noteList = Object.keys(noteIdx)
+            .map(nb => ({ nb, e: noteIdx[nb] }))
+            // Longer spans first so the longest bar lands in the
+            // leftmost slot and bars funnel large-to-small left to right.
+            .sort((a, b) => (b.e.max - b.e.min) - (a.e.max - a.e.min) || a.e.min - b.e.min);
+
+        // Notes whose true range runs off the top (or bottom)
+        // of this page get no gutter of their own: a bar that
+        // starts above the screen or ends below it can only be
+        // drawn as a misleading fragment. They share one grey
+        // lane on the far left instead.
+        const boundsOf = window.__stepNoteBounds || {};
+        let pageStart = null, pageEnd = null;
+        verses.forEach(v => {
+            const o = ordOf(v.canon);
+            if (o == null) return;
+            if (pageStart === null || o < pageStart) pageStart = o;
+            if (pageEnd === null || o > pageEnd) pageEnd = o;
+        });
+        // The page key identifies one lane. Two panels can be
+        // on the same passage, so the panel index is part of
+        // it — otherwise a list pinned in panel one would be
+        // treated as the lane for panel two.
+        panel.page = (pageStart === null ? "" : pageStart + "-" + pageEnd) + "#" + pi;
+        // Retag this panel's verses with its final page key. The flat
+        // list was built before the key existed, so __page was left
+        // empty and every page-scoped highlight (bar hover) filtered
+        // every verse out. Walk this panel's own verse objects — the
+        // earlier version indexed the flat list with panel.start + i
+        // into the panel-local array, so only panel 0 (start 0) ever
+        // matched and the second column's verses stayed page-less.
+        panel.verses.forEach(v => { v.__page = panel.page; });
+        const overflowList = [];
+        const drawnList = [];
+        noteList.forEach(item => {
+            const b = boundsOf[item.nb];
+            // A note covering the whole page and running
+            // off either end hides where it actually
+            // starts or stops, so it goes to the lane.
+            // A note that covers the page exactly keeps
+            // its own (full-height) bar, and one that
+            // starts inside the page keeps its bar too.
+            const coversPage = b && pageStart !== null
+                && b.start <= pageStart && b.end >= pageEnd;
+            const overflowOne =
+                b.start < pageStart || b.end > pageEnd;
+            if (coversPage && overflowOne) {
+                overflowList.push(item);
+            } else {
+                drawnList.push(item);
+            }
+        });
+        noteList.length = 0;
+        drawnList.forEach(it => noteList.push(it));
+
+        const slotEnds = [];   // slot -> max verse index used
+        const slotOf = {};
+        noteList.forEach(item => {
+            let s = 0;
+            while (s < slotEnds.length && slotEnds[s] >= item.e.min) s++;
+            slotOf[item.nb] = s;
+            slotEnds[s] = item.e.max;
+        });
+
+        const dbg = [];
+        let maxSlot = 0;
+        let added = 0;
+
+        // Every bar is a plain solid bar: whole-book references
+        // are expanded to the book's verses when the map is built.
+        noteList.forEach(item => {
+            const slot = slotOf[item.nb];
+            // Track widest slot regardless of whether the bar is
+            // newly added — otherwise re-injection (bars already
+            // exist) collapses the gutter back to the base padding.
+            maxSlot = Math.max(maxSlot, slot);
+                const firstV = verses[item.e.min].verse;
+                const lastV = verses[item.e.max].verse;
+
+                // Idempotency: one bar per note per page
+                const existing = cont.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
+                if (existing) return;
+
+                // Slots sit to the right of the overflow lane,
+                // which is always 12px wide.
+                const slotX = slot + 1;
+
+                // Typed bars take their colour from the note-type
+                // settings (or the crosslink colour for X: ids).
+                const tinfo = (window.__stepTypedData || {}).contentOf && window.__stepTypedData.contentOf[item.nb];
+                const bar = document.createElement("div");
+                bar.className = "step-note-bar";
+                bar.dataset.note = item.nb;
+                // Metadata for the plugin-side hover popover: the
+                // verse range and whether this is a typed/crosslink bar.
+                bar.dataset.ref = verses[item.e.min].canon + ".." + verses[item.e.max].canon;
+                if (tinfo) bar.dataset.typed = "1";
+                if (tinfo && window.__stepTypedData.colourOf[item.nb]) {
+                    const typeCol = window.__stepTypedData.colourOf[item.nb];
+                    bar.style.background = typeCol;
+                }
+                if (item.nb.indexOf("X:") === 0) {
+                    // Crosslink: hollow bar, stroke only.
+                    const stroke = (window.__stepTypedData.colourOf || {})[item.nb] || "currentColor";
+                    bar.dataset.cross = "1";
+                    bar.style.background = "transparent";
+                    bar.style.boxShadow = "inset 0 0 0 2px " + stroke;
+                }
+                // Fixed gutter position; widths live in the
+                // stylesheet so :hover can still widen a bar.
+                const baseLeft = 2;
+                bar.style.left = ((panel.x || 0) + baseLeft + slotX * 8) + "px";
+
+                // Measure the range from viewport rects, converted
+                // to container-content coordinates (accounting for
+                // container scroll) so inline spans can't inflate it.
+                const r1 = firstV.getBoundingClientRect();
+                const r2 = lastV.getBoundingClientRect();
+                // The verse span includes the raised verse number,
+                // so its rect top sits above the text line. Align the
+                // bar to the text's own line box instead.
+                const lineH1 = parseFloat(getComputedStyle(firstV).lineHeight) || r1.height;
+                // Stretch the bar to cover the full vertical extent of the
+                // referenced text: top of the verse number down to the bottom
+                // of the last verse's final line.
+                const top1 = r1.top - contRect.top + cont.scrollTop;
+                const bottom2 = r2.bottom - contRect.top + cont.scrollTop;
+                bar.style.top = top1 + "px";
+                bar.style.height = Math.max(10, bottom2 - top1) + "px";
+                dbg.push("#" + added + " s" + slot + " t" + Math.round(top1) + " h" + Math.round(bottom2 - top1) + " " + verses[item.e.min].canon + ".." + verses[item.e.max].canon);
+
+                bar.__range = { min: panel.start + item.e.min, max: panel.start + item.e.max };
+                // Which passage panel this bar belongs to. Two
+                // columns on one page are independent: a hover
+                // or hold must never touch the other column.
+                bar.__page = panel.page;
+                // Hover: highlight the whole referenced range in-page.
+                // Typed bars show their content in an Obsidian-managed
+                // popover (plugin side), so no in-page tip for them.
+                bar.addEventListener("mouseenter", () => {
+                    window.__stepHighlight(item.nb, "", panel.page);
+                    if (tinfo) {
+                        // Widen this crosslink's section bar too.
+                        const pid = tinfo.parentId;
+                        if (pid) {
+                            const pb = cont.querySelector('.step-note-bar[data-note="' + pid.replace(/"/g, "") + '"]');
+                            if (pb) { pb.setAttribute("data-parent-lit", "1"); bar.__parentLit = pb; }
+                        }
+                        return;
+                    }
+                    const fr2 = firstV.getBoundingClientRect();
+                    const tip = document.createElement("div");
+                    tip.className = "step-note-tip";
+                    if (tinfo) {
+                        tip.classList.add("wide");
+                        tip.textContent = tinfo.label + "\n\n" + tinfo.text;
+                    } else {
+                        tip.textContent = item.nb;
+                    }
+                    tip.style.left = (fr2.right + 10) + "px";
+                    tip.style.top = fr2.top + "px";
+                    document.body.appendChild(tip);
+                    // Clamp inside the viewport: verses near the right
+                    // or bottom edge would otherwise push the tip off screen.
+                    const tr = tip.getBoundingClientRect();
+                    const lx = Math.max(4, Math.min(fr2.right + 10, window.innerWidth - tr.width - 4));
+                    const ty = Math.max(4, Math.min(fr2.top, window.innerHeight - tr.height - 4));
+                    tip.style.left = lx + "px";
+                    tip.style.top = ty + "px";
+                    bar.__tip = tip;
+                });
+                bar.addEventListener("mouseleave", () => {
+                    // Don't wipe a highlight the popover is holding.
+                    if (!(window.__stepHl && window.__stepHl.hold)) window.__stepHighlight("", "", panel.page);
+                    if (bar.__parentLit) { bar.__parentLit.removeAttribute("data-parent-lit"); bar.__parentLit = null; }
+                    if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
+                });
+
+                cont.appendChild(bar);
+                added++;
+        });
+
+        // The overflow lane: one thin grey bar for every note
+        // that reaches outside this page. It sits at the very
+        // left and is as tall as the list it stands for.
+        const OVF_ID = "__STEPOVF__";
+        if (cont) {
+            if (!overflowList.length) {
+                const oldBar = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
+                if (oldBar) oldBar.remove();
+                panel.list = [];
+            } else {
+                // Least verses first, so the smallest note (the
+                // most specific reference) is at the top.
+                const spanOf = (it) => {
+                    const b = boundsOf[it.nb];
+                    return b ? (b.end - b.start) : (it.e.max - it.e.min);
+                };
+                const ovf = overflowList.slice().sort((a, b) => spanOf(a) - spanOf(b));
+                // This panel's lane contents. The host keys a
+                // list by hit.page, which now carries the
+                // panel index, so the two lanes stay apart.
+                panel.list = ovf.slice();
+                panel.list = ovf.map(it => it.nb);
+                let ob = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
+                if (ob) { ob.__panel = panel; ob.__page = panel.page; ob.style.left = ((panel.x || 0) + 2) + "px"; }
+                if (!ob) {
+                    ob = document.createElement("div");
+                    ob.className = "step-note-bar step-note-overflow";
+                    ob.dataset.note = OVF_ID;
+                    ob.__panel = panel;
+                    ob.__page = panel.page;
+                    ob.style.background = "rgba(150,150,150,0.55)";
+                    ob.style.left = ((panel.x || 0) + 2) + "px";
+                    // No inline width: it would override both
+                    // the 4px base and the 6px :hover rule,
+                    // leaving the lane permanently wide.
+                    ob.addEventListener("mouseenter", () => {
+                        ob.setAttribute("data-ovf-hover", "1");
+                    });
+                    ob.addEventListener("mouseleave", () => {
+                        ob.removeAttribute("data-ovf-hover");
+                    });
+                    cont.appendChild(ob);
+                }
+                // The lane spans the passage itself — from the
+                // top of the first verse to the bottom of the
+                // last — so it is a full-height target that does
+                // not dodge the cursor.
+                if (verses.length && contRect) {
+                    const firstR = verses[0].verse.getBoundingClientRect();
+                    const lastR = verses[verses.length - 1].verse.getBoundingClientRect();
+                    const topY = firstR.top - contRect.top + cont.scrollTop;
+                    const botY = lastR.bottom - contRect.top + cont.scrollTop;
+                    ob.style.top = topY + "px";
+                    ob.style.height = Math.max(40, botY - topY) + "px";
+                } else {
+                    ob.style.top = (cont.scrollTop + 40) + "px";
+                    ob.style.height = Math.max(14, ovf.length * 12 + 8) + "px";
+                }
+            }
+        }
+
+        // Re-injection is a full sync, not an append: a bar
+        // whose note no longer maps onto this page (the
+        // reference was deleted from the note, or the note
+        // itself went away) has to disappear without a
+        // reload. Anything left over is stale.
+        if (cont) {
+            const keep = new Set(noteList.map(it => it.nb));
+            keep.add("__STEPOVF__");
+            cont.querySelectorAll('.step-note-bar').forEach(b => {
+                const id = b.getAttribute('data-note') || '';
+                if (keep.has(id)) return;
+                if (b.__tip) { b.__tip.remove(); b.__tip = null; }
+                if (b.__parentLit) { b.__parentLit.removeAttribute('data-parent-lit'); b.__parentLit = null; }
+                b.remove();
+            });
+        }
+        // Adaptive gutter: widen padding to fit the slot stack
+        if (cont && cont !== document.body) {
+            cont.style.paddingLeft = (20 + maxSlot * 8) + "px";
+        }
+        if (dbg.length) {
+            // debug info goes to the console log in the plugin; no title edit
+        }
+        totalAdded += added;
+        allDbg.push(dbg.join(" | "));
+        });
+
+        // The union of every panel's lane, for the in-page
+        // helpers that only need "is this note in a lane".
+        window.__stepOverflowList = [].concat.apply([], panels.map(p => p.list));
+        return {
+            added: totalAdded,
+            dbg: allDbg.join(" || "),
+            cont: panels.length > 1 ? ("PANELS:" + panels.length)
+                : (panels[0] ? (panels[0].cont === document.body ? "BODY" : (panels[0].cont && panels[0].cont.className) || "?") : "NONE"),
+            verses: verses.length,
+            panels: panels.length
+        };
+    }
+
+    highlight(id, sourceRange, page) {
+        if (page === undefined) page = "";
+        // Clear from the document, not from the last pass's bookkeeping.
+        // A page-scoped clear deliberately leaves the other panel lit,
+        // but replacing window.__stepHl afterwards used to forget those
+        // survivors, so nothing could ever unlight them: the left column
+        // stayed lit for good once the right column had been hovered.
+        // Scanning the DOM finds orphans as well as tracked elements.
+        // Every lit verse carries __page (stamped in lit() below), so
+        // the scope test is still exact.
+        const clear = (onlyPage) => {
+            document.querySelectorAll(".verse.step-ref-hover").forEach(el => {
+                if (!onlyPage || el.__page === onlyPage) el.classList.remove("step-ref-hover");
+            });
+            document.querySelectorAll(".step-note-bar.step-bar-expand").forEach(el => {
+                if (!onlyPage || el.__page === onlyPage) el.classList.remove("step-bar-expand");
+            });
+            window.__stepHl = null;
+        };
+        // Always clear everything first. Only one note is hovered at a
+        // time — the host sends one id per state — so a highlight left
+        // standing in the other column is a stale highlight: the pointer
+        // is no longer on it. Page scoping still decides which verses
+        // are allowed to light, so the right column can never light the
+        // left one's text.
+        clear();
+        if (!id) return;
+        const verses = window.__stepVerses || [];
+        const els = [];
+        // With a page given, only that panel's verses can light up.
+        const lit = (v) => {
+            if (!v || !v.verse || els.indexOf(v.verse) !== -1) return;
+            if (page && v.__page !== page) return;
+            // Stamp the page on the element itself. The page key
+            // lives on the {verse, canon} wrapper, but clear()
+            // tests the DOM nodes in window.__stepHl.els — so a
+            // panel-scoped clear used to find __page undefined on
+            // every element and remove nothing, leaving the other
+            // panel's verses lit after the pointer had moved on.
+            v.verse.__page = v.__page || "";
+            v.verse.classList.add("step-ref-hover");
+            els.push(v.verse);
+        };
+        // The same note can have a bar in each panel; light
+        // only the one(s) in the panel being hovered.
+        document.querySelectorAll('.step-note-bar[data-note="' + CSS.escape(id) + '"]').forEach(bar => {
+            if (!bar.__range) return;
+            if (page && bar.__page !== page) return;
+            for (let i = bar.__range.min; i <= bar.__range.max; i++) lit(verses[i]);
+        });
+        // A ref bar lights only what it points at — never the
+        // note text the ref was written in.
+        const range = sourceRange || "";
+        if (range && verses.length) {
+            const parts = (c) => {
+                const a = String(c || "").split(".");
+                return [a[0] || "", parseInt(a[1], 10) || 0, parseInt(a[2], 10) || 0];
+            };
+            const halves = range.split("-");
+            const lo = parts(halves[0]);
+            const hi = halves[1] ? parts(halves[1]) : lo;
+            const cmp = (x, y) => (x[0] !== y[0] ? (x[0] < y[0] ? -1 : 1) : (x[1] - y[1]) || (x[2] - y[2]));
+            verses.forEach(v => {
+                const q = parts(v.canon);
+                if (!q[0]) return;
+                if (cmp(q, lo) >= 0 && cmp(q, hi) <= 0) lit(v);
+            });
+        }
+        window.__stepHl = { els: els, bars: [], page: page || "" };
+    }
+
+    inLane(id, page) {
+        // Lanes are per panel: a note reaching past the left
+        // column says nothing about the right one.
+        let ids = null;
+        if (page && Array.isArray(window.__stepPanels)) {
+            const pn = window.__stepPanels.filter(p => p.page === page)[0];
+            if (pn) ids = pn.list;
+        }
+        if (!Array.isArray(ids)) ids = window.__stepOverflowList;
+        if (!Array.isArray(ids) || !id) return false;
+        if (ids.indexOf(id) >= 0) return true;
+        const td = window.__stepTypedData || {};
+        const contentOf = td.contentOf || {};
+        const seen = new Set();
+        let cur = contentOf[id] && contentOf[id].parentId;
+        while (cur && !seen.has(cur)) {
+            if (ids.indexOf(cur) >= 0) return true;
+            seen.add(cur);
+            cur = contentOf[cur] && contentOf[cur].parentId;
+        }
+        return false;
+    }
+
+    holdBars(byPage) {
+        // A map of panel page -> ids, so each column is handled
+        // on its own. A bare array means the unnamed panel.
+        let map = byPage;
+        if (!map || Array.isArray(map)) map = { "": Array.isArray(map) ? map : [] };
+        const sets = {};
+        Object.keys(map).forEach(k => { sets[k] = new Set(map[k] || []); });
+        // A note open from the lane must widen the lane in the
+        // panel it was opened from — and only that panel. The
+        // id reaching us here is the note, not "__STEPOVF__"
+        // (the host only adds the lane id when the pointer is
+        // directly on a lane), so membership is checked
+        // against that panel's own list.
+        const lanePage = {};
+        if (Array.isArray(window.__stepPanels)) {
+            window.__stepPanels.forEach(pn => {
+                const ids = pn.list || [];
+                const hit = (sets[pn.page || ""] || new Set());
+                lanePage[pn.page || ""] = ids.some(id => hit.has(id));
+            });
+        }
+        document.querySelectorAll(".step-note-bar").forEach(b => {
+            const page = b.__page || "";
+            const set = sets[page];
+            const id = b.dataset.note || "";
+            if (id === "__STEPOVF__") {
+                if (set && (set.has(id) || lanePage[page])) b.setAttribute("data-hold", "1");
+                else if (b.getAttribute("data-hold") === "1") b.removeAttribute("data-hold");
+                return;
+            }
+            if (set && set.has(id)) b.setAttribute("data-hold", "1");
+            else if (b.getAttribute("data-hold") === "1") b.removeAttribute("data-hold");
+        });
+    }
+
+    barState(state) {
+        if (!state || typeof state.seq !== "number") return;
+        if (typeof window.__stepBarStateSeq === "number"
+            && state.seq < window.__stepBarStateSeq) return;
+        window.__stepBarStateSeq = state.seq;
+        try { if (window.__stepHoldBars) window.__stepHoldBars(state.hold || {}); } catch (e) {}
+        try { if (window.__stepHighlight) window.__stepHighlight(state.id || "", "", state.page || ""); } catch (e) {}
+    }
+
+    laneOf(page) {
+        if (!Array.isArray(window.__stepPanels)) return null;
+        const pn = window.__stepPanels.filter(p => p.page === (page || ""))[0];
+        if (!pn || !pn.cont) return null;
+        return pn.cont.querySelector('.step-note-bar[data-note="__STEPOVF__"]');
+    }
+
+    barAt(x, y) {
+        const hits = document.elementsFromPoint(x, y)
+            .filter(el => el.classList && el.classList.contains("step-note-bar"));
+        let b = hits.length ? hits[0] : null;
+        if (!b) {
+            // Geometric fallback. elementsFromPoint rounds the
+            // point to whole pixels and skips the bars'
+            // rounded corners, so a pointer resting on the very
+            // left edge of a 4px bar can miss it — while
+            // :hover and mouseenter (exact, fractional hit
+            // testing) both fire. The bar widens and the text
+            // highlights, but no popover opens and clicking it
+            // pins nothing. Match against the rects instead,
+            // with a small tolerance for that same edge.
+            let bestD = Infinity;
+            document.querySelectorAll(".step-note-bar").forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) return;
+                const pad = 2;
+                if (x < r.left - pad || x > r.right + pad || y < r.top - pad || y > r.bottom + pad) return;
+                const dx = Math.max(r.left - x, 0, x - r.right);
+                const dy = Math.max(r.top - y, 0, y - r.bottom);
+                const d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; b = el; }
+            });
+        }
+        if (!b) return null;
+        if (b.dataset.note === "__STEPOVF__") {
+            // The grey lane stands for every note that reaches
+            // past this page; the host renders them as a list.
+            const pn = b.__panel;
+            return {
+                id: "__STEPOVF__",
+                overflow: true,
+                list: pn ? pn.list : (window.__stepOverflowList || []),
+                page: pn ? pn.page : "",
+                panel: pn ? pn.page : "",
+                // The lane element itself. Every highlight of
+                // a lane must use the lane the pointer is on,
+                // never a document-wide lookup (two columns
+                // each have one, and the first found belongs
+                // to the other passage).
+                laneEl: b
+            };
+        }
+        return {
+            id: b.dataset.note || "",
+            ref: b.dataset.ref || "",
+            typed: b.dataset.typed === "1",
+            page: b.__page || "",
+            // This bar's own panel lane, for lighting when
+            // the bar's note lives in that lane.
+            ovfEl: window.__stepLaneOf ? window.__stepLaneOf(b.__page || "") : null,
+            laneParent: !!window.__stepInLane && window.__stepInLane(b.dataset.note, b.__page || ""),
+            // True when this bar also stands in the grey
+            // lane, so the host can widen it for hovers and
+            // pins that never go through the list.
+            ovf: window.__stepInLane ? window.__stepInLane(b.dataset.note, b.__page || "") : false
+        };
+    }
+
+    installHoverHooks() {
+        // Listeners are attached to document/window, so they outlive this
+        // instance. Every re-mount (navigation, refresh, page watch) would
+        // otherwise add another set: two listeners mean two
+        // __STEPBARCLICK__ messages per click, and the host treats the
+        // second identical click as "unpin and close" — the popover opened
+        // and vanished in the same instant. Attach once, keep the original
+        // set; it resolves every call through window.__stepDOM, so it always
+        // reaches the current instance.
+        if (window.__stepBarHoverHook) return;
+        window.__stepBarHoverHook = true;
+        let lastHover = null;
+        document.addEventListener("mousemove", (e) => {
+            const hit = window.__stepBarAt
+                ? window.__stepBarAt(e.clientX, e.clientY) : null;
+            // A child of the grey lane widens it locally as
+            // well: the host round trip is not needed for a
+            // highlight that lives entirely in this page.
+            try {
+                // Each column has its own lane. Light only the
+                // lane of the bar under the pointer, resolved
+                // through that bar's own panel; then clear every
+                // other lane so a highlight can never linger on
+                // the opposite column after the pointer moves.
+                let lane = null;
+                if (hit && (hit.id === "__STEPOVF__")) lane = hit.laneEl || null;
+                else if (hit && hit.laneParent) lane = hit.ovfEl || null;
+                document.querySelectorAll('.step-note-bar[data-lane-hover="1"]').forEach(el => {
+                    if (el !== lane) el.removeAttribute("data-lane-hover");
+                });
+                if (lane) {
+                    if (hit && (hit.id === "__STEPOVF__" || hit.laneParent)) lane.setAttribute("data-lane-hover", "1");
+                    else lane.removeAttribute("data-lane-hover");
+                }
+            } catch (e) {}
+            // Keyed by page as well as id: each panel has its
+            // own grey lane with the same id, and moving
+            // between them must still be reported.
+            const key = hit ? (hit.id + "|" + (hit.page || "")) : "";
+            if (key === lastHover) return; // only report changes
+            lastHover = key;
+            console.log("__STEPBAR__" + JSON.stringify(hit));
+        }, { passive: true });
+        // Cursor leaving the page entirely never fires a
+        // mousemove, so report the exit explicitly.
+        const reportLeave = () => {
+            if (!lastHover) return;
+            lastHover = null;
+            console.log("__STEPBAR__null");
+        };
+        document.addEventListener("mouseleave", reportLeave, { passive: true });
+        window.addEventListener("mouseout", (e) => {
+            if (!e.relatedTarget) reportLeave();
+        }, { passive: true });
+        // Clicking a bar pins the popover (host-side)
+        document.addEventListener("click", (e) => {
+            const hit = window.__stepBarAt
+                ? window.__stepBarAt(e.clientX, e.clientY) : null;
+            console.log("__STEPBARCLICK__" + JSON.stringify(hit));
+        }, { passive: true });
+    }
+
+    installObserver() {
+        const getTargets = () => [document.body];
+
+        if (!window.__stepDotObserver) {
+            let pending = null;
+            const run = () => {
+                clearTimeout(pending);
+                pending = setTimeout(() => {
+                    try {
+                        if (!window.__stepInjectDots) return;
+                        if (window.__stepDotObserver) window.__stepDotObserver.disconnect();
+                        let n;
+                        try { n = window.__stepInjectDots(); }
+                        finally { if (window.__stepDotObserve) window.__stepDotObserve(); }
+                        // A DOM swap that moved us to a new
+                        // passage still needs a host re-scan:
+                        // the note index comes from the vault.
+                        try { if (window.__stepNotifyPage) window.__stepNotifyPage(); } catch (e) {}
+                    } catch (e) {
+                        console.log("[step-dots] OBS ERR " + (e && e.message ? e.message.slice(0, 80) : e));
+                    }
+                }, 300);
+            };
+            // Re-measure bars when layout changes: bars are absolutely
+            // positioned, so their tops/heights go stale when text rewraps
+            // (window resize, fonts loading, scrollbar appearing).
+            if (!window.__stepBarResizeHooked) {
+                window.__stepBarResizeHooked = true;
+                const remeasure = () => {
+                    try {
+                        document.querySelectorAll(".step-note-bar").forEach(b => b.remove());
+                        if (window.__stepInjectDots) window.__stepInjectDots();
+                    } catch (e) {
+                        console.log("[step-dots] RESIZE ERR " + (e && e.message ? e.message.slice(0, 80) : e));
+                    }
+                };
+                let rt;
+                const debounced = () => { clearTimeout(rt); rt = setTimeout(remeasure, 200); };
+                window.addEventListener("resize", debounced);
+                // Watch the passage container itself: pane resizes, scrollbar
+                // changes and rewraps all change its size without a window event.
+                if (window.ResizeObserver) {
+                    // Every passage panel, not just the first: a
+                    // second column opened from a footnote resizes
+                    // without a window event and its bars go stale.
+                    const hookCont = () => {
+                        const cs = Array.from(document.querySelectorAll(".passageContentHolder"));
+                        if (!cs.length) cs.push(document.body);
+                        const key = cs.join(",");
+                        if (window.__stepBarRO && window.__stepBarRO._key === key) return;
+                        if (window.__stepBarRO) window.__stepBarRO.disconnect();
+                        window.__stepBarRO = new ResizeObserver(debounced);
+                        window.__stepBarRO._key = key;
+                        cs.forEach(c => window.__stepBarRO.observe(c));
+                    };
+                    hookCont();
+                    setTimeout(hookCont, 1500);
+                }
+                // Fonts finish loading after first paint and rewrap text;
+                // re-measure once they do, plus one late safety pass.
+                if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => setTimeout(remeasure, 100));
+                setTimeout(remeasure, 1200);
+            }
+            const obs = new MutationObserver(run);
+            window.__stepDotObserver = obs;
+            window.__stepDotObserve = () => {
+                try { obs.disconnect(); } catch (e) {}
+                getTargets().forEach(t => obs.observe(t, { childList: true, subtree: true }));
+                obs.__root = document.body;
+            };
+            window.__stepDotObserve();
+        }
+    }
+
+    installPageWatch() {
+        try {
+        const pageKey = () => location.href
+            + "|" + document.querySelectorAll(".passageContentHolder").length
+            + "|" + document.querySelectorAll(".verse").length;
+        if (typeof window.__stepLastPageKey !== "string") {
+            window.__stepLastPageKey = pageKey();
+        }
+        window.__stepNotifyPage = () => {
+            let k;
+            try {
+                if (!document.querySelectorAll(".verse").length) return;
+                k = pageKey();
+            } catch (e) { return; }
+            if (k === window.__stepLastPageKey) return;
+            window.__stepLastPageKey = k;
+            try { console.log("__STEPPAGE__"); } catch (e) {}
+        };
+        if (!window.__stepPageWatchHooked) {
+            window.__stepPageWatchHooked = true;
+            const fire = () => setTimeout(() => {
+                try { window.__stepNotifyPage && window.__stepNotifyPage(); } catch (e) {}
+            }, 500);
+            window.addEventListener("hashchange", fire);
+            window.addEventListener("popstate", fire);
+            try {
+                ["pushState", "replaceState"].forEach((n) => {
+                    const orig = history[n];
+                    if (!orig || orig.__stepWrapped) return;
+                    const w = function (...a) { const r = orig.apply(this, a); fire(); return r; };
+                    w.__stepWrapped = true;
+                    history[n] = w;
+                });
+            } catch (e) {}
+            setInterval(() => {
+                try {
+                    if (window.__stepDotObserver && window.__stepDotObserver.__root !== document.body) {
+                        window.__stepDotObserve && window.__stepDotObserve();
+                    }
+                    window.__stepNotifyPage && window.__stepNotifyPage();
+                } catch (e) {}
+            }, 1500);
+        }
+        } catch (e) {
+            window.__stepLastPageWatchError = e && e.message ? e.message : String(e);
+        }
     }
 }

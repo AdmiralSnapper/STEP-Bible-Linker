@@ -1714,7 +1714,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this._noteDotsRefreshTimer = null;
         this._localStepRunningCache = { value: null, time: 0 };
         this._lastSearchQueryRef = null;
-        this.setupBarHover();
+        // One StepInterfaceObsidian per webview, created the first time a panel
+        // reports in. Keyed by the webview element so each panel keeps its own
+        // popover slots.
+        this._barInterfaces = new Map();
+        // A popover hangs off one panel's rectangle. Leaving the tab or
+        // reflowing the layout would orphan it, so both close every panel's.
+        this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.closeBarPopovers()));
+        this.registerEvent(this.app.workspace.on("layout-change", () => this.closeBarPopovers()));
 
         // Load settings and add settings tab
         await this.loadSettings();
@@ -1846,13 +1853,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (msg.startsWith("__STEPBARCLICK__")) {
                     let click = null;
                     try { click = JSON.parse(msg.slice("__STEPBARCLICK__".length)); } catch (e) { click = null; }
-                    this.handleBarClickMessage(webviewEl, click);
+                    this.barInterface(webviewEl).handleBarClickMessage(webviewEl, click);
                     return;
                 }
                 if (!msg.startsWith("__STEPBAR__")) return;
                 let hit = null;
                 try { hit = JSON.parse(msg.slice("__STEPBAR__".length)); } catch (e) { hit = null; }
-                this.handleBarHoverMessage(webviewEl, hit);
+                this.barInterface(webviewEl).handleBarHoverMessage(webviewEl, hit);
             });
 
             //Listener function that gets attached to webview  
@@ -3454,1600 +3461,30 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // sendToHost channel (mouse events over a webview guest never reach the
     // host document). Typed/crosslink bars open an Obsidian-managed popover
     // (real markdown: text, images, links) anchored at the webview's top right.
-    setupBarHover() {
-        if (this._barHoverReady) return;
-        this._barHoverReady = true;
-        this._barHoverTimer = null;
-        // Two slots so a pinned note and a hover note can coexist: the hover
-        // box stacks above the pinned one.
-        this._pinnedPop = null;
-        this._hoverPop = null;
-        this._barPinned = false;
 
-        // Popover styling (header + body), theme-aware via Obsidian variables.
-        {
-            // Reuse the node if a previous load left one behind, but always
-            // rewrite its text: a stale stylesheet from an older build is how
-            // the box ended up with no background at all.
-            let st = document.getElementById("step-bar-popover-style");
-            if (!st) {
-                st = document.createElement("style");
-                st.id = "step-bar-popover-style";
-                document.head.appendChild(st);
-            }
-            st.textContent = [
-                // The box used to be Obsidian's HoverPopover, which supplied the
-                // theme surface. Now it's our own div, so we draw it ourselves.
-                ".step-bar-popover { width: max-content; max-width: 560px; min-width: 240px; max-height: 30vh; overflow: hidden; font-size: 13px;" +
-                "  background: var(--background-primary); color: var(--text-normal);" +
-                "  border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m, 8px);" +
-                "  box-shadow: 0 4px 18px rgba(0,0,0,0.28); }",
-                ".step-bar-popover .step-bar-popover-header {",
-                "  position: relative; display: flex; flex-direction: column; gap: 1px;",
-                "  padding: 8px 44px 6px 12px; margin-bottom: 0; flex: 0 0 auto; border-bottom: 1px solid var(--background-modifier-border); }",
-                ".step-bar-popover .step-bar-popover-title {",
-                "  font-weight: 700; font-size: 15px; font-family: var(--font-interface); color: var(--text-normal); }",
-                ".step-bar-popover .step-bar-popover-ref {",
-                "  font-size: 12px; font-family: var(--font-interface); color: var(--text-muted); }",
-                ".step-bar-popover .step-bar-popover-buttons {",
-                "  position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; }",
-                ".step-bar-popover .step-bar-popover-buttons-hidden { display: none; }",
-                ".step-bar-popover .step-bar-popover-btn {",
-                "  background: transparent; border: none; box-shadow: none; padding: 0; cursor: pointer;",
-                "  width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }",
-                ".step-bar-popover .step-bar-popover-btn:hover { background: rgba(255,255,255,0.25); }",
-                ".step-bar-popover .step-bar-popover-btn svg { width: 16px; height: 16px; }",
-                ".step-bar-popover .step-bar-popover-body { padding: 8px 14px 10px 14px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }",
-            ].join("\n");
+    // One StepInterfaceObsidian per STEP webview. Popover slots, pointer facts
+    // and the highlight sequence belong to one panel, so two panels can never
+    // fight over the same popover.
+    barInterface(webviewEl) {
+        let iface = this._barInterfaces.get(webviewEl);
+        if (!iface) {
+            iface = new StepInterfaceObsidian(this, webviewEl);
+            this._barInterfaces.set(webviewEl, iface);
         }
-
-        const dispose = (entry) => {
-            if (!entry) return;
-            if (this._ovfList && this._ovfList.body === entry.body) this._ovfList = null;
-            const pop = entry.pop;
-            // Only a hover close is cancelled by a hover teardown. Clearing it
-            // when a pinned box closes threw away a hover note's already-
-            // scheduled removal, so the note sat there until the next pointer
-            // event — the delay that showed up right after closing a pin.
-            if (!entry.pinned) clearTimeout(this._hoverCloseTimer);
-            this._barDragging = false;
-            // The flag describes the hover note's own body. Once a box is torn
-            // down it can never be a true statement, whoever owned it, and a
-            // stuck `true` made pointerOverHoverPop() keep every later hover
-            // note alive.
-            this._pointerInPopover = false;
-            // Drop the slot first, then sync: the bar narrows on the same tick
-            // the popover is torn down.
-            // A row-owned note has nothing left to belong to.
-            if (entry._xGuard) { try { document.removeEventListener("pointerdown", entry._xGuard, true); } catch (e) {} entry._xGuard = null; }
-            if (entry._docWheel) { try { document.removeEventListener("wheel", entry._docWheel, true); } catch (e) {} entry._docWheel = null; }
-            try { if (entry.adjChild) entry.adjChild(); } catch (e) {}
-            // The stretched title bar belongs to this note, not to the list:
-            // it goes when the note goes, and the list's bookkeeping is cleared.
-            if (entry._adjBar) {
-                const b = entry._adjBar;
-                entry._adjBar = null;
-                try { b.style.opacity = "0"; } catch (e) {}
-                window.setTimeout(() => { try { b.remove(); } catch (e) {} }, 140);
-                if (entry._adjSlot === "pinned") {
-                    if (this._adjPinned && this._adjPinned.note === entry) this._adjPinned = null;
-                } else {
-                    if (this._adjHover && this._adjHover.note === entry) this._adjHover = null;
-                }
-            }
-            // The enter/leave flag belongs to that one popover. Once it is
-            // torn down the pointer cannot be inside it, but no mouseleave
-            // ever fires for an element removed under a stationary cursor, so
-            // the flag survived. Pinning disposes the hover note (the pointer
-            // is inside it — that is where the pin button was), so the flag
-            // stayed true for good: with no host pointer moves over the page,
-            // pointerOverHoverPop() had no geometry to fall back on and held
-            // every later hover note open until the user clicked or left the
-            // window. That is the "only after I pin something" bug.
-            if (this._hoverPop === entry) this._pointerInPopover = false;
-            if (entry.pinned) {
-                if (this._pinnedPop === entry) this._pinnedPop = null;
-                this._barPinned = false;
-                // Closing a pinned box with its X is host-side: the guest never
-                // sees the pointer leave the bar, so the last hit it reported
-                // would stay "current" and hold the next hover note open until
-                // the pointer re-entered the page. Closing by clicking the bar
-                // already clears it; this makes every close path do the same.
-                this._lastBarHit = null;
-                // The X is host-side: the guest never reports the pointer
-                // leaving the lane, so a lane hover would otherwise stay lit
-                // and wide until the pointer re-entered the page.
-                this._barHitOvf = false;
-                this._barHitOvfPage = "";
-            } else if (this._hoverPop === entry) this._hoverPop = null;
-            try { (entry.hide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
-            // Narrow the bars in the same tick the popover goes away.
-            this._syncBarHold();
-            // The lit passage follows the bar that lit it, on this same tick.
-            this._restoreHighlight();
-            if (entry.anchorEl && entry.anchorEl.parentNode) entry.anchorEl.remove();
-            if (!entry.pinned) {
-                // No fade-out: a hover note goes the instant the bar is left.
-                try { if (entry.body) { entry.body.style.display = "none"; entry.body.remove(); } } catch (e) {}
-            }
-            if (entry.pinned) {
-                // A hover note can be open when the pin goes. Nothing will
-                // re-evaluate it until the pointer moves, so check now.
-                this._scheduleHoverClose();
-                // The X lives in the host document: the click took focus off
-                // the page, so hover reports from the guest would stall until
-                // the next click inside it. Give focus back straight away.
-                this._focusPage();
-            }
-        };
-        // Keep the guest's widened bars in step with the open popovers.
-        this._syncBarHold = () => {
-            // Per panel: a note open in one column must never widen a bar in
-            // the other, and the two grey lanes are separate lanes.
-            const byPage = new Map();
-            const add = (id, page) => {
-                if (!id) return;
-                page = page || "";
-                if (!byPage.has(page)) byPage.set(page, []);
-                const ids = byPage.get(page);
-                if (ids.indexOf(id) < 0) ids.push(id);
-                // A crosslink's section bar stays widened with it.
-                const td = this._noteDotsCache && this._noteDotsCache.typedData;
-                const p = td && td.contentOf && td.contentOf[id] && td.contentOf[id].parentId;
-                if (p && ids.indexOf(p) < 0) ids.push(p);
-            };
-            const pageOf = (entry) => (entry && entry.page) || "";
-            if (this._pinnedPop) add(this._pinnedPop.id, pageOf(this._pinnedPop));
-            if (this._hoverPop) add(this._hoverPop.id, pageOf(this._hoverPop));
-            // A note opened from the Wider References list lives in the list's
-            // own slots, not in the hover/pinned ones, so it has to be added
-            // separately or its bar (and the lane it belongs to) never widen.
-            if (this._adjPinned && this._adjPinned.note) add(this._adjPinned.note.id, pageOf(this._adjPinned));
-            if (this._adjHover && this._adjHover.note) add(this._adjHover.note.id, pageOf(this._adjHover));
-            // The grey lane stands for its whole list, so it stays wide while
-            // any note in that list is open — including a crosslink inside one
-            // of those notes, whose id only reaches the note through
-            // parentId above.
-            if (this._barHitOvf) add("__STEPOVF__", this._barHitOvfPage || "");
-            if (this._pinnedPop && this._pinnedPop.ovf) add("__STEPOVF__", pageOf(this._pinnedPop));
-            if (this._hoverPop && this._hoverPop.ovf) add("__STEPOVF__", pageOf(this._hoverPop));
-            const ovf = this._ovfList;
-            if (ovf && ovf.ids && ovf.ids.length) {
-                byPage.forEach((ids, page) => {
-                    if (page !== (ovf.page || "")) return;
-                    for (const id of ids.slice()) {
-                        if (ovf.ids.indexOf(id) >= 0) { add("__STEPOVF__", page); break; }
-                    }
-                });
-            }
-            const wv = this._barWebview;
-            if (!wv || !wv.executeJavaScript) return;
-            const payload = {};
-            byPage.forEach((ids, page) => { payload[page] = ids; });
-            // One message carries both halves of the hover: which bars widen
-            // and which passage is lit. Two separate fire-and-forget calls
-            // could land out of order after a pin, leaving bars wide or text
-            // lit with nothing open.
-            const lit = this._litEntry();
-            this._highlightPage = lit ? lit.page : "";
-            const state = {
-                seq: ++this._barStateSeq,
-                hold: payload,
-                id: lit ? lit.id : "",
-                page: lit ? lit.page : ""
-            };
-            try {
-                wv.executeJavaScript(`window.__stepBarState && window.__stepBarState(${JSON.stringify(state)})`).catch(() => {});
-            } catch (e) {}
-        };
-        const closeHover = () => dispose(this._hoverPop);
-        const closePinned = () => dispose(this._pinnedPop);
-        // Hand focus back to the page. Clicking any of our own chrome (an X,
-        // a title bar, the list header) moves focus to the host document, and
-        // while the webview is unfocused the guest stops reporting bar hovers
-        // until the user clicks back into the page — which looked exactly like
-        // "hover notes stop closing after I use the X".
-        this._focusPage = () => {
-            const wv = this._barWebview;
-            if (!wv) return;
-            try { if (wv.focus) wv.focus(); } catch (e) {}
-            try { wv.executeJavaScript("try{window.focus()}catch(e){}").catch(() => {}); } catch (e) {}
-        };
-        const closePopover = () => { closeHover(); closePinned(); };
-        this._closeBarPopover = closePopover;
-        this._closeHoverPopover = closeHover;
-        this._closePinnedPopover = closePinned;
-        this._barOpenTimer = null;
-
-        // Moving between a bar and its popover crosses a gap, and the popover
-        // sits outside the webview (so the guest reports "no bar"). Close a
-        // hover note only after a short grace period, and never while the
-        // pointer is actually over the popover.
-        this._lastBarHit = null;
-        // Whether the bar under the pointer also stands in the grey lane.
-        this._barHitOvf = false;
-        this._barDragging = false;
-        this._pointerInPopover = false;
-        this._lastPointer = null;
-        // True while the pointer is known to be over the guest page rather
-        // than over our own chrome. A bar report can only come from inside the
-        // webview, so it sets this; any host mousemove clears it.
-        this._inGuestPage = false;
-        this.registerDomEvent(document, "mousemove", (e) => {
-            this._lastPointer = { x: e.clientX, y: e.clientY };
-            // A host mousemove means the pointer is over host DOM, never over
-            // the page's content.
-            this._inGuestPage = false;
-            // Bar hits are only reported from inside the webview. Once the
-            // pointer moves onto one of our own popovers or bars the reports
-            // stop, so the last hit would otherwise stay "current" and keep a
-            // hover note alive for as long as the pointer stayed there.
-            const t = e.target;
-            if (t && t.closest && t.closest(".step-bar-popover, .step-adj-bar")) {
-                this._lastBarHit = null;
-            }
-        }, { passive: true, capture: true });
-        // True when the tracked pointer sits inside the open hover popover.
-        // Geometry is used instead of enter/leave flags: a flag can stay stuck
-        // when the element is removed or re-rendered under the cursor, which
-        // made notes linger for seconds.
-        const pointerOverHoverPop = () => {
-            if (!this._hoverPop) return false;
-            const own = this._hoverPop.body;
-            if (!own || !own.isConnected) return false;
-            // A report from the guest proves the pointer is over the page, so
-            // it cannot be over the note. Without this, the note's enter/leave
-            // flag was authoritative whenever a guest report arrived (guest
-            // reports null _lastPointer), and that flag can stay stuck: the
-            // pointer leaving the note into the webview fires no mouseleave in
-            // the host, because events over the guest never reach it. One stuck
-            // `true` then kept every later hover note open forever — the
-            // "after I pin something and close it with the X" bug.
-            if (this._inGuestPage) return false;
-            const c = own;
-            const p = this._lastPointer;
-            if (!p) return this._pointerInPopover;
-            try {
-                const stack = document.elementsFromPoint(p.x, p.y) || [];
-                for (const el of stack) {
-                    if (el === c || (c.contains && c.contains(el))) return true;
-                    // Nothing of ours sits above the hover note except other
-                    // popovers and stretched title bars — anything else (the
-                    // webview, page chrome) means the pointer is off the note.
-                    if (el.closest && el.closest(".step-bar-popover, .step-adj-bar, .step-overflow-list")) return false;
-                    break;
-                }
-            } catch (e) {}
-            const r = c.getBoundingClientRect();
-            return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
-        };
-
-        this._barStateSeq = 0;
-        this._litEntry = () => {
-            if (this._hoverPop && !this._hoverPop.ovf) return { id: this._hoverPop.id, page: this._hoverPop.page };
-            if (this._lastBarHit) return { id: this._lastBarHit.id || "", page: this._lastBarHit.page || "" };
-            if (this._adjHover && this._adjHover.note) return { id: this._adjHover.note.id, page: this._adjHover.note.page || this._adjHover.page };
-            if (this._pinnedPop && !this._pinnedPop.ovf) return { id: this._pinnedPop.id, page: this._pinnedPop.page };
-            if (this._adjPinned && this._adjPinned.note) return { id: this._adjPinned.note.id, page: this._adjPinned.note.page || this._adjPinned.page };
-            return null;
-        };
-        // Kept for the call sites that only mean "make the page match what is
-        // open": widening and highlighting travel together, so this is the
-        // same push.
-        this._restoreHighlight = () => this._syncBarHold();
-
-        // A hover note lives only while the pointer is on its bar or on the
-        // note itself. No timer: if neither is true, it goes now.
-        this._scheduleHoverClose = () => {
-            clearTimeout(this._hoverCloseTimer);
-            // An adjacent (wider-references row) note owns its own lifetime
-            // through its own enter/leave flags and timer. It is NOT a reason
-            // to keep an ordinary hover note alive: when a row hover got stuck
-            // after a pin, this guard made every later hover note immortal, and
-            // the only escape was a click or leaving the window — which is
-            // exactly how the "delay after pinning" bug behaved.
-            if (this._lastBarHit) return;
-            if (pointerOverHoverPop()) return;
-            closeHover();
-            this._restoreHighlight();
-        };
-
-        // Called from the webview's ipc-message listener. A null hit means the
-        // pointer is over no bar: close any open popover. A typed hit opens a
-        // popover after a short hover delay (later messages cancel the timer).
-        this.handleBarHoverMessage = (webviewEl, hit) => {
-            this._barWebview = webviewEl;
-            // Any report at all came from inside the webview, so the pointer is
-            // over the page and not over one of our popovers.
-            this._inGuestPage = true;
-            // Attach the focus safety net once per webview element. Coming back
-            // into the page is the moment any state left behind by our own
-            // chrome can be corrected, whatever caused it.
-            if (!webviewEl.__stepFocusHook) {
-                webviewEl.__stepFocusHook = true;
-                try {
-                    webviewEl.addEventListener("focus", () => {
-                        this._lastBarHit = null;
-                        this._pointerInPopover = false;
-                        this._syncBarHold();
-                        this._scheduleHoverClose();
-                    });
-                } catch (e) {}
-            }
-            // A report can only come from inside the webview, so the pointer is
-            // no longer over host chrome. The tracked host position is stale
-            // from wherever the pointer last sat in the plugin UI (typically the
-            // pin's X button), and pointerOverHoverPop() testing that old point
-            // kept a hover note alive for as long as its rectangle happened to
-            // cover it — which read as a multi-second delay after closing a
-            // pinned note with X. Over the page, only the popover enter/leave
-            // flag is trustworthy.
-            this._lastPointer = null;
-            // Mid-drag the guest still reports whatever bar the box happens to
-            // sit over; rebuilding or closing popovers then would move the box
-            // out from under the pointer and kill the drag.
-            if (this._barDragging) return;
-            // Push highlight state into the guest: the verses stay lit while
-            // the mouse is on the bar OR on the popover (guest can't see the
-            // popover, the host bridges it).
-            if (!hit || (!hit.typed && !hit.overflow)) {
-                // Cancel any pending open: a timer that fires after the pointer
-                // has left would pop a note up with no bar hovered under it.
-                clearTimeout(this._barOpenTimer);
-                this._lastBarHit = null;
-                this._barHitOvf = false;
-                this._barHitOvfPage = "";
-                this._syncBarHold();
-                // Unlight on this tick, before any close timer runs.
-                this._restoreHighlight();
-                // Unlight and thin on this tick. openBarPopover is opened
-                // synchronously above, so a hover note the pointer is still on
-                // is kept by pointerOverHoverPop(); anything else is stale.
-                this._scheduleHoverClose();
-                return;
-            }
-            this._lastBarHit = hit;
-            this._barHitOvf = !!hit.ovf;
-            this._barHitOvfPage = hit.page || "";
-            // Widens and lights together, on this tick.
-            this._syncBarHold();
-            clearTimeout(this._hoverCloseTimer);
-            // A pinned list for this page already stands for the lane. Hovering
-            // the lane must not build a second one beside it: the new list
-            // would take over `_ovfList`, stranding the pinned list on screen
-            // and leaving nothing that closes it (the lane click then saw an
-            // unpinned list and made a third).
-            if (hit.overflow && this._ovfList && this._ovfList.pinned
-                && this._ovfList.page === (hit.page || "")) {
-                closeHover();
-                return;
-            }
-            // Already showing this bar (pinned or hovering): nothing to do.
-            // The lane id is the same in every panel, so compare its page too —
-            // otherwise panel two's lane would look like panel one's.
-            // Pages are compared for every bar, not just the lane: one note can
-            // have a bar in each panel, and hovering the second column's must
-            // not be mistaken for the note already open from the first.
-            const sameBar = (a) => a && a.id === hit.id
-                && (a.page || "") === (hit.page || "");
-            if (sameBar(this._pinnedPop)) { closeHover(); return; }
-            if (sameBar(this._hoverPop)) return;
-            clearTimeout(this._barOpenTimer);
-            // Open on this tick: the widened bar, the lit text and the note
-            // are one event. A delayed open meant a bar could be left wide
-            // with no note, or a note could arrive after the pointer had gone.
-            this._barOpenTimer = null;
-            this.openBarPopover(webviewEl, hit, false);
-        };
-
-        // Click on a bar: pin the popover (stays put, movable, resizable)
-        this.handleBarClickMessage = (webviewEl, hit) => {
-            clearTimeout(this._barOpenTimer);
-            // The click opens a popover outside the webview, so the guest will
-            // never report "no bar" for it. A hit left over from the hover that
-            // preceded the click would then keep every later hover note alive
-            // until the pointer re-entered the page and left a bar again.
-            this._lastBarHit = null;
-            if (!hit || (!hit.typed && !hit.overflow)) return;
-            // Clicking the grey lane closes the list only if that list is
-            // pinned — same as pressing its X. A hovered list is not closed:
-            // the click pins it, as clicking any other bar would.
-            if (hit.overflow && this._ovfList && this._ovfList.pinned
-                && this._ovfList.page === (hit.page || "")) {
-                try { this._ovfList.closeAll(); } catch (e) {}
-                return;
-            }
-            if (this._pinnedPop && this._pinnedPop.id === hit.id) {
-                // second click on the same bar unpins and closes
-                closePinned();
-                closeHover();
-                return;
-            }
-            // Anything that pins replaces whatever was pinned before — and a
-            // pinned Wider References list counts. (Clicks on one of the
-            // list's own rows never come through here, so opening a note from
-            // the list does not close the list underneath it.)
-            if (this._ovfList && this._ovfList.pinned) {
-                try { this._ovfList.closeAll(); } catch (e) {}
-            }
-            this.openBarPopover(webviewEl, hit, true);
-        };
-
-        // The overflow lane's popover: a scrollable list of title bars, one per
-        // note that reaches outside the page. Clicking one opens that note
-        // exactly as clicking its own bar would.
-        this.openOverflowPopover = async (webviewEl, hit, pinned) => {
-            const box = webviewEl.getBoundingClientRect();
-            const td = this._noteDotsCache && this._noteDotsCache.typedData;
-            const contentOf = (td && td.contentOf) || {};
-            const ids = (hit.list || []).filter(id => contentOf[id]);
-            // A page can only have one list. A hover on a lane that is already
-            // pinned for this page keeps the pinned one; and pinning anywhere
-            // retires whatever list was open before.
-            if (!pinned && this._ovfList && this._ovfList.pinned
-                && this._ovfList.page === (hit.page || "")) {
-                this._syncBarHold();
-                return;
-            }
-            if (pinned && this._ovfList) { try { this._ovfList.closeAll(); } catch (e) {} }
-            closeHover();
-            if (pinned) closePinned();
-            if (!ids.length) { this._syncBarHold(); return; }
-
-            const anchorEl = document.createElement("div");
-            anchorEl.style.cssText = "position:fixed;width:0;height:0;pointer-events:none;";
-            anchorEl.style.left = (box.right - 8) + "px";
-            anchorEl.style.top = (box.top + 8) + "px";
-            document.body.appendChild(anchorEl);
-
-            const body = document.createElement("div");
-            const pop = {
-                hoverEl: body,
-                hide() { try { body.remove(); } catch (e) {} },
-                position() {},
-                show() {}
-            };
-            document.body.appendChild(body);
-            body.addClass("step-bar-popover");
-            // The list sits above the stretched bars it owns, so its single X
-            // stays clickable once a row is pinned.
-            // Hovered popovers outrank every pinned one; a pinned list still
-            // sits above a pinned note.
-            body.style.zIndex = pinned ? "1000014" : "1000034";
-            body.style.position = "fixed";
-            body.style.left = (box.right - 8) + "px";
-            body.style.top = (box.top + 8) + "px";
-            body.style.right = "auto";
-            body.style.bottom = "auto";
-            body.style.transform = "translateX(-100%)";
-            body.style.display = "flex";
-            body.style.flexDirection = "column";
-            body.style.width = "260px";
-            body.style.maxHeight = "45vh";
-            body.style.overflow = "hidden";
-
-            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "" };
-            if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
-            else this._hoverPop = entry;
-            this._barWebview = webviewEl;
-            this._syncBarHold();
-
-            if (!pinned) {
-                this._pointerInPopover = false;
-                body.addEventListener("mouseenter", () => {
-                    this._pointerInPopover = true;
-                    clearTimeout(this._hoverCloseTimer);
-                });
-                body.addEventListener("mouseleave", () => {
-                    this._pointerInPopover = false;
-                    this._scheduleHoverClose();
-                });
-            }
-
-            // The list's own entry, held in this closure so no other popover
-            // can overwrite the slot it used to live in.
-            const listEntry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "", ids: ids.slice() };
-            this._ovfList = listEntry;
-            const header = body.createDiv({ cls: "step-bar-popover-header" });
-            header.style.position = "sticky";
-            header.style.top = "0";
-            header.style.zIndex = "5";
-            header.style.flex = "0 0 auto";
-            header.style.padding = "8px 44px 6px 12px";
-            header.style.backgroundColor = "var(--background-secondary)";
-            const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
-            titleEl.setText("Wider References");
-            titleEl.style.fontWeight = "700";
-            titleEl.style.fontSize = "14px";
-            const countEl = header.createDiv({ cls: "step-bar-popover-ref" });
-            countEl.setText(ids.length + (ids.length === 1 ? " note" : " notes"));
-            countEl.style.fontSize = "12px";
-            countEl.style.opacity = "0.7";
-
-            // One X for the whole list.
-            const btns = header.createDiv({ cls: "step-bar-popover-buttons" });
-            btns.style.position = "absolute";
-            btns.style.top = "6px";
-            btns.style.right = "6px";
-            const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
-            closeBtn.style.cssText = "background:transparent;border:none;border-radius:50%;width:26px;height:26px;padding:0;font-size:16px;display:flex;align-items:center;justify-content:center;cursor:pointer;";
-            closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(128,128,128,0.35)"; });
-            closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "transparent"; });
-            setIcon(closeBtn, "lucide-x");
-            if (!closeBtn.querySelector("svg")) {
-                closeBtn.setText("\u2715");
-                closeBtn.style.fontSize = "14px";
-                closeBtn.style.lineHeight = "26px";
-            }
-            closeBtn.setAttribute("aria-label", "Close");
-            // One X for the whole thing. It disposes the list's own entry,
-            // never this._pinnedPop: a note opened from a row takes that slot,
-            // so closing through it left the list stranded on screen.
-            const closeAll = () => {
-                killAdj("pinned");
-                killAdj("hover");
-                if (this._ovfList === listEntry) this._ovfList = null;
-                // `entry` holds the slot (`_pinnedPop` / `_hoverPop`), so it
-                // has to be disposed too or the dead popover stays registered.
-                try { dispose(entry); } catch (e) {}
-                try { dispose(listEntry); } catch (e) {}
-                closeHover();
-                if (this._focusPage) this._focusPage();
-            };
-            closeBtn.addEventListener("click", (ev) => { ev.stopPropagation(); closeAll(); });
-            listEntry.closeAll = closeAll;
-            // The X can end up beneath a note or a stretched bar (notes paint
-            // over the list). Catch the press in the capture phase, before the
-            // covering element sees it.
-            const xGuard = (ev) => {
-                if (!listEntry || !listEntry.body || !listEntry.body.isConnected) return;
-                const r = closeBtn.getBoundingClientRect();
-                if (ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom) {
-                    ev.stopPropagation();
-                    ev.preventDefault();
-                    closeAll();
-                }
-            };
-            document.addEventListener("pointerdown", xGuard, true);
-            listEntry._xGuard = xGuard;
-
-            // Dragging the list by its header carries every note it has out
-            // along with it: a stretched title bar and its note are positioned
-            // independently of the list, so they have to be shifted by the
-            // same delta rather than left behind.
-            const shiftAdj = (ent, dx, dy) => {
-                if (!ent) return;
-                try { if (ent.bar && ent.bar.isConnected) ent.bar.style.left = (parseFloat(ent.bar.style.left || "0") + dx) + "px"; } catch (e) {}
-                try {
-                    if (ent.note && ent.note.body && ent.note.body.isConnected) {
-                        ent.note.body.style.left = (parseFloat(ent.note.body.style.left || "0") + dx) + "px";
-                    }
-                } catch (e) {}
-                try { if (ent.followRows) ent.followRows(); } catch (e) {}
-            };
-            let listDrag = null;
-            header.style.cursor = "move";
-            header.style.touchAction = "none";
-            header.style.userSelect = "none";
-            const onListDragMove = (ev) => {
-                if (!listDrag || !body.isConnected) return;
-                if (ev.pointerId !== undefined && listDrag.pid !== undefined && ev.pointerId !== listDrag.pid) return;
-                const dx = ev.clientX - listDrag.x;
-                const dy = ev.clientY - listDrag.y;
-                if (!dx && !dy) return;
-                listDrag.x = ev.clientX; listDrag.y = ev.clientY;
-                try {
-                    body.style.left = Math.max(0, parseFloat(body.style.left || "0") + dx) + "px";
-                    body.style.top = Math.max(0, parseFloat(body.style.top || "0") + dy) + "px";
-                } catch (e) {}
-                // Both slots move: a hovered row can sit over a pinned one.
-                shiftAdj(this._adjPinned, dx, dy);
-                shiftAdj(this._adjHover, dx, dy);
-            };
-            const endListDrag = (ev) => {
-                if (!listDrag) return;
-                if (ev && ev.type === "pointerup" && ev.buttons) return;
-                listDrag = null;
-                this._barDragging = false;
-                try { body.style.cursor = ""; } catch (e) {}
-                window.removeEventListener("pointermove", onListDragMove, true);
-                window.removeEventListener("pointerup", endListDrag, true);
-                window.removeEventListener("pointercancel", endListDrag, true);
-                window.removeEventListener("blur", endListDrag, true);
-            };
-            const startListDrag = (ev) => {
-                if (listDrag) return;
-                if (ev.button !== undefined && ev.button !== 0) return;
-                const t = ev.target;
-                if (t && t.closest && t.closest("button, a")) return;
-                const r = body.getBoundingClientRect();
-                // Drop the translateX(-100%) right-alignment before dragging,
-                // or the box jumps a full width sideways on the first move.
-                body.style.transform = "none";
-                body.style.left = r.left + "px";
-                body.style.top = r.top + "px";
-                listDrag = { x: ev.clientX, y: ev.clientY, pid: ev.pointerId };
-                this._barDragging = true;
-                clearTimeout(this._barOpenTimer);
-                clearTimeout(this._hoverCloseTimer);
-                try { body.style.cursor = "grabbing"; } catch (e) {}
-                try { ev.preventDefault(); } catch (e) {}
-                window.addEventListener("pointermove", onListDragMove, true);
-                window.addEventListener("pointerup", endListDrag, true);
-                window.addEventListener("pointercancel", endListDrag, true);
-                window.addEventListener("blur", endListDrag, true);
-            };
-            header.addEventListener("pointerdown", startListDrag, true);
-            if (listEntry) listEntry.startListDrag = startListDrag;
-
-            const listEl = body.createDiv({ cls: "step-bar-popover-body" });
-            listEl.style.padding = "6px";
-            listEl.style.flex = "1 1 auto";
-            listEl.style.minHeight = "0";
-            listEl.style.overflowY = "auto";
-            listEl.style.overscrollBehavior = "contain";
-            // Wheel scrolling for the list. A capture-phase listener on the
-            // document is needed as well as the local one: a row's stretched
-            // note (and Obsidian's own panes) sit inside the popover, and the
-            // wheel event can be consumed before it ever reaches `body`.
-            // Whichever arrives first scrolls the list; a `_wheelDone` stamp
-            // stops the same event scrolling it twice.
-            const cons = Math.max(1, window.devicePixelRatio || 1);
-            const wheelList = (ev) => {
-                if (!body.isConnected) return false;
-                const br = body.getBoundingClientRect();
-                if (ev.clientX < br.left || ev.clientX > br.right ||
-                    ev.clientY < br.top || ev.clientY > br.bottom) return false;
-                // Let the note's own body scroll itself when it can.
-                const over = document.elementFromPoint(ev.clientX, ev.clientY);
-                const scroller = over && over.closest ? over.closest(".step-bar-popover-body") : null;
-                const target = scroller && body.contains(scroller) ? scroller : listEl;
-                if (target.scrollHeight <= target.clientHeight) return false;
-                if (ev._wheelDone) return false;
-                ev._wheelDone = true;
-                target.scrollTop += ev.deltaY;
-                ev.preventDefault();
-                ev.stopPropagation();
-                return true;
-            };
-            body.addEventListener("wheel", wheelList, { passive: false });
-            const docWheel = (ev) => {
-                if (!body.isConnected) {
-                    document.removeEventListener("wheel", docWheel, true);
-                    return;
-                }
-                wheelList(ev);
-            };
-            document.addEventListener("wheel", docWheel, true);
-            listEntry._docWheel = docWheel;
-
-            // A row opens its note to the left: the row clones itself into a
-            // bar that stretches left over the note's top edge, and the note
-            // slides out underneath its left end. The stretched bar IS the
-            // note's title bar, so the note's own header is suppressed.
-            this._adjPinned = null;
-            this._adjHover = null;
-            const killAdj = (which) => {
-                const ent = which === "pinned" ? this._adjPinned : this._adjHover;
-                if (!ent) return;
-                if (which === "pinned") this._adjPinned = null; else this._adjHover = null;
-                clearTimeout(ent.timer);
-                dispose(ent.note);
-            };
-            const makeAdj = async (id, row, makePinned) => {
-                const existing = makePinned ? this._adjPinned : this._adjHover;
-                if (existing && existing.id === id) return;
-                if (!makePinned) killAdj("hover");
-                if (makePinned && this._adjPinned) killAdj("pinned");
-                const lr = listEl.getBoundingClientRect();
-                const rr = row.getBoundingClientRect();
-                const width = Math.max(300, Math.min(460, Math.round(window.innerWidth * 0.3)));
-                const left = Math.max(8, lr.left - 10 - width);
-                const top = rr.bottom;
-
-                // Clone, not a fresh div: same colour, outline, text, sizes.
-                // cloneNode drops the row's listeners, which is what we want.
-                const bar = row.cloneNode(true);
-                bar.addClass("step-adj-bar");
-                bar.style.position = "fixed";
-                bar.style.margin = "0";
-                bar.style.boxSizing = "border-box";
-                bar.style.top = rr.top + "px";
-                bar.style.height = rr.height + "px";
-                bar.style.left = rr.left + "px";
-                bar.style.width = rr.width + "px";
-                // The bar and its note are one visual unit: same level.
-                bar.style.zIndex = makePinned ? "1000020" : "1000038";
-                bar.style.cursor = "default";
-                // Only the hover preview slides out; a pinned bar inherits the
-                // position of the bar it replaces, already extended.
-                bar.style.transition = makePinned
-                    ? "opacity .12s linear"
-                    : "left .18s ease, width .18s ease, opacity .12s linear";
-                // Buttons live at the far right so the note can be minimised
-                // even when another note covers the bar's left end.
-                const barBtns = document.createElement("div");
-                barBtns.style.cssText = "position:absolute;right:5px;top:50%;transform:translateY(-50%);display:flex;gap:2px;";
-                const goto = document.createElement("button");
-                goto.textContent = "\u2197";
-                goto.title = "Open in Obsidian at this reference";
-                goto.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
-                goto.addEventListener("pointerdown", (ev) => ev.stopPropagation());
-                goto.addEventListener("click", async (ev) => {
-                    ev.stopPropagation();
-                    try {
-                        if (note && note.goToNote) await note.goToNote();
-                        killAdj(makePinned ? "pinned" : "hover");
-                    } catch (e) {}
-                });
-                const mini = document.createElement("button");
-                mini.textContent = "\u2192";
-                mini.title = "Minimise";
-                mini.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
-                mini.addEventListener("pointerdown", (ev) => ev.stopPropagation());
-                mini.addEventListener("click", (ev) => {
-                    ev.stopPropagation();
-                    killAdj(makePinned ? "pinned" : "hover");
-                });
-                barBtns.appendChild(goto);
-                // Only a pinned bar can be minimised; a hovered one goes on
-                // its own the moment the pointer leaves it.
-                if (makePinned) barBtns.appendChild(mini);
-                bar.appendChild(barBtns);
-                document.body.appendChild(bar);
-                if (makePinned) {
-                    bar.style.left = left + "px";
-                    bar.style.width = (rr.right - left) + "px";
-                } else {
-                    requestAnimationFrame(() => {
-                        bar.style.left = left + "px";
-                        bar.style.width = (rr.right - left) + "px";
-                    });
-                }
-
-                const note = await this.openBarPopover(webviewEl, { id, typed: true }, !!makePinned, {
-                    adjacent: { left, top, width },
-                    suppressHoverClose: true
-                });
-                if (!note) { try { bar.remove(); } catch (e) {} return; }
-                // A hovered note paints over the pinned note's title bar.
-                // Notes paint over the list they belong to; the bars they
-                // hang from stay beneath it so its X is never covered.
-                note.body.style.zIndex = makePinned ? "1000020" : "1000038";
-                note.body.dataset.stepAdjacent = "1";
-                // Close the seam between the stretched bar and the note: the
-                // body is pulled up so its top edge meets the bar's bottom,
-                // whatever border/margin the list rows carry.
-                const seamShut = () => {
-                    try {
-                        if (!bar.isConnected || !note.body || !note.body.isConnected) return;
-                        const br = bar.getBoundingClientRect();
-                        const nr = note.body.getBoundingClientRect();
-                        const gap = Math.round(nr.top - br.bottom);
-                        if (gap > 0) note.body.style.top = (parseFloat(note.body.style.top || "0") - gap) + "px";
-                    } catch (e) {}
-                };
-                requestAnimationFrame(() => { seamShut(); requestAnimationFrame(seamShut); });
-
-                // The bar follows its row as the list scrolls. Once the row
-                // would leave the popover, the bar parks at the top or bottom
-                // edge until the row comes back into view. The note tracks the
-                // bar, so the pair always reads as one unit.
-                const followRows = () => {
-                    if (!bar.isConnected) return;
-                    try {
-                        const rr2 = row.getBoundingClientRect();
-                        const pr = body.getBoundingClientRect();
-                        const h = bar.offsetHeight || rr2.height;
-                        const headH = header.offsetHeight || 0;
-                        const minTop = pr.top + headH;
-                        const maxTop = Math.max(minTop, pr.bottom - h);
-                        let top = rr2.top;
-                        if (top < minTop) top = minTop;
-                        else if (top > maxTop) top = maxTop;
-                        bar.style.top = top + "px";
-                        if (note && note.body && note.body.isConnected) {
-                            note.body.style.top = (top + h) + "px";
-                        }
-                    } catch (e) {}
-                };
-                listEl.addEventListener("scroll", followRows, { passive: true });
-
-                const ent = { id, bar, note, timer: null, followRows };
-                if (makePinned) this._adjPinned = ent; else this._adjHover = ent;
-                this._syncBarHold();
-                note._adjBar = bar;
-                note._adjSlot = makePinned ? "pinned" : "hover";
-
-                if (!makePinned) {
-                    // Alive while the pointer is on the bar, the row, or the
-                    // note itself — and gone the moment it leaves all three.
-                    // Presence is tracked with enter/leave flags, not a tracked
-                    // pointer point: while the cursor is over the guest page the
-                    // host never sees a mousemove, so a remembered host position
-                    // is stale and would either keep this note alive (if the old
-                    // point fell inside it) or kill it early.
-                    const over = { bar: false, row: false, body: false };
-                    const track = (el, key) => {
-                        if (!el) return;
-                        el.addEventListener("mouseenter", () => { over[key] = true; clearTimeout(ent.timer); });
-                        el.addEventListener("mouseleave", () => { over[key] = false; maybe(); });
-                    };
-                    // A flag can only count while its element is still in the
-                    // document: a row torn down under a stationary cursor never
-                    // fires mouseleave, and a stuck `true` kept the note alive
-                    // forever (and, before the fix above, every ordinary hover
-                    // note with it).
-                    const still = () => (over.bar && bar.isConnected)
-                        || (over.row && row.isConnected)
-                        || (over.body && note.body && note.body.isConnected);
-                    const maybe = () => {
-                        clearTimeout(ent.timer);
-                        ent.timer = window.setTimeout(() => {
-                            if (this._adjHover !== ent) return;
-                            if (still()) return;
-                            // A pinned note elsewhere in the list is a
-                            // different note: it must not keep this one alive.
-                            dispose(note);
-                        }, 90);
-                    };
-                    ent.maybe = maybe;
-                    track(bar, "bar");
-                    track(row, "row");
-                    track(note.body, "body");
-                    // A row scrolled out from under the pointer sends no
-                    // mouseleave; the scroll handler re-tests instead.
-                    const recheck = () => {
-                        over.row = !!row.isConnected && row.matches(":hover");
-                        over.bar = !!bar.isConnected && bar.matches(":hover");
-                        over.body = !!note.body && note.body.isConnected && note.body.matches(":hover");
-                        if (!still()) maybe();
-                    };
-                    listEl.addEventListener("scroll", recheck, { passive: true });
-                }
-
-                // Clicking the stretched bar pins that note; a pinned note is
-                // replaced only by another click, never by mere hovering.
-                bar.addEventListener("click", async (ev) => {
-                    ev.stopPropagation();
-                    // A pinned bar is already extended: clicking it minimises
-                    // it again, exactly like the arrow button.
-                    if (makePinned) { killAdj("pinned"); return; }
-                    killAdj("hover");
-                    await makeAdj(id, row, true);
-                });
-            };
-
-            // The list owns whatever note is open beside it: close it with the
-            // list, however the list is closed.
-            entry.adjChild = () => { killAdj("pinned"); killAdj("hover"); };
-
-            ids.forEach(id => {
-                const info = contentOf[id];
-                const isCross = id.indexOf("X:") === 0;
-                const row = listEl.createDiv({ cls: "step-bar-popover-titlebar" });
-                row.style.position = "relative";
-                row.style.padding = "6px 8px";
-                row.style.margin = "0 0 4px 0";
-                row.style.borderRadius = "4px";
-                row.style.cursor = "pointer";
-                const col = info.colour || "#17758f";
-                if (isCross) {
-                    // Crosslink: hollow — dark grey fill, colour stroke.
-                    row.style.background = "#3a3a3a";
-                    row.style.boxShadow = "inset 0 0 0 2px " + col;
-                } else {
-                    row.style.background = col;
-                }
-                const hex = String(col).replace("#", "");
-                const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
-                const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
-                const darkText = !isCross && lum > 0.6;
-                const nameEl = row.createDiv();
-                nameEl.setText(info.refText || "");
-                nameEl.style.fontWeight = "700";
-                nameEl.style.fontSize = "13px";
-                nameEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
-                if (info.label) {
-                    const lbl = row.createDiv();
-                    lbl.setText(info.label);
-                    lbl.style.fontSize = "11px";
-                    lbl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
-                }
-                row.addEventListener("mouseenter", () => {
-                    row.style.filter = "brightness(1.12)";
-                    // Preview to the left. Hovering replaces a hover preview and
-                    // sits on top of a pinned note; it never replaces it.
-                    makeAdj(id, row, false);
-                });
-                row.addEventListener("mouseleave", () => { row.style.filter = ""; });
-                row.addEventListener("click", async (ev) => {
-                    ev.stopPropagation();
-                    // Pin it exactly as clicking the stretched bar would.
-                    killAdj("hover");
-                    await makeAdj(id, row, true);
-                });
-            });
-        };
-
-        // Create the popover for one bar hit. Pinned popovers get a header
-        // toolbar (open-in-Obsidian button), are draggable by the header and
-        // resizable from the corner.
-        this.openBarPopover = async (webviewEl, hit, pinned, opts) => {
-            // opts.adjacent: the note belongs to a row in the "Wider
-            // References" list. Its own title bar is unused — the row, stretched
-            // leftwards, becomes the title bar — and it anchors to the row
-            // instead of to a bar in the page.
-            const adjacent = (opts && opts.adjacent) || null;
-            const box = webviewEl.getBoundingClientRect();
-            if (hit && hit.overflow) {
-                await this.openOverflowPopover(webviewEl, hit, pinned);
-                return;
-            }
-            if (!box.width) { if (!pinned) closePopover(); this._syncBarHold(); return; }
-
-            // Content from the cached typed scan (same ids the page uses)
-            const td = this._noteDotsCache && this._noteDotsCache.typedData;
-            const info = td && td.contentOf && td.contentOf[hit.id];
-            if (!info) { this._syncBarHold(); return; }
-            const base = hit.id.split(":")[1];
-            const folder = (this.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
-            // Typed entries live in the notes folder; ordinary notes record
-            // their real path (they can sit anywhere in the vault).
-            const sourcePath = info.path || (folder ? `${folder}/${base}.md` : `${base}.md`);
-
-            // Open the note in Obsidian and land the cursor on its reference
-            // line. Shared by the note's own toolbar button and by the
-            // "go to note" button on a row's stretched title bar.
-            const goToNote = async () => {
-                try {
-
-                    const leaf2 = await this.app.workspace.openLinkText(sourcePath, "", true);
-                    const view = leaf2 && leaf2.view;
-                    if (view && view.getMode && view.getMode() === "source" && view.editor) {
-                        const ed = view.editor;
-                        const value = ed.getValue();
-                        const lines = value.split("\n");
-                        const wantRaw = String(info.refRaw || "").trim();
-                        const wantText = String(info.refText || "").replace(/[\[\]]/g, "").trim();
-                        let lineNo = -1;
-                        if (wantRaw) {
-                            for (let i = 0; i < lines.length; i++) {
-                                if (!lines[i].includes("reference=")) continue;
-                                const m = lines[i].match(/reference=([^)&\s]+)/);
-                                if (!m) continue;
-                                let got = m[1];
-                                try { got = decodeURIComponent(got); } catch (e) {}
-                                if (got.trim() === wantRaw) { lineNo = i; break; }
-                            }
-                        }
-                        // Fallback: the line that names the reference, so a
-                        // hand-written or odd-encoded link still lands right.
-                        if (lineNo < 0 && wantText) {
-                            for (let i = 0; i < lines.length; i++) {
-                                if (lines[i].includes("reference=") && lines[i].includes(wantText)) { lineNo = i; break; }
-                            }
-                        }
-                        if (lineNo >= 0) {
-                            const pos = { line: lineNo, ch: 0 };
-                            // Select the whole line: scrolling lands there and
-                            // the line is visibly highlighted.
-                            ed.setSelection(pos, { line: lineNo, ch: lines[lineNo].length });
-                            ed.scrollIntoView({ from: pos, to: pos }, true);
-                        }
-                    }
-            
-                } catch (e) {}
-            };
-
-            // Pinning replaces the pinned note and any transient hover note;
-            // hovering keeps the pinned note where it is.
-            // An adjacent note belongs to the "Wider References" list, so
-            // opening it must not close the very popover that owns it.
-            if (!adjacent) { closeHover(); if (pinned) closePinned(); }
-
-            // Anchor at the webview's top right corner
-            const anchorEl = document.createElement("div");
-            anchorEl.style.cssText = "position:fixed;width:0;height:0;pointer-events:none;";
-            anchorEl.style.left = (box.right - 8) + "px";
-            anchorEl.style.top = (box.top + 8) + "px";
-            document.body.appendChild(anchorEl);
-
-            let pop = null;
-            // Own element, not Obsidian's HoverPopover. HoverPopover keeps a
-            // single shared hover element for the whole app and hides itself on
-            // mouseleave; that closed pinned notes when the pointer moved off
-            // them and made two independent notes impossible. A plain div we
-            // own is torn down only when we say so.
-            const body = document.createElement("div");
-            pop = {
-                hoverEl: body,
-                hide() { try { body.remove(); } catch (e) {} },
-                position() {},
-                show() {}
-            };
-            document.body.appendChild(body);
-            body.addClass("step-bar-popover");
-            // A transient hover note must stack above the pinned one.
-            // An adjacent note sits above the list it was opened from (and
-            // above every title bar it hangs from).
-            body.style.zIndex = adjacent
-                ? (pinned ? "1000020" : "1000038")
-                : (pinned ? "1000010" : "1000050");
-            // Anchor at the top right of the webview: right-aligned by pulling
-            // the box back over its own width.
-            body.style.position = "fixed";
-            body.style.left = (box.right - 8) + "px";
-            body.style.top = (box.top + 8) + "px";
-            body.style.right = "auto";
-            body.style.bottom = "auto";
-            body.style.transform = "translateX(-100%)";
-            if (adjacent) {
-                body.style.transform = "none";
-                body.style.left = adjacent.left + "px";
-                body.style.top = adjacent.top + "px";
-                body.style.width = adjacent.width + "px";
-                body.dataset.stepAdjacent = "1";
-            }
-            // Register immediately: any later failure must still leave the
-            // popover closeable (otherwise the X does nothing).
-            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, ovf: !!hit.ovf, page: hit.page || "" };
-            entry.goToNote = goToNote;
-            if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
-            else this._hoverPop = entry;
-            this._barWebview = webviewEl;
-            this._syncBarHold();
-            body.style.maxHeight = "30vh";
-            // Width hugs the content; height is a fixed length, scrolled
-            // inside. Pinned and unpinned are the same size.
-            body.style.width = adjacent ? adjacent.width + "px" : "max-content";
-            // HoverPopover's hoverEl is a flex row by default; force a column
-            // so the title sits above the text.
-            body.style.display = "flex";
-            body.style.flexDirection = "column";
-            body.style.alignItems = "stretch";
-            // Track whether the pointer is inside the popover: leaving a bar for
-            // its own note must not close it. An adjacent note is the exception:
-            // the "Wider References" list owns its lifetime, so the built-in
-            // hover-close would fight that.
-            if (!pinned && !(adjacent && opts && opts.suppressHoverClose)) {
-                this._pointerInPopover = false;
-                body.addEventListener("mouseenter", () => {
-                    this._pointerInPopover = true;
-                    clearTimeout(this._hoverCloseTimer);
-                });
-                body.addEventListener("mouseleave", () => {
-                    this._pointerInPopover = false;
-                    this._scheduleHoverClose();
-                });
-            }
-
-            // Moving the pointer onto the popover no longer lights anything in
-            // STEP: the passage highlight belongs to the bar hover alone.
-
-            // Title block, coloured like the note bar: note name (bold,
-            // larger) with the verse reference underneath. Buttons overlay
-            // the block's top right corner.
-            const header = body.createDiv({ cls: "step-bar-popover-header" });
-            // Title-block colour = bar colour; pick white or dark grey text
-            // by the block's relative luminance.
-            const hex = (info.colour || "#17758f").replace("#", "");
-            const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
-            const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
-            const darkText = lum > 0.6;
-            if (info.colour) header.style.backgroundColor = info.colour;
-            else header.style.backgroundColor = "var(--background-secondary)";
-            // Its title bar is the row stretched over it, so hide the header.
-            if (adjacent) header.style.display = "none";
-            // Pin the title block: it stays in view while the note scrolls under it.
-            header.style.position = "sticky";
-            header.style.top = "0";
-            header.style.zIndex = "5";
-            header.style.flex = "0 0 auto";
-            header.style.padding = "8px 44px 6px 12px";
-            const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
-            // The title is always the note's own reference — the same title for
-            // every bar that file or section draws.
-            const titleText = info.refText || "";
-            titleEl.setText(titleText);
-            titleEl.style.fontWeight = "700";
-            titleEl.style.fontSize = "15px";
-            titleEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
-            const refEl = header.createDiv({ cls: "step-bar-popover-ref" });
-            refEl.setText(info.label || "");
-            refEl.style.fontSize = "12px";
-            refEl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
-            const btns = header.createDiv({ cls: "step-bar-popover-buttons" });
-            btns.style.position = "absolute";
-            btns.style.top = "6px";
-            btns.style.right = "6px";
-            btns.style.display = "flex";
-            btns.style.flexDirection = "row";
-            btns.style.gap = "4px";
-            // Lucide svgs size via width:1em; a tiny inherited font-size collapses
-            // them to a dot. Pin explicit pixel size + colour on the svg.
-            const hardenIcon = (btn) => {
-                const svg = btn.querySelector("svg");
-                if (!svg) return;
-                const col = darkText ? "#3a3a3a" : "#ffffff";
-                for (const k of ["width", "height"]) {
-                    svg.setAttribute(k, "16");
-                    svg.style[k] = "16px";
-                }
-                svg.style.stroke = col;
-                svg.style.display = "block";
-            };
-            if (pinned) {
-                const openBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
-                openBtn.style.background = "transparent";
-                openBtn.style.border = "none";
-                openBtn.style.borderRadius = "50%";
-                openBtn.style.width = "26px";
-                openBtn.style.height = "26px";
-                openBtn.style.padding = "0";
-                openBtn.style.fontSize = "16px"; // em-sized icons must not inherit a tiny font
-                openBtn.style.display = "flex";
-                openBtn.style.alignItems = "center";
-                openBtn.style.justifyContent = "center";
-                openBtn.style.cursor = "pointer";
-                openBtn.addEventListener("mouseenter", () => { openBtn.style.background = "rgba(128,128,128,0.35)"; });
-                openBtn.addEventListener("mouseleave", () => { openBtn.style.background = "transparent"; });
-                setIcon(openBtn, "lucide-arrow-up-right");
-                hardenIcon(openBtn);
-                openBtn.setAttribute("aria-label", "Open in Obsidian at this reference");
-                openBtn.addEventListener("click", async (ev) => {
-                    ev.stopPropagation();
-                    await goToNote();
-                    closePinned();
-                });
-                const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
-                closeBtn.style.background = "transparent";
-                closeBtn.style.border = "none";
-                closeBtn.style.borderRadius = "50%";
-                closeBtn.style.width = "26px";
-                closeBtn.style.height = "26px";
-                closeBtn.style.padding = "0";
-                closeBtn.style.fontSize = "16px"; // em-sized icons must not inherit a tiny font
-                closeBtn.style.display = "flex";
-                closeBtn.style.alignItems = "center";
-                closeBtn.style.justifyContent = "center";
-                closeBtn.style.cursor = "pointer";
-                closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(128,128,128,0.35)"; });
-                closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "transparent"; });
-                setIcon(closeBtn, "lucide-x");
-                if (!closeBtn.querySelector("svg")) {
-                    // Last resort: guaranteed-visible unicode cross
-                    closeBtn.setText("\u2715");
-                    closeBtn.style.color = darkText ? "#3a3a3a" : "#ffffff";
-                    closeBtn.style.fontSize = "14px";
-                    closeBtn.style.lineHeight = "26px";
-                }
-                hardenIcon(closeBtn);
-                closeBtn.setAttribute("aria-label", "Close");
-                closeBtn.addEventListener("click", (ev) => {
-                    ev.stopPropagation();
-                    closePinned();
-                });
-            } else {
-                btns.addClass("step-bar-popover-buttons-hidden");
-            }
-
-            const mdEl = body.createDiv({ cls: "step-bar-popover-body" });
-            mdEl.style.padding = "8px 14px 10px 14px";
-            // The markdown body is its own scroll container: the title block
-            // above it stays put and the note scrolls underneath. Without
-            // min-height:0 a flex child refuses to shrink, so the box grows
-            // instead of scrolling and the wheel does nothing.
-            mdEl.style.flex = "1 1 auto";
-            mdEl.style.minHeight = "0";
-            mdEl.style.overflowY = "auto";
-            mdEl.style.overflowX = "hidden";
-            mdEl.style.overscrollBehavior = "contain";
-            // Wheel over the popover scrolls the note even if the pointer is
-            // over the title block or the box's padding.
-            body.addEventListener("wheel", (ev) => {
-                if (!mdEl.style.display || mdEl.style.display === "none") return;
-                if (mdEl.scrollHeight <= mdEl.clientHeight) return;
-                mdEl.scrollTop += ev.deltaY;
-                ev.preventDefault();
-            }, { passive: false });
-            try {
-                await MarkdownRenderer.render(this.app, info.text || "", mdEl, sourcePath, this);
-            } catch (e) {
-                mdEl.setText(info.text || "");
-            }
-
-            // MarkdownRenderer hands links over to Obsidian's tooltip system
-            // (title/aria-label + listeners), which normal reading views
-            // suppress but a bare div in a custom panel does not — hence the
-            // black URL box on hover.
-            this.stripLinkTooltips(mdEl, sourcePath);
-
-
-            // Every place the linked passage is mentioned in the note.
-            const needles = [];
-            if (info.searchRef) {
-                const parts = String(info.searchRef).split("-")[0].split(".");
-                needles.push(String(info.searchRef).replace(/\./g, " "));
-                // "Genesis.3.15" also reads as "Genesis 3:15" in prose.
-                if (parts.length >= 3) needles.push(parts[0] + " " + parts[1] + ":" + parts[2]);
-            }
-            // Every spelling a reference can take in prose: "Genesis.3.15",
-            // "Genesis 3 15", "Genesis 3:15", "Genesis 3.15".
-            [info.searchRef, info.refRaw].filter(Boolean).forEach((r) => {
-                const plain = String(r).replace(/\./g, " ");
-                needles.push(plain);
-                String(r).split("-")[0].split(".").length >= 3 && needles.push(plain.replace(/(\d+) (\d+)$/, "$1:$2"));
-                needles.push(String(r).split("-")[0]);
-            });
-            if (info.refText) needles.push(info.refText);
-            // A note's own bar shows the note unmarked, at the top. Only a
-            // crosslink marks and scrolls to its reference.
-            let mentions = info.noMentions ? [] : this.findMentions(mdEl, info.searchRef, needles);
-            // Skip the note's own heading line, which carries the same reference
-            // text as this crosslink. The crosslink's spot in the body is the
-            // first mention worth marking.
-            if (info.dropFirstMention && mentions.length) {
-                const firstBlock = mdEl.firstElementChild;
-                while (mentions.length > 1 && firstBlock &&
-                    (firstBlock === mentions[0] || firstBlock.contains(mentions[0]))) {
-                    mentions.shift();
-                }
-            }
-
-            // Match heights: measure the natural content height (header + body)
-            // at the popover's final width and use it for both the hover state
-            // and the pinned state, capped at 60% of the viewport. Below the cap
-            // the content scrolls.
-            //
-            // The width has to settle first: `max-content` is only resolved by
-            // layout, and the markdown inside wraps to whatever width it ends up
-            // with. Measuring before that produces a height for the wrong wrap
-            // (far too tall when the box is measured narrow), which is why some
-            // notes came out much longer than their content. Measure with the
-            // height/max-height off, read the body's own scrollHeight, then cap.
-            // Fixed vertical length: half the old 60vh cap. Content past it
-            // scrolls inside; the box never grows to fit the whole note.
-            const capH = () => Math.max(180, Math.round(window.innerHeight * 0.3));
-            let fittedH = 0;
-            const fitHeight = () => {
-                // Once the user has dragged the box taller, their height wins.
-                if (body.dataset.stepUserH) return;
-                // A collapsed note (title bar only) has no content to size to.
-                if (body.classList.contains("step-bar-popover-collapsed")) {
-                    body.style.height = "auto";
-                    body.style.maxHeight = "none";
-                    body.style.overflow = "hidden";
-                    return;
-                }
-                fittedH = capH();
-                body.style.maxHeight = fittedH + "px";
-                body.style.height = fittedH + "px";
-                body.style.overflow = "hidden";
-                // One scroller only, and it is the markdown element: two nested
-                // scrollbars fought each other and swallowed the wheel.
-                body.style.overflowY = "hidden";
-            };
-            fitHeight();
-            // Re-measure once layout has settled, in case the initial pass ran
-            // before the width resolved (that produced the over-tall boxes).
-            requestAnimationFrame(() => requestAnimationFrame(() => {
-                try {
-                    fitHeight();
-                    if (pinned && !collapsedPopover) body.style.height = fittedH + "px";
-                    if (mentions.length) scrollToMention(0);
-                } catch (e) {}
-            }));
-            // Late layout (webfonts, images, markdown embeds) can change the
-            // wrapped height after the first two frames; settle the size again so
-            // a slow-loading note doesn't stay measured at the fallback height.
-            window.setTimeout(() => {
-                try {
-                    if (!body.isConnected) return;
-                    fitHeight();
-                    if (pinned && !collapsedPopover) body.style.height = fittedH + "px";
-                    if (mentions.length) scrollToMention(0);
-                } catch (e) {}
-            }, 180);
-
-            // Scroll to the first mention, and (pinned) offer a counter button
-            // to step through the rest.
-            const scrollToMention = (i) => {
-                const el = mentions[i];
-                if (!el) return;
-                // Whatever actually clips the content is the thing to scroll:
-                // usually the markdown body, but HoverPopover may wrap it in a
-                // scroller of its own. Walk up and take the innermost clipper
-                // that overflows; fall back to the body.
-                const isScroller = (n) => {
-                    if (!n || n.nodeType !== 1 || n === document.body) return false;
-                    if (n.scrollHeight <= n.clientHeight + 1) return false;
-                    const oy = getComputedStyle(n).overflowY;
-                    return oy === "auto" || oy === "scroll" || oy === "overlay";
-                };
-                let sc = null;
-                for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
-                    if (isScroller(n)) { sc = n; break; }
-                }
-                if (!sc && body.scrollHeight > body.clientHeight + 1) {
-                    if (getComputedStyle(body).overflowY === "hidden") body.style.overflowY = "auto";
-                    sc = body;
-                }
-                if (!sc) return;
-                const cr = sc.getBoundingClientRect();
-                const er = el.getBoundingClientRect();
-                // Centre the mention in what is actually visible. The title bar
-                // can overlap the top of the scroll area, so the covered strip
-                // is not usable space: measure the visible box from the bar's
-                // lower edge instead.
-                const hr = header.getBoundingClientRect();
-                const covered = Math.max(0, Math.min(hr.bottom - cr.top, cr.height));
-                const usableTop = cr.top + covered;
-                const usableH = Math.max(24, cr.height - covered);
-                const target = usableTop + usableH / 2 - er.height / 2;
-                const delta = er.top - target;
-                if (Math.abs(delta) < 1) return;
-                const max = sc.scrollHeight - sc.clientHeight;
-                sc.scrollTop = Math.min(max, Math.max(0, sc.scrollTop + delta));
-            };
-            if (mentions.length) scrollToMention(0);
-
-            if (pinned && mentions.length > 1) {
-                let idx = 0;
-                const counter = btns.createEl("button", { cls: "step-bar-popover-btn step-bar-popover-counter" });
-                counter.style.width = "auto";
-                counter.style.minWidth = "34px";
-                counter.style.padding = "0 6px";
-                counter.style.borderRadius = "10px";
-                counter.style.fontSize = "11px";
-                counter.style.fontFamily = "var(--font-interface)";
-                counter.style.background = darkText ? "rgba(0,0,0,0.10)" : "rgba(255,255,255,0.18)";
-                counter.style.color = darkText ? "#3a3a3a" : "#ffffff";
-                counter.style.border = "none";
-                counter.style.cursor = "pointer";
-                counter.style.display = "flex";
-                counter.style.alignItems = "center";
-                counter.style.justifyContent = "center";
-                counter.style.height = "22px";
-                counter.style.marginTop = "0";
-                counter.style.alignSelf = "center";
-                counter.setText(`${idx + 1}/${mentions.length}`);
-                counter.setAttribute("aria-label", "Next mention");
-                // Stepper sits left of Open/Close.
-                if (btns.firstChild !== counter) btns.insertBefore(counter, btns.firstChild);
-                counter.addEventListener("pointerdown", (ev) => ev.stopPropagation());
-                counter.addEventListener("click", (ev) => {
-                    ev.stopPropagation();
-                    ev.preventDefault();
-                    idx = (idx + 1) % mentions.length;
-                    counter.setText(`${idx + 1}/${mentions.length}`);
-                    scrollToMention(idx);
-                });
-            }
-
-            // A Bible-note section that holds nothing but the reference itself
-            // (no prose, no images) collapses: only its coloured title bar shows.
-            let collapsedPopover = false;
-            try {
-                const tmp = mdEl.cloneNode(true);
-                // Links are content, not chrome: a body whose only text is a
-                // link must still show. So anchors are kept here and also count
-                // as content when deciding whether to collapse.
-                const hasLink = !!mdEl.querySelector("a");
-                tmp.querySelectorAll("img, video, audio, br, hr, .step-popover-mention").forEach(n => n.remove());
-                // The reference can also arrive as plain text (a bare
-                // "Genesis 3:15", the note's own title line, frontmatter), so
-                // scrub every known spelling of it before deciding.
-                let leftover = (tmp.textContent || "").replace(/[\s\u00a0]+/g, "");
-                const strip = [info.refText, info.refRaw, info.searchRef];
-                if (info.searchRef) {
-                    const p = String(info.searchRef).split("-")[0].split(".");
-                    strip.push(String(info.searchRef).replace(/\./g, " "));
-                    if (p.length >= 3) { strip.push(p[0] + " " + p[1] + ":" + p[2]); strip.push(p[0] + " " + p[1] + "." + p[2]); }
-                }
-                strip.filter(Boolean).forEach((t) => {
-                    const needle = String(t).replace(/[\s\u00a0]+/g, "");
-                    if (!needle) return;
-                    while (leftover.includes(needle)) leftover = leftover.split(needle).join("");
-                });
-                // Drop punctuation-only remains ("|", "—", "()", ":") too.
-                leftover = leftover.replace(/[|\-–—:;,·•·()\[\]{}"“”'’«»]/g, "");
-                if (!leftover && !hasLink) {
-                    mdEl.style.display = "none";
-                    mdEl.style.padding = "0";
-                    body.classList.add("step-bar-popover-collapsed");
-                    collapsedPopover = true;
-                }
-            } catch (e) {}
-
-            if (pinned) {
-                // Keep it where it is, movable and resizable, and stop the
-                // HoverPopover from hiding itself when the mouse leaves it.
-                body.classList.add("step-bar-popover-pinned");
-                // HoverPopover re-positions its element on mousemove via a
-                // transform; that fights the drag. Neutralise both hooks.
-                try { if (typeof pop.position === "function") pop.position = () => {}; } catch (e) {}
-                try { if (typeof pop.show === "function") pop.show = () => {}; } catch (e) {}
-                const r = adjacent
-                    ? { left: adjacent.left, top: adjacent.top }
-                    : anchorEl.getBoundingClientRect();
-                body.style.position = "fixed";
-                body.style.width = adjacent ? adjacent.width + "px" : body.style.width;
-                // Obsidian positions hover popovers with a CSS transform, which
-                // would override left/top entirely and make the box refuse to
-                // move. Take the transform off so the drag can use left/top.
-                body.style.transform = "none";
-                body.style.translate = "0 0";
-                body.style.maxHeight = capH() + "px";
-                body.style.inset = "auto";
-                body.style.zIndex = adjacent
-                    ? (pinned ? "1000020" : "1000038")
-                    : (pinned ? "1000010" : "1000050");
-                body.style.left = adjacent
-                    ? adjacent.left + "px"
-                    : Math.max(4, r.left - body.offsetWidth) + "px";
-                body.style.top = r.top + "px";
-                body.style.right = "auto";
-                body.style.overflow = "hidden";
-                body.style.minWidth = "240px";
-                // Keep the measured height from the hover state (do not force a
-                // fixed 210px), so pinning doesn't change the box's size. The
-                // height must stay pinned too: with maxHeight:none the box just
-                // grows to fit the whole note and there is nothing left to
-                // scroll. Fixed height + the body's own scroller = scrollable.
-                body.style.minHeight = collapsedPopover ? "0" : "80px";
-                body.style.maxWidth = "560px";
-                body.style.maxHeight = collapsedPopover ? "none" : capH() + "px";
-                if (!collapsedPopover) body.style.height = capH() + "px";
-
-                // Vertical-only resize handle along the bottom edge: drag down
-                // to make the box taller (content scrolls inside).
-                const grip = body.createDiv({ cls: "step-bar-popover-grip" });
-                grip.style.position = "absolute";
-                grip.style.left = "0";
-                grip.style.right = "0";
-                grip.style.bottom = "0";
-                grip.style.height = "9px";
-                grip.style.cursor = "ns-resize";
-                grip.style.zIndex = "10";
-                grip.style.background = "transparent";
-                let vresize = null;
-                grip.addEventListener("pointerdown", (ev) => {
-                    ev.preventDefault();
-                    vresize = { sy: ev.clientY, h: body.offsetHeight };
-                    grip.setPointerCapture(ev.pointerId);
-                });
-                grip.addEventListener("pointermove", (ev) => {
-                    if (!vresize) return;
-                    body.dataset.stepUserH = "1";
-                    body.style.height = Math.max(80, vresize.h + ev.clientY - vresize.sy) + "px";
-                });
-                const endV = () => { vresize = null; };
-                grip.addEventListener("pointerup", endV);
-                grip.addEventListener("pointercancel", endV);
-                entry.hide = () => { try { body.remove(); } catch (e) {} };
-
-                // Drag by the header. Listeners go on document while dragging:
-                // element capture is unreliable here because Obsidian's
-                // HoverPopover owns the element and can re-render it mid-drag.
-                // Drag the box. Deliberately capture-free: element pointer
-                // capture can be lost the moment anything re-renders the
-                // header (which happens on notes whose popover body is rebuilt,
-                // e.g. one referencing its own section), and a spurious
-                // `lostpointercapture` used to end the drag on its first tick.
-                // Everything runs off window-level capture listeners instead.
-                let drag = null;
-                let dragRaf = false;
-                const onDragMove = (ev) => {
-                    if (!drag) return;
-                    if (ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
-                    const dx = ev.clientX - drag.sx;
-                    const dy = ev.clientY - drag.sy;
-                    if (!dx && !dy) return;
-                    drag.moved = true;
-                    body.style.left = Math.max(0, drag.l + dx) + "px";
-                    body.style.top = Math.max(0, drag.t + dy) + "px";
-                };
-                const onDragEnd = (ev) => {
-                    if (!drag) return;
-                    // Ignore a pointerup/cancel that belongs to another pointer.
-                    if (ev && ev.pointerId !== undefined && drag.pid !== undefined &&
-                        ev.pointerId !== drag.pid && ev.type !== "blur") return;
-                    // A pointerup while the button is still reported down, or a
-                    // pointercancel we did not ask for, must not kill the drag.
-                    if (ev && ev.type === "pointerup" && ev.buttons) return;
-                    drag = null;
-                    dragRaf = false;
-                    this._barDragging = false;
-                    try { body.style.userSelect = ""; body.style.cursor = "move"; } catch (e) {}
-                    window.removeEventListener("pointermove", onDragMove, true);
-                    window.removeEventListener("pointerup", onDragEnd, true);
-                    window.removeEventListener("pointercancel", onDragEnd, true);
-                    window.removeEventListener("blur", onBlur, true);
-                };
-                const onBlur = () => onDragEnd({ type: "blur" });
-                header.style.cursor = "move";
-                header.style.touchAction = "none";
-                header.style.userSelect = "none";
-                body.style.cursor = "move";
-                const startDrag = (ev) => {
-                    if (drag) return;
-                    if (ev.button !== undefined && ev.button !== 0) return;
-                    const t = ev.target;
-                    if (t && t.closest && t.closest("button, a, .step-bar-popover-grip")) return;
-                    const r = body.getBoundingClientRect();
-                    // The box is right-aligned with translateX(-100%); drop the
-                    // transform before dragging or it jumps a full width left.
-                    body.style.transform = "none";
-                    body.style.left = r.left + "px";
-                    body.style.top = r.top + "px";
-                    drag = { sx: ev.clientX, sy: ev.clientY, l: r.left, t: r.top, pid: ev.pointerId, moved: false };
-                    // Stop hover handling for the duration of the drag.
-                    this._barDragging = true;
-                    clearTimeout(this._barOpenTimer);
-                    clearTimeout(this._hoverCloseTimer);
-                    try { body.style.userSelect = "none"; body.style.cursor = "grabbing"; } catch (e) {}
-                    // Nothing else in Obsidian gets to see this press: link
-                    // handling, page preview and the editor all bail out.
-                    try { ev.preventDefault(); } catch (e) {}
-                    try { ev.stopPropagation(); } catch (e) {}
-                    window.addEventListener("pointermove", onDragMove, true);
-                    window.addEventListener("pointerup", onDragEnd, true);
-                    window.addEventListener("pointercancel", onDragEnd, true);
-                    window.addEventListener("blur", onBlur, true);
-                };
-                // One entry point only. A single capture listener, so a press
-                // fires startDrag exactly once (the old body+header pair fired
-                // it twice and the second pass could clear the drag state).
-                body.addEventListener("pointerdown", startDrag, true);
-            }
-
-            if (collapsedPopover) {
-                body.style.height = "auto";
-                body.style.minHeight = "0";
-                body.style.maxHeight = "none";
-                body.style.overflow = "hidden";
-                body.style.padding = "0";
-            }
-
-            // Layout (and, when pinned, repositioning) lands a frame or two after
-            // the box is built; re-run the jump until it sticks.
-            if (mentions.length) {
-                requestAnimationFrame(() => {
-                    scrollToMention(0);
-                    requestAnimationFrame(() => {
-                        scrollToMention(0);
-                        requestAnimationFrame(() => scrollToMention(0));
-                    });
-                });
-            }
-
-            entry.anchorEl = anchorEl;
-
-            // Obsidian sets its own stacking on show; re-assert ours a frame
-            // later so a hover note always sits above a pinned one.
-            const wantZ = adjacent
-                ? (pinned ? "1000020" : "1000038")
-                : (pinned ? "1000010" : "1000050");
-            const reassertZ = () => { try { body.style.zIndex = wantZ; } catch (e) {} };
-            reassertZ();
-            requestAnimationFrame(() => { reassertZ(); requestAnimationFrame(reassertZ); });
-            entry.adjacent = adjacent;
-            return entry;
-        };
-
-        // Leaving the window kills any open (unpinned) popover
-        this.registerDomEvent(document, "mouseleave", () => {
-            // Pointer has left the window: no bar can be under it any more.
-            this._lastBarHit = null;
-            this._scheduleHoverClose();
-        });
+        return iface;
     }
 
-    // Kill Obsidian's hover tooltips on links rendered into a custom panel.
-    // Attributes are not enough: Obsidian attaches hover listeners to the
-    // anchor, so each link is replaced with a clean clone (no listeners, no
-    // tooltip attributes) and given our own click handling back.
+    // A popover is anchored to one webview. When the user moves to another tab
+    // or the layout reflows, a box hanging off a panel that is no longer on
+    // screen is just a stray: close them all.
+    closeBarPopovers() {
+        if (!this._barInterfaces) return;
+        for (const iface of Array.from(this._barInterfaces.values())) {
+            try { iface.closeAll(); } catch (e) {}
+        }
+    }
+
+
     // Every place a reference is mentioned in rendered note text: anchors whose
     // link points at the same passage, else plain-text hits for the reference.
     // Returns the marked elements in document order.
@@ -5119,6 +3556,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return spans;
     }
 
+    // Kill Obsidian's hover tooltips on links rendered into a custom panel.
+    // Attributes are not enough: Obsidian attaches hover listeners to the
+    // anchor, so each link is replaced with a clean clone (no listeners, no
+    // tooltip attributes) and given our own click handling back.
     stripLinkTooltips(root, sourcePath) {
         root.querySelectorAll("a").forEach(a => {
             const ext = a.classList.contains("external-link");
@@ -5172,6 +3613,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         if (this.activePopover && this.activePopover.parentNode) {
             this.activePopover.parentNode.removeChild(this.activePopover);
         }
+        if (this._barInterfaces) this.closeBarPopovers();
         console.log('STEP Bible Linker unloaded.');
     }
 }
@@ -5999,20 +4441,6 @@ class BibleInformation {
 
 // ---------------------------------------------------------------------------
 // StepInterfaceDOM - the in-page half of the bar overlay.
-//
-// This class is authored here, in the plugin, but it never runs here: the
-// whole class is String()-ed and evaluated inside the STEP <webview>, a
-// separate document with its own window. window.__stepDOM holds the live
-// instance there, and mount() returns the result object the plugin reads back.
-//
-// It knows nothing about Obsidian, the vault, or the plugin: everything it
-// needs arrives in the window.__step* payload the plugin writes first, and
-// everything it reports goes out through console.log('__STEPBAR__...'), which
-// the host picks up on the webview console-message channel.
-//
-// Written as a real class rather than a template literal so that node --check
-// parses it, editors highlight it, and a syntax error is a plugin load failure
-// instead of a silent 'no bars anywhere'.
 // ---------------------------------------------------------------------------
 class StepInterfaceDOM {
     constructor() {
@@ -6969,5 +5397,1605 @@ class StepInterfaceDOM {
         } catch (e) {
             window.__stepLastPageWatchError = e && e.message ? e.message : String(e);
         }
+    }
+}
+
+// STEP INTERFACE, OBSIDIAN SIDE ==============================================================
+// ============================================================================================
+class StepInterfaceObsidian {
+    constructor(plugin, webviewEl) {
+        this.plugin = plugin;
+        this.webviewEl = webviewEl;
+        this._barWebview = webviewEl;
+        this._barHoverTimer = null;
+        // Two slots so a pinned note and a hover note can coexist: the hover
+        // box stacks above the pinned one.
+        this._pinnedPop = null;
+        this._hoverPop = null;
+        this._barPinned = false;
+
+        // Popover styling (header + body), theme-aware via Obsidian variables.
+        {
+            // Reuse the node if a previous load left one behind, but always
+            // rewrite its text: a stale stylesheet from an older build is how
+            // the box ended up with no background at all.
+            let st = document.getElementById("step-bar-popover-style");
+            if (!st) {
+                st = document.createElement("style");
+                st.id = "step-bar-popover-style";
+                document.head.appendChild(st);
+            }
+            st.textContent = [
+                // The box used to be Obsidian's HoverPopover, which supplied the
+                // theme surface. Now it's our own div, so we draw it ourselves.
+                ".step-bar-popover { width: max-content; max-width: 560px; min-width: 240px; max-height: 30vh; overflow: hidden; font-size: 13px;" +
+                "  background: var(--background-primary); color: var(--text-normal);" +
+                "  border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m, 8px);" +
+                "  box-shadow: 0 4px 18px rgba(0,0,0,0.28); }",
+                ".step-bar-popover .step-bar-popover-header {",
+                "  position: relative; display: flex; flex-direction: column; gap: 1px;",
+                "  padding: 8px 44px 6px 12px; margin-bottom: 0; flex: 0 0 auto; border-bottom: 1px solid var(--background-modifier-border); }",
+                ".step-bar-popover .step-bar-popover-title {",
+                "  font-weight: 700; font-size: 15px; font-family: var(--font-interface); color: var(--text-normal); }",
+                ".step-bar-popover .step-bar-popover-ref {",
+                "  font-size: 12px; font-family: var(--font-interface); color: var(--text-muted); }",
+                ".step-bar-popover .step-bar-popover-buttons {",
+                "  position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; }",
+                ".step-bar-popover .step-bar-popover-buttons-hidden { display: none; }",
+                ".step-bar-popover .step-bar-popover-btn {",
+                "  background: transparent; border: none; box-shadow: none; padding: 0; cursor: pointer;",
+                "  width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }",
+                ".step-bar-popover .step-bar-popover-btn:hover { background: rgba(255,255,255,0.25); }",
+                ".step-bar-popover .step-bar-popover-btn svg { width: 16px; height: 16px; }",
+                ".step-bar-popover .step-bar-popover-body { padding: 8px 14px 10px 14px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }",
+            ].join("\n");
+        }
+
+        const dispose = (entry) => {
+            if (!entry) return;
+            if (this._ovfList && this._ovfList.body === entry.body) this._ovfList = null;
+            const pop = entry.pop;
+            // Only a hover close is cancelled by a hover teardown. Clearing it
+            // when a pinned box closes threw away a hover note's already-
+            // scheduled removal, so the note sat there until the next pointer
+            // event — the delay that showed up right after closing a pin.
+            if (!entry.pinned) clearTimeout(this._hoverCloseTimer);
+            this._barDragging = false;
+            // The flag describes the hover note's own body. Once a box is torn
+            // down it can never be a true statement, whoever owned it, and a
+            // stuck `true` made pointerOverHoverPop() keep every later hover
+            // note alive.
+            this._pointerInPopover = false;
+            // Drop the slot first, then sync: the bar narrows on the same tick
+            // the popover is torn down.
+            // A row-owned note has nothing left to belong to.
+            if (entry._xGuard) { try { document.removeEventListener("pointerdown", entry._xGuard, true); } catch (e) {} entry._xGuard = null; }
+            if (entry._docWheel) { try { document.removeEventListener("wheel", entry._docWheel, true); } catch (e) {} entry._docWheel = null; }
+            try { if (entry.adjChild) entry.adjChild(); } catch (e) {}
+            // The stretched title bar belongs to this note, not to the list:
+            // it goes when the note goes, and the list's bookkeeping is cleared.
+            if (entry._adjBar) {
+                const b = entry._adjBar;
+                entry._adjBar = null;
+                try { b.style.opacity = "0"; } catch (e) {}
+                window.setTimeout(() => { try { b.remove(); } catch (e) {} }, 140);
+                if (entry._adjSlot === "pinned") {
+                    if (this._adjPinned && this._adjPinned.note === entry) this._adjPinned = null;
+                } else {
+                    if (this._adjHover && this._adjHover.note === entry) this._adjHover = null;
+                }
+            }
+            // The enter/leave flag belongs to that one popover. Once it is
+            // torn down the pointer cannot be inside it, but no mouseleave
+            // ever fires for an element removed under a stationary cursor, so
+            // the flag survived. Pinning disposes the hover note (the pointer
+            // is inside it — that is where the pin button was), so the flag
+            // stayed true for good: with no host pointer moves over the page,
+            // pointerOverHoverPop() had no geometry to fall back on and held
+            // every later hover note open until the user clicked or left the
+            // window. That is the "only after I pin something" bug.
+            if (this._hoverPop === entry) this._pointerInPopover = false;
+            if (entry.pinned) {
+                if (this._pinnedPop === entry) this._pinnedPop = null;
+                this._barPinned = false;
+                // Closing a pinned box with its X is host-side: the guest never
+                // sees the pointer leave the bar, so the last hit it reported
+                // would stay "current" and hold the next hover note open until
+                // the pointer re-entered the page. Closing by clicking the bar
+                // already clears it; this makes every close path do the same.
+                this._lastBarHit = null;
+                // The X is host-side: the guest never reports the pointer
+                // leaving the lane, so a lane hover would otherwise stay lit
+                // and wide until the pointer re-entered the page.
+                this._barHitOvf = false;
+                this._barHitOvfPage = "";
+            } else if (this._hoverPop === entry) this._hoverPop = null;
+            try { (entry.hide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
+            // Narrow the bars in the same tick the popover goes away.
+            this._syncBarHold();
+            // The lit passage follows the bar that lit it, on this same tick.
+            this._restoreHighlight();
+            if (entry.anchorEl && entry.anchorEl.parentNode) entry.anchorEl.remove();
+            if (!entry.pinned) {
+                // No fade-out: a hover note goes the instant the bar is left.
+                try { if (entry.body) { entry.body.style.display = "none"; entry.body.remove(); } } catch (e) {}
+            }
+            if (entry.pinned) {
+                // A hover note can be open when the pin goes. Nothing will
+                // re-evaluate it until the pointer moves, so check now.
+                this._scheduleHoverClose();
+                // The X lives in the host document: the click took focus off
+                // the page, so hover reports from the guest would stall until
+                // the next click inside it. Give focus back straight away.
+                this._focusPage();
+            }
+        };
+        // Keep the guest's widened bars in step with the open popovers.
+        this._syncBarHold = () => {
+            // Per panel: a note open in one column must never widen a bar in
+            // the other, and the two grey lanes are separate lanes.
+            const byPage = new Map();
+            const add = (id, page) => {
+                if (!id) return;
+                page = page || "";
+                if (!byPage.has(page)) byPage.set(page, []);
+                const ids = byPage.get(page);
+                if (ids.indexOf(id) < 0) ids.push(id);
+                // A crosslink's section bar stays widened with it.
+                const td = this.plugin._noteDotsCache && this.plugin._noteDotsCache.typedData;
+                const p = td && td.contentOf && td.contentOf[id] && td.contentOf[id].parentId;
+                if (p && ids.indexOf(p) < 0) ids.push(p);
+            };
+            const pageOf = (entry) => (entry && entry.page) || "";
+            if (this._pinnedPop) add(this._pinnedPop.id, pageOf(this._pinnedPop));
+            if (this._hoverPop) add(this._hoverPop.id, pageOf(this._hoverPop));
+            // A note opened from the Wider References list lives in the list's
+            // own slots, not in the hover/pinned ones, so it has to be added
+            // separately or its bar (and the lane it belongs to) never widen.
+            if (this._adjPinned && this._adjPinned.note) add(this._adjPinned.note.id, pageOf(this._adjPinned));
+            if (this._adjHover && this._adjHover.note) add(this._adjHover.note.id, pageOf(this._adjHover));
+            // The grey lane stands for its whole list, so it stays wide while
+            // any note in that list is open — including a crosslink inside one
+            // of those notes, whose id only reaches the note through
+            // parentId above.
+            if (this._barHitOvf) add("__STEPOVF__", this._barHitOvfPage || "");
+            if (this._pinnedPop && this._pinnedPop.ovf) add("__STEPOVF__", pageOf(this._pinnedPop));
+            if (this._hoverPop && this._hoverPop.ovf) add("__STEPOVF__", pageOf(this._hoverPop));
+            const ovf = this._ovfList;
+            if (ovf && ovf.ids && ovf.ids.length) {
+                byPage.forEach((ids, page) => {
+                    if (page !== (ovf.page || "")) return;
+                    for (const id of ids.slice()) {
+                        if (ovf.ids.indexOf(id) >= 0) { add("__STEPOVF__", page); break; }
+                    }
+                });
+            }
+            const wv = this._barWebview;
+            if (!wv || !wv.executeJavaScript) return;
+            const payload = {};
+            byPage.forEach((ids, page) => { payload[page] = ids; });
+            // One message carries both halves of the hover: which bars widen
+            // and which passage is lit. Two separate fire-and-forget calls
+            // could land out of order after a pin, leaving bars wide or text
+            // lit with nothing open.
+            const lit = this._litEntry();
+            this._highlightPage = lit ? lit.page : "";
+            const state = {
+                seq: ++this._barStateSeq,
+                hold: payload,
+                id: lit ? lit.id : "",
+                page: lit ? lit.page : ""
+            };
+            try {
+                wv.executeJavaScript(`window.__stepBarState && window.__stepBarState(${JSON.stringify(state)})`).catch(() => {});
+            } catch (e) {}
+        };
+        const closeHover = () => dispose(this._hoverPop);
+        const closePinned = () => dispose(this._pinnedPop);
+        // Hand focus back to the page. Clicking any of our own chrome (an X,
+        // a title bar, the list header) moves focus to the host document, and
+        // while the webview is unfocused the guest stops reporting bar hovers
+        // until the user clicks back into the page — which looked exactly like
+        // "hover notes stop closing after I use the X".
+        this._focusPage = () => {
+            const wv = this._barWebview;
+            if (!wv) return;
+            try { if (wv.focus) wv.focus(); } catch (e) {}
+            try { wv.executeJavaScript("try{window.focus()}catch(e){}").catch(() => {}); } catch (e) {}
+        };
+        const closePopover = () => { closeHover(); closePinned(); };
+        this._closeBarPopover = closePopover;
+        this._closeHoverPopover = closeHover;
+        this._closePinnedPopover = closePinned;
+        this._barOpenTimer = null;
+
+        // Moving between a bar and its popover crosses a gap, and the popover
+        // sits outside the webview (so the guest reports "no bar"). Close a
+        // hover note only after a short grace period, and never while the
+        // pointer is actually over the popover.
+        this._lastBarHit = null;
+        // Whether the bar under the pointer also stands in the grey lane.
+        this._barHitOvf = false;
+        this._barDragging = false;
+        this._pointerInPopover = false;
+        this._lastPointer = null;
+        // True while the pointer is known to be over the guest page rather
+        // than over our own chrome. A bar report can only come from inside the
+        // webview, so it sets this; any host mousemove clears it.
+        this._inGuestPage = false;
+        this.plugin.registerDomEvent(document, "mousemove", (e) => {
+            this._lastPointer = { x: e.clientX, y: e.clientY };
+            // A host mousemove means the pointer is over host DOM, never over
+            // the page's content.
+            this._inGuestPage = false;
+            // Bar hits are only reported from inside the webview. Once the
+            // pointer moves onto one of our own popovers or bars the reports
+            // stop, so the last hit would otherwise stay "current" and keep a
+            // hover note alive for as long as the pointer stayed there.
+            const t = e.target;
+            if (t && t.closest && t.closest(".step-bar-popover, .step-adj-bar")) {
+                this._lastBarHit = null;
+            }
+        }, { passive: true, capture: true });
+        // True when the tracked pointer sits inside the open hover popover.
+        // Geometry is used instead of enter/leave flags: a flag can stay stuck
+        // when the element is removed or re-rendered under the cursor, which
+        // made notes linger for seconds.
+        const pointerOverHoverPop = () => {
+            if (!this._hoverPop) return false;
+            const own = this._hoverPop.body;
+            if (!own || !own.isConnected) return false;
+            // A report from the guest proves the pointer is over the page, so
+            // it cannot be over the note. Without this, the note's enter/leave
+            // flag was authoritative whenever a guest report arrived (guest
+            // reports null _lastPointer), and that flag can stay stuck: the
+            // pointer leaving the note into the webview fires no mouseleave in
+            // the host, because events over the guest never reach it. One stuck
+            // `true` then kept every later hover note open forever — the
+            // "after I pin something and close it with the X" bug.
+            if (this._inGuestPage) return false;
+            const c = own;
+            const p = this._lastPointer;
+            if (!p) return this._pointerInPopover;
+            try {
+                const stack = document.elementsFromPoint(p.x, p.y) || [];
+                for (const el of stack) {
+                    if (el === c || (c.contains && c.contains(el))) return true;
+                    // Nothing of ours sits above the hover note except other
+                    // popovers and stretched title bars — anything else (the
+                    // webview, page chrome) means the pointer is off the note.
+                    if (el.closest && el.closest(".step-bar-popover, .step-adj-bar, .step-overflow-list")) return false;
+                    break;
+                }
+            } catch (e) {}
+            const r = c.getBoundingClientRect();
+            return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
+        };
+
+        this._barStateSeq = 0;
+        this._litEntry = () => {
+            if (this._hoverPop && !this._hoverPop.ovf) return { id: this._hoverPop.id, page: this._hoverPop.page };
+            if (this._lastBarHit) return { id: this._lastBarHit.id || "", page: this._lastBarHit.page || "" };
+            if (this._adjHover && this._adjHover.note) return { id: this._adjHover.note.id, page: this._adjHover.note.page || this._adjHover.page };
+            if (this._pinnedPop && !this._pinnedPop.ovf) return { id: this._pinnedPop.id, page: this._pinnedPop.page };
+            if (this._adjPinned && this._adjPinned.note) return { id: this._adjPinned.note.id, page: this._adjPinned.note.page || this._adjPinned.page };
+            return null;
+        };
+        // Kept for the call sites that only mean "make the page match what is
+        // open": widening and highlighting travel together, so this is the
+        // same push.
+        this._restoreHighlight = () => this._syncBarHold();
+
+        // A hover note lives only while the pointer is on its bar or on the
+        // note itself. No timer: if neither is true, it goes now.
+        this._scheduleHoverClose = () => {
+            clearTimeout(this._hoverCloseTimer);
+            // An adjacent (wider-references row) note owns its own lifetime
+            // through its own enter/leave flags and timer. It is NOT a reason
+            // to keep an ordinary hover note alive: when a row hover got stuck
+            // after a pin, this guard made every later hover note immortal, and
+            // the only escape was a click or leaving the window — which is
+            // exactly how the "delay after pinning" bug behaved.
+            if (this._lastBarHit) return;
+            if (pointerOverHoverPop()) return;
+            closeHover();
+            this._restoreHighlight();
+        };
+
+        // Called from the webview's ipc-message listener. A null hit means the
+        // pointer is over no bar: close any open popover. A typed hit opens a
+        // popover after a short hover delay (later messages cancel the timer).
+        this.handleBarHoverMessage = (webviewEl, hit) => {
+            this._barWebview = webviewEl;
+            // Any report at all came from inside the webview, so the pointer is
+            // over the page and not over one of our popovers.
+            this._inGuestPage = true;
+            // Attach the focus safety net once per webview element. Coming back
+            // into the page is the moment any state left behind by our own
+            // chrome can be corrected, whatever caused it.
+            if (!webviewEl.__stepFocusHook) {
+                webviewEl.__stepFocusHook = true;
+                try {
+                    webviewEl.addEventListener("focus", () => {
+                        this._lastBarHit = null;
+                        this._pointerInPopover = false;
+                        this._syncBarHold();
+                        this._scheduleHoverClose();
+                    });
+                } catch (e) {}
+            }
+            // A report can only come from inside the webview, so the pointer is
+            // no longer over host chrome. The tracked host position is stale
+            // from wherever the pointer last sat in the plugin UI (typically the
+            // pin's X button), and pointerOverHoverPop() testing that old point
+            // kept a hover note alive for as long as its rectangle happened to
+            // cover it — which read as a multi-second delay after closing a
+            // pinned note with X. Over the page, only the popover enter/leave
+            // flag is trustworthy.
+            this._lastPointer = null;
+            // Mid-drag the guest still reports whatever bar the box happens to
+            // sit over; rebuilding or closing popovers then would move the box
+            // out from under the pointer and kill the drag.
+            if (this._barDragging) return;
+            // Push highlight state into the guest: the verses stay lit while
+            // the mouse is on the bar OR on the popover (guest can't see the
+            // popover, the host bridges it).
+            if (!hit || (!hit.typed && !hit.overflow)) {
+                // Cancel any pending open: a timer that fires after the pointer
+                // has left would pop a note up with no bar hovered under it.
+                clearTimeout(this._barOpenTimer);
+                this._lastBarHit = null;
+                this._barHitOvf = false;
+                this._barHitOvfPage = "";
+                this._syncBarHold();
+                // Unlight on this tick, before any close timer runs.
+                this._restoreHighlight();
+                // Unlight and thin on this tick. openBarPopover is opened
+                // synchronously above, so a hover note the pointer is still on
+                // is kept by pointerOverHoverPop(); anything else is stale.
+                this._scheduleHoverClose();
+                return;
+            }
+            this._lastBarHit = hit;
+            this._barHitOvf = !!hit.ovf;
+            this._barHitOvfPage = hit.page || "";
+            // Widens and lights together, on this tick.
+            this._syncBarHold();
+            clearTimeout(this._hoverCloseTimer);
+            // A pinned list for this page already stands for the lane. Hovering
+            // the lane must not build a second one beside it: the new list
+            // would take over `_ovfList`, stranding the pinned list on screen
+            // and leaving nothing that closes it (the lane click then saw an
+            // unpinned list and made a third).
+            if (hit.overflow && this._ovfList && this._ovfList.pinned
+                && this._ovfList.page === (hit.page || "")) {
+                closeHover();
+                return;
+            }
+            // Already showing this bar (pinned or hovering): nothing to do.
+            // The lane id is the same in every panel, so compare its page too —
+            // otherwise panel two's lane would look like panel one's.
+            // Pages are compared for every bar, not just the lane: one note can
+            // have a bar in each panel, and hovering the second column's must
+            // not be mistaken for the note already open from the first.
+            const sameBar = (a) => a && a.id === hit.id
+                && (a.page || "") === (hit.page || "");
+            if (sameBar(this._pinnedPop)) { closeHover(); return; }
+            if (sameBar(this._hoverPop)) return;
+            clearTimeout(this._barOpenTimer);
+            // Open on this tick: the widened bar, the lit text and the note
+            // are one event. A delayed open meant a bar could be left wide
+            // with no note, or a note could arrive after the pointer had gone.
+            this._barOpenTimer = null;
+            this.openBarPopover(webviewEl, hit, false);
+        };
+
+        // Click on a bar: pin the popover (stays put, movable, resizable)
+        this.handleBarClickMessage = (webviewEl, hit) => {
+            clearTimeout(this._barOpenTimer);
+            // The click opens a popover outside the webview, so the guest will
+            // never report "no bar" for it. A hit left over from the hover that
+            // preceded the click would then keep every later hover note alive
+            // until the pointer re-entered the page and left a bar again.
+            this._lastBarHit = null;
+            if (!hit || (!hit.typed && !hit.overflow)) return;
+            // Clicking the grey lane closes the list only if that list is
+            // pinned — same as pressing its X. A hovered list is not closed:
+            // the click pins it, as clicking any other bar would.
+            if (hit.overflow && this._ovfList && this._ovfList.pinned
+                && this._ovfList.page === (hit.page || "")) {
+                try { this._ovfList.closeAll(); } catch (e) {}
+                return;
+            }
+            if (this._pinnedPop && this._pinnedPop.id === hit.id) {
+                // second click on the same bar unpins and closes
+                closePinned();
+                closeHover();
+                return;
+            }
+            // Anything that pins replaces whatever was pinned before — and a
+            // pinned Wider References list counts. (Clicks on one of the
+            // list's own rows never come through here, so opening a note from
+            // the list does not close the list underneath it.)
+            if (this._ovfList && this._ovfList.pinned) {
+                try { this._ovfList.closeAll(); } catch (e) {}
+            }
+            this.openBarPopover(webviewEl, hit, true);
+        };
+
+        // The overflow lane's popover: a scrollable list of title bars, one per
+        // note that reaches outside the page. Clicking one opens that note
+        // exactly as clicking its own bar would.
+        this.openOverflowPopover = async (webviewEl, hit, pinned) => {
+            const box = webviewEl.getBoundingClientRect();
+            const td = this.plugin._noteDotsCache && this.plugin._noteDotsCache.typedData;
+            const contentOf = (td && td.contentOf) || {};
+            const ids = (hit.list || []).filter(id => contentOf[id]);
+            // A page can only have one list. A hover on a lane that is already
+            // pinned for this page keeps the pinned one; and pinning anywhere
+            // retires whatever list was open before.
+            if (!pinned && this._ovfList && this._ovfList.pinned
+                && this._ovfList.page === (hit.page || "")) {
+                this._syncBarHold();
+                return;
+            }
+            if (pinned && this._ovfList) { try { this._ovfList.closeAll(); } catch (e) {} }
+            closeHover();
+            if (pinned) closePinned();
+            if (!ids.length) { this._syncBarHold(); return; }
+
+            const anchorEl = document.createElement("div");
+            anchorEl.style.cssText = "position:fixed;width:0;height:0;pointer-events:none;";
+            anchorEl.style.left = (box.right - 8) + "px";
+            anchorEl.style.top = (box.top + 8) + "px";
+            document.body.appendChild(anchorEl);
+
+            const body = document.createElement("div");
+            const pop = {
+                hoverEl: body,
+                hide() { try { body.remove(); } catch (e) {} },
+                position() {},
+                show() {}
+            };
+            document.body.appendChild(body);
+            body.addClass("step-bar-popover");
+            // The list sits above the stretched bars it owns, so its single X
+            // stays clickable once a row is pinned.
+            // Hovered popovers outrank every pinned one; a pinned list still
+            // sits above a pinned note.
+            body.style.zIndex = pinned ? "1000014" : "1000034";
+            body.style.position = "fixed";
+            body.style.left = (box.right - 8) + "px";
+            body.style.top = (box.top + 8) + "px";
+            body.style.right = "auto";
+            body.style.bottom = "auto";
+            body.style.transform = "translateX(-100%)";
+            body.style.display = "flex";
+            body.style.flexDirection = "column";
+            body.style.width = "260px";
+            body.style.maxHeight = "45vh";
+            body.style.overflow = "hidden";
+
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "" };
+            if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
+            else this._hoverPop = entry;
+            this._barWebview = webviewEl;
+            this._syncBarHold();
+
+            if (!pinned) {
+                this._pointerInPopover = false;
+                body.addEventListener("mouseenter", () => {
+                    this._pointerInPopover = true;
+                    clearTimeout(this._hoverCloseTimer);
+                });
+                body.addEventListener("mouseleave", () => {
+                    this._pointerInPopover = false;
+                    this._scheduleHoverClose();
+                });
+            }
+
+            // The list's own entry, held in this closure so no other popover
+            // can overwrite the slot it used to live in.
+            const listEntry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "", ids: ids.slice() };
+            this._ovfList = listEntry;
+            const header = body.createDiv({ cls: "step-bar-popover-header" });
+            header.style.position = "sticky";
+            header.style.top = "0";
+            header.style.zIndex = "5";
+            header.style.flex = "0 0 auto";
+            header.style.padding = "8px 44px 6px 12px";
+            header.style.backgroundColor = "var(--background-secondary)";
+            const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
+            titleEl.setText("Wider References");
+            titleEl.style.fontWeight = "700";
+            titleEl.style.fontSize = "14px";
+            const countEl = header.createDiv({ cls: "step-bar-popover-ref" });
+            countEl.setText(ids.length + (ids.length === 1 ? " note" : " notes"));
+            countEl.style.fontSize = "12px";
+            countEl.style.opacity = "0.7";
+
+            // One X for the whole list.
+            const btns = header.createDiv({ cls: "step-bar-popover-buttons" });
+            btns.style.position = "absolute";
+            btns.style.top = "6px";
+            btns.style.right = "6px";
+            const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
+            closeBtn.style.cssText = "background:transparent;border:none;border-radius:50%;width:26px;height:26px;padding:0;font-size:16px;display:flex;align-items:center;justify-content:center;cursor:pointer;";
+            closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(128,128,128,0.35)"; });
+            closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "transparent"; });
+            setIcon(closeBtn, "lucide-x");
+            if (!closeBtn.querySelector("svg")) {
+                closeBtn.setText("\u2715");
+                closeBtn.style.fontSize = "14px";
+                closeBtn.style.lineHeight = "26px";
+            }
+            closeBtn.setAttribute("aria-label", "Close");
+            // One X for the whole thing. It disposes the list's own entry,
+            // never this._pinnedPop: a note opened from a row takes that slot,
+            // so closing through it left the list stranded on screen.
+            const closeAll = () => {
+                killAdj("pinned");
+                killAdj("hover");
+                if (this._ovfList === listEntry) this._ovfList = null;
+                // `entry` holds the slot (`_pinnedPop` / `_hoverPop`), so it
+                // has to be disposed too or the dead popover stays registered.
+                try { dispose(entry); } catch (e) {}
+                try { dispose(listEntry); } catch (e) {}
+                closeHover();
+                if (this._focusPage) this._focusPage();
+            };
+            closeBtn.addEventListener("click", (ev) => { ev.stopPropagation(); closeAll(); });
+            listEntry.closeAll = closeAll;
+            // The X can end up beneath a note or a stretched bar (notes paint
+            // over the list). Catch the press in the capture phase, before the
+            // covering element sees it.
+            const xGuard = (ev) => {
+                if (!listEntry || !listEntry.body || !listEntry.body.isConnected) return;
+                const r = closeBtn.getBoundingClientRect();
+                if (ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom) {
+                    ev.stopPropagation();
+                    ev.preventDefault();
+                    closeAll();
+                }
+            };
+            document.addEventListener("pointerdown", xGuard, true);
+            listEntry._xGuard = xGuard;
+
+            // Dragging the list by its header carries every note it has out
+            // along with it: a stretched title bar and its note are positioned
+            // independently of the list, so they have to be shifted by the
+            // same delta rather than left behind.
+            const shiftAdj = (ent, dx, dy) => {
+                if (!ent) return;
+                try { if (ent.bar && ent.bar.isConnected) ent.bar.style.left = (parseFloat(ent.bar.style.left || "0") + dx) + "px"; } catch (e) {}
+                try {
+                    if (ent.note && ent.note.body && ent.note.body.isConnected) {
+                        ent.note.body.style.left = (parseFloat(ent.note.body.style.left || "0") + dx) + "px";
+                    }
+                } catch (e) {}
+                try { if (ent.followRows) ent.followRows(); } catch (e) {}
+            };
+            let listDrag = null;
+            header.style.cursor = "move";
+            header.style.touchAction = "none";
+            header.style.userSelect = "none";
+            const onListDragMove = (ev) => {
+                if (!listDrag || !body.isConnected) return;
+                if (ev.pointerId !== undefined && listDrag.pid !== undefined && ev.pointerId !== listDrag.pid) return;
+                const dx = ev.clientX - listDrag.x;
+                const dy = ev.clientY - listDrag.y;
+                if (!dx && !dy) return;
+                listDrag.x = ev.clientX; listDrag.y = ev.clientY;
+                try {
+                    body.style.left = Math.max(0, parseFloat(body.style.left || "0") + dx) + "px";
+                    body.style.top = Math.max(0, parseFloat(body.style.top || "0") + dy) + "px";
+                } catch (e) {}
+                // Both slots move: a hovered row can sit over a pinned one.
+                shiftAdj(this._adjPinned, dx, dy);
+                shiftAdj(this._adjHover, dx, dy);
+            };
+            const endListDrag = (ev) => {
+                if (!listDrag) return;
+                if (ev && ev.type === "pointerup" && ev.buttons) return;
+                listDrag = null;
+                this._barDragging = false;
+                try { body.style.cursor = ""; } catch (e) {}
+                window.removeEventListener("pointermove", onListDragMove, true);
+                window.removeEventListener("pointerup", endListDrag, true);
+                window.removeEventListener("pointercancel", endListDrag, true);
+                window.removeEventListener("blur", endListDrag, true);
+            };
+            const startListDrag = (ev) => {
+                if (listDrag) return;
+                if (ev.button !== undefined && ev.button !== 0) return;
+                const t = ev.target;
+                if (t && t.closest && t.closest("button, a")) return;
+                const r = body.getBoundingClientRect();
+                // Drop the translateX(-100%) right-alignment before dragging,
+                // or the box jumps a full width sideways on the first move.
+                body.style.transform = "none";
+                body.style.left = r.left + "px";
+                body.style.top = r.top + "px";
+                listDrag = { x: ev.clientX, y: ev.clientY, pid: ev.pointerId };
+                this._barDragging = true;
+                clearTimeout(this._barOpenTimer);
+                clearTimeout(this._hoverCloseTimer);
+                try { body.style.cursor = "grabbing"; } catch (e) {}
+                try { ev.preventDefault(); } catch (e) {}
+                window.addEventListener("pointermove", onListDragMove, true);
+                window.addEventListener("pointerup", endListDrag, true);
+                window.addEventListener("pointercancel", endListDrag, true);
+                window.addEventListener("blur", endListDrag, true);
+            };
+            header.addEventListener("pointerdown", startListDrag, true);
+            if (listEntry) listEntry.startListDrag = startListDrag;
+
+            const listEl = body.createDiv({ cls: "step-bar-popover-body" });
+            listEl.style.padding = "6px";
+            listEl.style.flex = "1 1 auto";
+            listEl.style.minHeight = "0";
+            listEl.style.overflowY = "auto";
+            listEl.style.overscrollBehavior = "contain";
+            // Wheel scrolling for the list. A capture-phase listener on the
+            // document is needed as well as the local one: a row's stretched
+            // note (and Obsidian's own panes) sit inside the popover, and the
+            // wheel event can be consumed before it ever reaches `body`.
+            // Whichever arrives first scrolls the list; a `_wheelDone` stamp
+            // stops the same event scrolling it twice.
+            const cons = Math.max(1, window.devicePixelRatio || 1);
+            const wheelList = (ev) => {
+                if (!body.isConnected) return false;
+                const br = body.getBoundingClientRect();
+                if (ev.clientX < br.left || ev.clientX > br.right ||
+                    ev.clientY < br.top || ev.clientY > br.bottom) return false;
+                // Let the note's own body scroll itself when it can.
+                const over = document.elementFromPoint(ev.clientX, ev.clientY);
+                const scroller = over && over.closest ? over.closest(".step-bar-popover-body") : null;
+                const target = scroller && body.contains(scroller) ? scroller : listEl;
+                if (target.scrollHeight <= target.clientHeight) return false;
+                if (ev._wheelDone) return false;
+                ev._wheelDone = true;
+                target.scrollTop += ev.deltaY;
+                ev.preventDefault();
+                ev.stopPropagation();
+                return true;
+            };
+            body.addEventListener("wheel", wheelList, { passive: false });
+            const docWheel = (ev) => {
+                if (!body.isConnected) {
+                    document.removeEventListener("wheel", docWheel, true);
+                    return;
+                }
+                wheelList(ev);
+            };
+            document.addEventListener("wheel", docWheel, true);
+            listEntry._docWheel = docWheel;
+
+            // A row opens its note to the left: the row clones itself into a
+            // bar that stretches left over the note's top edge, and the note
+            // slides out underneath its left end. The stretched bar IS the
+            // note's title bar, so the note's own header is suppressed.
+            this._adjPinned = null;
+            this._adjHover = null;
+            const killAdj = (which) => {
+                const ent = which === "pinned" ? this._adjPinned : this._adjHover;
+                if (!ent) return;
+                if (which === "pinned") this._adjPinned = null; else this._adjHover = null;
+                clearTimeout(ent.timer);
+                dispose(ent.note);
+            };
+            const makeAdj = async (id, row, makePinned) => {
+                const existing = makePinned ? this._adjPinned : this._adjHover;
+                if (existing && existing.id === id) return;
+                if (!makePinned) killAdj("hover");
+                if (makePinned && this._adjPinned) killAdj("pinned");
+                const lr = listEl.getBoundingClientRect();
+                const rr = row.getBoundingClientRect();
+                const width = Math.max(300, Math.min(460, Math.round(window.innerWidth * 0.3)));
+                const left = Math.max(8, lr.left - 10 - width);
+                const top = rr.bottom;
+
+                // Clone, not a fresh div: same colour, outline, text, sizes.
+                // cloneNode drops the row's listeners, which is what we want.
+                const bar = row.cloneNode(true);
+                bar.addClass("step-adj-bar");
+                bar.style.position = "fixed";
+                bar.style.margin = "0";
+                bar.style.boxSizing = "border-box";
+                bar.style.top = rr.top + "px";
+                bar.style.height = rr.height + "px";
+                bar.style.left = rr.left + "px";
+                bar.style.width = rr.width + "px";
+                // The bar and its note are one visual unit: same level.
+                bar.style.zIndex = makePinned ? "1000020" : "1000038";
+                bar.style.cursor = "default";
+                // Only the hover preview slides out; a pinned bar inherits the
+                // position of the bar it replaces, already extended.
+                bar.style.transition = makePinned
+                    ? "opacity .12s linear"
+                    : "left .18s ease, width .18s ease, opacity .12s linear";
+                // Buttons live at the far right so the note can be minimised
+                // even when another note covers the bar's left end.
+                const barBtns = document.createElement("div");
+                barBtns.style.cssText = "position:absolute;right:5px;top:50%;transform:translateY(-50%);display:flex;gap:2px;";
+                const goto = document.createElement("button");
+                goto.textContent = "\u2197";
+                goto.title = "Open in Obsidian at this reference";
+                goto.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
+                goto.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                goto.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    try {
+                        if (note && note.goToNote) await note.goToNote();
+                        killAdj(makePinned ? "pinned" : "hover");
+                    } catch (e) {}
+                });
+                const mini = document.createElement("button");
+                mini.textContent = "\u2192";
+                mini.title = "Minimise";
+                mini.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
+                mini.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                mini.addEventListener("click", (ev) => {
+                    ev.stopPropagation();
+                    killAdj(makePinned ? "pinned" : "hover");
+                });
+                barBtns.appendChild(goto);
+                // Only a pinned bar can be minimised; a hovered one goes on
+                // its own the moment the pointer leaves it.
+                if (makePinned) barBtns.appendChild(mini);
+                bar.appendChild(barBtns);
+                document.body.appendChild(bar);
+                if (makePinned) {
+                    bar.style.left = left + "px";
+                    bar.style.width = (rr.right - left) + "px";
+                } else {
+                    requestAnimationFrame(() => {
+                        bar.style.left = left + "px";
+                        bar.style.width = (rr.right - left) + "px";
+                    });
+                }
+
+                const note = await this.openBarPopover(webviewEl, { id, typed: true }, !!makePinned, {
+                    adjacent: { left, top, width },
+                    suppressHoverClose: true
+                });
+                if (!note) { try { bar.remove(); } catch (e) {} return; }
+                // A hovered note paints over the pinned note's title bar.
+                // Notes paint over the list they belong to; the bars they
+                // hang from stay beneath it so its X is never covered.
+                note.body.style.zIndex = makePinned ? "1000020" : "1000038";
+                note.body.dataset.stepAdjacent = "1";
+                // Close the seam between the stretched bar and the note: the
+                // body is pulled up so its top edge meets the bar's bottom,
+                // whatever border/margin the list rows carry.
+                const seamShut = () => {
+                    try {
+                        if (!bar.isConnected || !note.body || !note.body.isConnected) return;
+                        const br = bar.getBoundingClientRect();
+                        const nr = note.body.getBoundingClientRect();
+                        const gap = Math.round(nr.top - br.bottom);
+                        if (gap > 0) note.body.style.top = (parseFloat(note.body.style.top || "0") - gap) + "px";
+                    } catch (e) {}
+                };
+                requestAnimationFrame(() => { seamShut(); requestAnimationFrame(seamShut); });
+
+                // The bar follows its row as the list scrolls. Once the row
+                // would leave the popover, the bar parks at the top or bottom
+                // edge until the row comes back into view. The note tracks the
+                // bar, so the pair always reads as one unit.
+                const followRows = () => {
+                    if (!bar.isConnected) return;
+                    try {
+                        const rr2 = row.getBoundingClientRect();
+                        const pr = body.getBoundingClientRect();
+                        const h = bar.offsetHeight || rr2.height;
+                        const headH = header.offsetHeight || 0;
+                        const minTop = pr.top + headH;
+                        const maxTop = Math.max(minTop, pr.bottom - h);
+                        let top = rr2.top;
+                        if (top < minTop) top = minTop;
+                        else if (top > maxTop) top = maxTop;
+                        bar.style.top = top + "px";
+                        if (note && note.body && note.body.isConnected) {
+                            note.body.style.top = (top + h) + "px";
+                        }
+                    } catch (e) {}
+                };
+                listEl.addEventListener("scroll", followRows, { passive: true });
+
+                const ent = { id, bar, note, timer: null, followRows };
+                if (makePinned) this._adjPinned = ent; else this._adjHover = ent;
+                this._syncBarHold();
+                note._adjBar = bar;
+                note._adjSlot = makePinned ? "pinned" : "hover";
+
+                if (!makePinned) {
+                    // Alive while the pointer is on the bar, the row, or the
+                    // note itself — and gone the moment it leaves all three.
+                    // Presence is tracked with enter/leave flags, not a tracked
+                    // pointer point: while the cursor is over the guest page the
+                    // host never sees a mousemove, so a remembered host position
+                    // is stale and would either keep this note alive (if the old
+                    // point fell inside it) or kill it early.
+                    const over = { bar: false, row: false, body: false };
+                    const track = (el, key) => {
+                        if (!el) return;
+                        el.addEventListener("mouseenter", () => { over[key] = true; clearTimeout(ent.timer); });
+                        el.addEventListener("mouseleave", () => { over[key] = false; maybe(); });
+                    };
+                    // A flag can only count while its element is still in the
+                    // document: a row torn down under a stationary cursor never
+                    // fires mouseleave, and a stuck `true` kept the note alive
+                    // forever (and, before the fix above, every ordinary hover
+                    // note with it).
+                    const still = () => (over.bar && bar.isConnected)
+                        || (over.row && row.isConnected)
+                        || (over.body && note.body && note.body.isConnected);
+                    const maybe = () => {
+                        clearTimeout(ent.timer);
+                        ent.timer = window.setTimeout(() => {
+                            if (this._adjHover !== ent) return;
+                            if (still()) return;
+                            // A pinned note elsewhere in the list is a
+                            // different note: it must not keep this one alive.
+                            dispose(note);
+                        }, 90);
+                    };
+                    ent.maybe = maybe;
+                    track(bar, "bar");
+                    track(row, "row");
+                    track(note.body, "body");
+                    // A row scrolled out from under the pointer sends no
+                    // mouseleave; the scroll handler re-tests instead.
+                    const recheck = () => {
+                        over.row = !!row.isConnected && row.matches(":hover");
+                        over.bar = !!bar.isConnected && bar.matches(":hover");
+                        over.body = !!note.body && note.body.isConnected && note.body.matches(":hover");
+                        if (!still()) maybe();
+                    };
+                    listEl.addEventListener("scroll", recheck, { passive: true });
+                }
+
+                // Clicking the stretched bar pins that note; a pinned note is
+                // replaced only by another click, never by mere hovering.
+                bar.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    // A pinned bar is already extended: clicking it minimises
+                    // it again, exactly like the arrow button.
+                    if (makePinned) { killAdj("pinned"); return; }
+                    killAdj("hover");
+                    await makeAdj(id, row, true);
+                });
+            };
+
+            // The list owns whatever note is open beside it: close it with the
+            // list, however the list is closed.
+            entry.adjChild = () => { killAdj("pinned"); killAdj("hover"); };
+
+            ids.forEach(id => {
+                const info = contentOf[id];
+                const isCross = id.indexOf("X:") === 0;
+                const row = listEl.createDiv({ cls: "step-bar-popover-titlebar" });
+                row.style.position = "relative";
+                row.style.padding = "6px 8px";
+                row.style.margin = "0 0 4px 0";
+                row.style.borderRadius = "4px";
+                row.style.cursor = "pointer";
+                const col = info.colour || "#17758f";
+                if (isCross) {
+                    // Crosslink: hollow — dark grey fill, colour stroke.
+                    row.style.background = "#3a3a3a";
+                    row.style.boxShadow = "inset 0 0 0 2px " + col;
+                } else {
+                    row.style.background = col;
+                }
+                const hex = String(col).replace("#", "");
+                const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
+                const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+                const darkText = !isCross && lum > 0.6;
+                const nameEl = row.createDiv();
+                nameEl.setText(info.refText || "");
+                nameEl.style.fontWeight = "700";
+                nameEl.style.fontSize = "13px";
+                nameEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
+                if (info.label) {
+                    const lbl = row.createDiv();
+                    lbl.setText(info.label);
+                    lbl.style.fontSize = "11px";
+                    lbl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
+                }
+                row.addEventListener("mouseenter", () => {
+                    row.style.filter = "brightness(1.12)";
+                    // Preview to the left. Hovering replaces a hover preview and
+                    // sits on top of a pinned note; it never replaces it.
+                    makeAdj(id, row, false);
+                });
+                row.addEventListener("mouseleave", () => { row.style.filter = ""; });
+                row.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    // Pin it exactly as clicking the stretched bar would.
+                    killAdj("hover");
+                    await makeAdj(id, row, true);
+                });
+            });
+        };
+
+        // Create the popover for one bar hit. Pinned popovers get a header
+        // toolbar (open-in-Obsidian button), are draggable by the header and
+        // resizable from the corner.
+        this.openBarPopover = async (webviewEl, hit, pinned, opts) => {
+            // opts.adjacent: the note belongs to a row in the "Wider
+            // References" list. Its own title bar is unused — the row, stretched
+            // leftwards, becomes the title bar — and it anchors to the row
+            // instead of to a bar in the page.
+            const adjacent = (opts && opts.adjacent) || null;
+            const box = webviewEl.getBoundingClientRect();
+            if (hit && hit.overflow) {
+                await this.openOverflowPopover(webviewEl, hit, pinned);
+                return;
+            }
+            if (!box.width) { if (!pinned) closePopover(); this._syncBarHold(); return; }
+
+            // Content from the cached typed scan (same ids the page uses)
+            const td = this.plugin._noteDotsCache && this.plugin._noteDotsCache.typedData;
+            const info = td && td.contentOf && td.contentOf[hit.id];
+            if (!info) { this._syncBarHold(); return; }
+            const base = hit.id.split(":")[1];
+            const folder = (this.plugin.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
+            // Typed entries live in the notes folder; ordinary notes record
+            // their real path (they can sit anywhere in the vault).
+            const sourcePath = info.path || (folder ? `${folder}/${base}.md` : `${base}.md`);
+
+            // Open the note in Obsidian and land the cursor on its reference
+            // line. Shared by the note's own toolbar button and by the
+            // "go to note" button on a row's stretched title bar.
+            const goToNote = async () => {
+                try {
+
+                    const leaf2 = await this.plugin.app.workspace.openLinkText(sourcePath, "", true);
+                    const view = leaf2 && leaf2.view;
+                    if (view && view.getMode && view.getMode() === "source" && view.editor) {
+                        const ed = view.editor;
+                        const value = ed.getValue();
+                        const lines = value.split("\n");
+                        const wantRaw = String(info.refRaw || "").trim();
+                        const wantText = String(info.refText || "").replace(/[\[\]]/g, "").trim();
+                        let lineNo = -1;
+                        if (wantRaw) {
+                            for (let i = 0; i < lines.length; i++) {
+                                if (!lines[i].includes("reference=")) continue;
+                                const m = lines[i].match(/reference=([^)&\s]+)/);
+                                if (!m) continue;
+                                let got = m[1];
+                                try { got = decodeURIComponent(got); } catch (e) {}
+                                if (got.trim() === wantRaw) { lineNo = i; break; }
+                            }
+                        }
+                        // Fallback: the line that names the reference, so a
+                        // hand-written or odd-encoded link still lands right.
+                        if (lineNo < 0 && wantText) {
+                            for (let i = 0; i < lines.length; i++) {
+                                if (lines[i].includes("reference=") && lines[i].includes(wantText)) { lineNo = i; break; }
+                            }
+                        }
+                        if (lineNo >= 0) {
+                            const pos = { line: lineNo, ch: 0 };
+                            // Select the whole line: scrolling lands there and
+                            // the line is visibly highlighted.
+                            ed.setSelection(pos, { line: lineNo, ch: lines[lineNo].length });
+                            ed.scrollIntoView({ from: pos, to: pos }, true);
+                        }
+                    }
+            
+                } catch (e) {}
+            };
+
+            // Pinning replaces the pinned note and any transient hover note;
+            // hovering keeps the pinned note where it is.
+            // An adjacent note belongs to the "Wider References" list, so
+            // opening it must not close the very popover that owns it.
+            if (!adjacent) { closeHover(); if (pinned) closePinned(); }
+
+            // Anchor at the webview's top right corner
+            const anchorEl = document.createElement("div");
+            anchorEl.style.cssText = "position:fixed;width:0;height:0;pointer-events:none;";
+            anchorEl.style.left = (box.right - 8) + "px";
+            anchorEl.style.top = (box.top + 8) + "px";
+            document.body.appendChild(anchorEl);
+
+            let pop = null;
+            // Own element, not Obsidian's HoverPopover. HoverPopover keeps a
+            // single shared hover element for the whole app and hides itself on
+            // mouseleave; that closed pinned notes when the pointer moved off
+            // them and made two independent notes impossible. A plain div we
+            // own is torn down only when we say so.
+            const body = document.createElement("div");
+            pop = {
+                hoverEl: body,
+                hide() { try { body.remove(); } catch (e) {} },
+                position() {},
+                show() {}
+            };
+            document.body.appendChild(body);
+            body.addClass("step-bar-popover");
+            // A transient hover note must stack above the pinned one.
+            // An adjacent note sits above the list it was opened from (and
+            // above every title bar it hangs from).
+            body.style.zIndex = adjacent
+                ? (pinned ? "1000020" : "1000038")
+                : (pinned ? "1000010" : "1000050");
+            // Anchor at the top right of the webview: right-aligned by pulling
+            // the box back over its own width.
+            body.style.position = "fixed";
+            body.style.left = (box.right - 8) + "px";
+            body.style.top = (box.top + 8) + "px";
+            body.style.right = "auto";
+            body.style.bottom = "auto";
+            body.style.transform = "translateX(-100%)";
+            if (adjacent) {
+                body.style.transform = "none";
+                body.style.left = adjacent.left + "px";
+                body.style.top = adjacent.top + "px";
+                body.style.width = adjacent.width + "px";
+                body.dataset.stepAdjacent = "1";
+            }
+            // Register immediately: any later failure must still leave the
+            // popover closeable (otherwise the X does nothing).
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, ovf: !!hit.ovf, page: hit.page || "" };
+            entry.goToNote = goToNote;
+            if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
+            else this._hoverPop = entry;
+            this._barWebview = webviewEl;
+            this._syncBarHold();
+            body.style.maxHeight = "30vh";
+            // Width hugs the content; height is a fixed length, scrolled
+            // inside. Pinned and unpinned are the same size.
+            body.style.width = adjacent ? adjacent.width + "px" : "max-content";
+            // HoverPopover's hoverEl is a flex row by default; force a column
+            // so the title sits above the text.
+            body.style.display = "flex";
+            body.style.flexDirection = "column";
+            body.style.alignItems = "stretch";
+            // Track whether the pointer is inside the popover: leaving a bar for
+            // its own note must not close it. An adjacent note is the exception:
+            // the "Wider References" list owns its lifetime, so the built-in
+            // hover-close would fight that.
+            if (!pinned && !(adjacent && opts && opts.suppressHoverClose)) {
+                this._pointerInPopover = false;
+                body.addEventListener("mouseenter", () => {
+                    this._pointerInPopover = true;
+                    clearTimeout(this._hoverCloseTimer);
+                });
+                body.addEventListener("mouseleave", () => {
+                    this._pointerInPopover = false;
+                    this._scheduleHoverClose();
+                });
+            }
+
+            // Moving the pointer onto the popover no longer lights anything in
+            // STEP: the passage highlight belongs to the bar hover alone.
+
+            // Title block, coloured like the note bar: note name (bold,
+            // larger) with the verse reference underneath. Buttons overlay
+            // the block's top right corner.
+            const header = body.createDiv({ cls: "step-bar-popover-header" });
+            // Title-block colour = bar colour; pick white or dark grey text
+            // by the block's relative luminance.
+            const hex = (info.colour || "#17758f").replace("#", "");
+            const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
+            const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+            const darkText = lum > 0.6;
+            if (info.colour) header.style.backgroundColor = info.colour;
+            else header.style.backgroundColor = "var(--background-secondary)";
+            // Its title bar is the row stretched over it, so hide the header.
+            if (adjacent) header.style.display = "none";
+            // Pin the title block: it stays in view while the note scrolls under it.
+            header.style.position = "sticky";
+            header.style.top = "0";
+            header.style.zIndex = "5";
+            header.style.flex = "0 0 auto";
+            header.style.padding = "8px 44px 6px 12px";
+            const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
+            // The title is always the note's own reference — the same title for
+            // every bar that file or section draws.
+            const titleText = info.refText || "";
+            titleEl.setText(titleText);
+            titleEl.style.fontWeight = "700";
+            titleEl.style.fontSize = "15px";
+            titleEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
+            const refEl = header.createDiv({ cls: "step-bar-popover-ref" });
+            refEl.setText(info.label || "");
+            refEl.style.fontSize = "12px";
+            refEl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
+            const btns = header.createDiv({ cls: "step-bar-popover-buttons" });
+            btns.style.position = "absolute";
+            btns.style.top = "6px";
+            btns.style.right = "6px";
+            btns.style.display = "flex";
+            btns.style.flexDirection = "row";
+            btns.style.gap = "4px";
+            // Lucide svgs size via width:1em; a tiny inherited font-size collapses
+            // them to a dot. Pin explicit pixel size + colour on the svg.
+            const hardenIcon = (btn) => {
+                const svg = btn.querySelector("svg");
+                if (!svg) return;
+                const col = darkText ? "#3a3a3a" : "#ffffff";
+                for (const k of ["width", "height"]) {
+                    svg.setAttribute(k, "16");
+                    svg.style[k] = "16px";
+                }
+                svg.style.stroke = col;
+                svg.style.display = "block";
+            };
+            if (pinned) {
+                const openBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
+                openBtn.style.background = "transparent";
+                openBtn.style.border = "none";
+                openBtn.style.borderRadius = "50%";
+                openBtn.style.width = "26px";
+                openBtn.style.height = "26px";
+                openBtn.style.padding = "0";
+                openBtn.style.fontSize = "16px"; // em-sized icons must not inherit a tiny font
+                openBtn.style.display = "flex";
+                openBtn.style.alignItems = "center";
+                openBtn.style.justifyContent = "center";
+                openBtn.style.cursor = "pointer";
+                openBtn.addEventListener("mouseenter", () => { openBtn.style.background = "rgba(128,128,128,0.35)"; });
+                openBtn.addEventListener("mouseleave", () => { openBtn.style.background = "transparent"; });
+                setIcon(openBtn, "lucide-arrow-up-right");
+                hardenIcon(openBtn);
+                openBtn.setAttribute("aria-label", "Open in Obsidian at this reference");
+                openBtn.addEventListener("click", async (ev) => {
+                    ev.stopPropagation();
+                    await goToNote();
+                    closePinned();
+                });
+                const closeBtn = btns.createEl("button", { cls: "step-bar-popover-btn" });
+                closeBtn.style.background = "transparent";
+                closeBtn.style.border = "none";
+                closeBtn.style.borderRadius = "50%";
+                closeBtn.style.width = "26px";
+                closeBtn.style.height = "26px";
+                closeBtn.style.padding = "0";
+                closeBtn.style.fontSize = "16px"; // em-sized icons must not inherit a tiny font
+                closeBtn.style.display = "flex";
+                closeBtn.style.alignItems = "center";
+                closeBtn.style.justifyContent = "center";
+                closeBtn.style.cursor = "pointer";
+                closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(128,128,128,0.35)"; });
+                closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "transparent"; });
+                setIcon(closeBtn, "lucide-x");
+                if (!closeBtn.querySelector("svg")) {
+                    // Last resort: guaranteed-visible unicode cross
+                    closeBtn.setText("\u2715");
+                    closeBtn.style.color = darkText ? "#3a3a3a" : "#ffffff";
+                    closeBtn.style.fontSize = "14px";
+                    closeBtn.style.lineHeight = "26px";
+                }
+                hardenIcon(closeBtn);
+                closeBtn.setAttribute("aria-label", "Close");
+                closeBtn.addEventListener("click", (ev) => {
+                    ev.stopPropagation();
+                    closePinned();
+                });
+            } else {
+                btns.addClass("step-bar-popover-buttons-hidden");
+            }
+
+            const mdEl = body.createDiv({ cls: "step-bar-popover-body" });
+            mdEl.style.padding = "8px 14px 10px 14px";
+            // The markdown body is its own scroll container: the title block
+            // above it stays put and the note scrolls underneath. Without
+            // min-height:0 a flex child refuses to shrink, so the box grows
+            // instead of scrolling and the wheel does nothing.
+            mdEl.style.flex = "1 1 auto";
+            mdEl.style.minHeight = "0";
+            mdEl.style.overflowY = "auto";
+            mdEl.style.overflowX = "hidden";
+            mdEl.style.overscrollBehavior = "contain";
+            // Wheel over the popover scrolls the note even if the pointer is
+            // over the title block or the box's padding.
+            body.addEventListener("wheel", (ev) => {
+                if (!mdEl.style.display || mdEl.style.display === "none") return;
+                if (mdEl.scrollHeight <= mdEl.clientHeight) return;
+                mdEl.scrollTop += ev.deltaY;
+                ev.preventDefault();
+            }, { passive: false });
+            try {
+                await MarkdownRenderer.render(this.plugin.app, info.text || "", mdEl, sourcePath, this.plugin);
+            } catch (e) {
+                mdEl.setText(info.text || "");
+            }
+
+            // MarkdownRenderer hands links over to Obsidian's tooltip system
+            // (title/aria-label + listeners), which normal reading views
+            // suppress but a bare div in a custom panel does not — hence the
+            // black URL box on hover.
+            this.plugin.stripLinkTooltips(mdEl, sourcePath);
+
+
+            // Every place the linked passage is mentioned in the note.
+            const needles = [];
+            if (info.searchRef) {
+                const parts = String(info.searchRef).split("-")[0].split(".");
+                needles.push(String(info.searchRef).replace(/\./g, " "));
+                // "Genesis.3.15" also reads as "Genesis 3:15" in prose.
+                if (parts.length >= 3) needles.push(parts[0] + " " + parts[1] + ":" + parts[2]);
+            }
+            // Every spelling a reference can take in prose: "Genesis.3.15",
+            // "Genesis 3 15", "Genesis 3:15", "Genesis 3.15".
+            [info.searchRef, info.refRaw].filter(Boolean).forEach((r) => {
+                const plain = String(r).replace(/\./g, " ");
+                needles.push(plain);
+                String(r).split("-")[0].split(".").length >= 3 && needles.push(plain.replace(/(\d+) (\d+)$/, "$1:$2"));
+                needles.push(String(r).split("-")[0]);
+            });
+            if (info.refText) needles.push(info.refText);
+            // A note's own bar shows the note unmarked, at the top. Only a
+            // crosslink marks and scrolls to its reference.
+            let mentions = info.noMentions ? [] : this.plugin.findMentions(mdEl, info.searchRef, needles);
+            // Skip the note's own heading line, which carries the same reference
+            // text as this crosslink. The crosslink's spot in the body is the
+            // first mention worth marking.
+            if (info.dropFirstMention && mentions.length) {
+                const firstBlock = mdEl.firstElementChild;
+                while (mentions.length > 1 && firstBlock &&
+                    (firstBlock === mentions[0] || firstBlock.contains(mentions[0]))) {
+                    mentions.shift();
+                }
+            }
+
+            // Match heights: measure the natural content height (header + body)
+            // at the popover's final width and use it for both the hover state
+            // and the pinned state, capped at 60% of the viewport. Below the cap
+            // the content scrolls.
+            //
+            // The width has to settle first: `max-content` is only resolved by
+            // layout, and the markdown inside wraps to whatever width it ends up
+            // with. Measuring before that produces a height for the wrong wrap
+            // (far too tall when the box is measured narrow), which is why some
+            // notes came out much longer than their content. Measure with the
+            // height/max-height off, read the body's own scrollHeight, then cap.
+            // Fixed vertical length: half the old 60vh cap. Content past it
+            // scrolls inside; the box never grows to fit the whole note.
+            const capH = () => Math.max(180, Math.round(window.innerHeight * 0.3));
+            let fittedH = 0;
+            const fitHeight = () => {
+                // Once the user has dragged the box taller, their height wins.
+                if (body.dataset.stepUserH) return;
+                // A collapsed note (title bar only) has no content to size to.
+                if (body.classList.contains("step-bar-popover-collapsed")) {
+                    body.style.height = "auto";
+                    body.style.maxHeight = "none";
+                    body.style.overflow = "hidden";
+                    return;
+                }
+                fittedH = capH();
+                body.style.maxHeight = fittedH + "px";
+                body.style.height = fittedH + "px";
+                body.style.overflow = "hidden";
+                // One scroller only, and it is the markdown element: two nested
+                // scrollbars fought each other and swallowed the wheel.
+                body.style.overflowY = "hidden";
+            };
+            fitHeight();
+            // Re-measure once layout has settled, in case the initial pass ran
+            // before the width resolved (that produced the over-tall boxes).
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                try {
+                    fitHeight();
+                    if (pinned && !collapsedPopover) body.style.height = fittedH + "px";
+                    if (mentions.length) scrollToMention(0);
+                } catch (e) {}
+            }));
+            // Late layout (webfonts, images, markdown embeds) can change the
+            // wrapped height after the first two frames; settle the size again so
+            // a slow-loading note doesn't stay measured at the fallback height.
+            window.setTimeout(() => {
+                try {
+                    if (!body.isConnected) return;
+                    fitHeight();
+                    if (pinned && !collapsedPopover) body.style.height = fittedH + "px";
+                    if (mentions.length) scrollToMention(0);
+                } catch (e) {}
+            }, 180);
+
+            // Scroll to the first mention, and (pinned) offer a counter button
+            // to step through the rest.
+            const scrollToMention = (i) => {
+                const el = mentions[i];
+                if (!el) return;
+                // Whatever actually clips the content is the thing to scroll:
+                // usually the markdown body, but HoverPopover may wrap it in a
+                // scroller of its own. Walk up and take the innermost clipper
+                // that overflows; fall back to the body.
+                const isScroller = (n) => {
+                    if (!n || n.nodeType !== 1 || n === document.body) return false;
+                    if (n.scrollHeight <= n.clientHeight + 1) return false;
+                    const oy = getComputedStyle(n).overflowY;
+                    return oy === "auto" || oy === "scroll" || oy === "overlay";
+                };
+                let sc = null;
+                for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
+                    if (isScroller(n)) { sc = n; break; }
+                }
+                if (!sc && body.scrollHeight > body.clientHeight + 1) {
+                    if (getComputedStyle(body).overflowY === "hidden") body.style.overflowY = "auto";
+                    sc = body;
+                }
+                if (!sc) return;
+                const cr = sc.getBoundingClientRect();
+                const er = el.getBoundingClientRect();
+                // Centre the mention in what is actually visible. The title bar
+                // can overlap the top of the scroll area, so the covered strip
+                // is not usable space: measure the visible box from the bar's
+                // lower edge instead.
+                const hr = header.getBoundingClientRect();
+                const covered = Math.max(0, Math.min(hr.bottom - cr.top, cr.height));
+                const usableTop = cr.top + covered;
+                const usableH = Math.max(24, cr.height - covered);
+                const target = usableTop + usableH / 2 - er.height / 2;
+                const delta = er.top - target;
+                if (Math.abs(delta) < 1) return;
+                const max = sc.scrollHeight - sc.clientHeight;
+                sc.scrollTop = Math.min(max, Math.max(0, sc.scrollTop + delta));
+            };
+            if (mentions.length) scrollToMention(0);
+
+            if (pinned && mentions.length > 1) {
+                let idx = 0;
+                const counter = btns.createEl("button", { cls: "step-bar-popover-btn step-bar-popover-counter" });
+                counter.style.width = "auto";
+                counter.style.minWidth = "34px";
+                counter.style.padding = "0 6px";
+                counter.style.borderRadius = "10px";
+                counter.style.fontSize = "11px";
+                counter.style.fontFamily = "var(--font-interface)";
+                counter.style.background = darkText ? "rgba(0,0,0,0.10)" : "rgba(255,255,255,0.18)";
+                counter.style.color = darkText ? "#3a3a3a" : "#ffffff";
+                counter.style.border = "none";
+                counter.style.cursor = "pointer";
+                counter.style.display = "flex";
+                counter.style.alignItems = "center";
+                counter.style.justifyContent = "center";
+                counter.style.height = "22px";
+                counter.style.marginTop = "0";
+                counter.style.alignSelf = "center";
+                counter.setText(`${idx + 1}/${mentions.length}`);
+                counter.setAttribute("aria-label", "Next mention");
+                // Stepper sits left of Open/Close.
+                if (btns.firstChild !== counter) btns.insertBefore(counter, btns.firstChild);
+                counter.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                counter.addEventListener("click", (ev) => {
+                    ev.stopPropagation();
+                    ev.preventDefault();
+                    idx = (idx + 1) % mentions.length;
+                    counter.setText(`${idx + 1}/${mentions.length}`);
+                    scrollToMention(idx);
+                });
+            }
+
+            // A Bible-note section that holds nothing but the reference itself
+            // (no prose, no images) collapses: only its coloured title bar shows.
+            let collapsedPopover = false;
+            try {
+                const tmp = mdEl.cloneNode(true);
+                // Links are content, not chrome: a body whose only text is a
+                // link must still show. So anchors are kept here and also count
+                // as content when deciding whether to collapse.
+                const hasLink = !!mdEl.querySelector("a");
+                tmp.querySelectorAll("img, video, audio, br, hr, .step-popover-mention").forEach(n => n.remove());
+                // The reference can also arrive as plain text (a bare
+                // "Genesis 3:15", the note's own title line, frontmatter), so
+                // scrub every known spelling of it before deciding.
+                let leftover = (tmp.textContent || "").replace(/[\s\u00a0]+/g, "");
+                const strip = [info.refText, info.refRaw, info.searchRef];
+                if (info.searchRef) {
+                    const p = String(info.searchRef).split("-")[0].split(".");
+                    strip.push(String(info.searchRef).replace(/\./g, " "));
+                    if (p.length >= 3) { strip.push(p[0] + " " + p[1] + ":" + p[2]); strip.push(p[0] + " " + p[1] + "." + p[2]); }
+                }
+                strip.filter(Boolean).forEach((t) => {
+                    const needle = String(t).replace(/[\s\u00a0]+/g, "");
+                    if (!needle) return;
+                    while (leftover.includes(needle)) leftover = leftover.split(needle).join("");
+                });
+                // Drop punctuation-only remains ("|", "—", "()", ":") too.
+                leftover = leftover.replace(/[|\-–—:;,·•·()\[\]{}"“”'’«»]/g, "");
+                if (!leftover && !hasLink) {
+                    mdEl.style.display = "none";
+                    mdEl.style.padding = "0";
+                    body.classList.add("step-bar-popover-collapsed");
+                    collapsedPopover = true;
+                }
+            } catch (e) {}
+
+            if (pinned) {
+                // Keep it where it is, movable and resizable, and stop the
+                // HoverPopover from hiding itself when the mouse leaves it.
+                body.classList.add("step-bar-popover-pinned");
+                // HoverPopover re-positions its element on mousemove via a
+                // transform; that fights the drag. Neutralise both hooks.
+                try { if (typeof pop.position === "function") pop.position = () => {}; } catch (e) {}
+                try { if (typeof pop.show === "function") pop.show = () => {}; } catch (e) {}
+                const r = adjacent
+                    ? { left: adjacent.left, top: adjacent.top }
+                    : anchorEl.getBoundingClientRect();
+                body.style.position = "fixed";
+                body.style.width = adjacent ? adjacent.width + "px" : body.style.width;
+                // Obsidian positions hover popovers with a CSS transform, which
+                // would override left/top entirely and make the box refuse to
+                // move. Take the transform off so the drag can use left/top.
+                body.style.transform = "none";
+                body.style.translate = "0 0";
+                body.style.maxHeight = capH() + "px";
+                body.style.inset = "auto";
+                body.style.zIndex = adjacent
+                    ? (pinned ? "1000020" : "1000038")
+                    : (pinned ? "1000010" : "1000050");
+                body.style.left = adjacent
+                    ? adjacent.left + "px"
+                    : Math.max(4, r.left - body.offsetWidth) + "px";
+                body.style.top = r.top + "px";
+                body.style.right = "auto";
+                body.style.overflow = "hidden";
+                body.style.minWidth = "240px";
+                // Keep the measured height from the hover state (do not force a
+                // fixed 210px), so pinning doesn't change the box's size. The
+                // height must stay pinned too: with maxHeight:none the box just
+                // grows to fit the whole note and there is nothing left to
+                // scroll. Fixed height + the body's own scroller = scrollable.
+                body.style.minHeight = collapsedPopover ? "0" : "80px";
+                body.style.maxWidth = "560px";
+                body.style.maxHeight = collapsedPopover ? "none" : capH() + "px";
+                if (!collapsedPopover) body.style.height = capH() + "px";
+
+                // Vertical-only resize handle along the bottom edge: drag down
+                // to make the box taller (content scrolls inside).
+                const grip = body.createDiv({ cls: "step-bar-popover-grip" });
+                grip.style.position = "absolute";
+                grip.style.left = "0";
+                grip.style.right = "0";
+                grip.style.bottom = "0";
+                grip.style.height = "9px";
+                grip.style.cursor = "ns-resize";
+                grip.style.zIndex = "10";
+                grip.style.background = "transparent";
+                let vresize = null;
+                grip.addEventListener("pointerdown", (ev) => {
+                    ev.preventDefault();
+                    vresize = { sy: ev.clientY, h: body.offsetHeight };
+                    grip.setPointerCapture(ev.pointerId);
+                });
+                grip.addEventListener("pointermove", (ev) => {
+                    if (!vresize) return;
+                    body.dataset.stepUserH = "1";
+                    body.style.height = Math.max(80, vresize.h + ev.clientY - vresize.sy) + "px";
+                });
+                const endV = () => { vresize = null; };
+                grip.addEventListener("pointerup", endV);
+                grip.addEventListener("pointercancel", endV);
+                entry.hide = () => { try { body.remove(); } catch (e) {} };
+
+                // Drag by the header. Listeners go on document while dragging:
+                // element capture is unreliable here because Obsidian's
+                // HoverPopover owns the element and can re-render it mid-drag.
+                // Drag the box. Deliberately capture-free: element pointer
+                // capture can be lost the moment anything re-renders the
+                // header (which happens on notes whose popover body is rebuilt,
+                // e.g. one referencing its own section), and a spurious
+                // `lostpointercapture` used to end the drag on its first tick.
+                // Everything runs off window-level capture listeners instead.
+                let drag = null;
+                let dragRaf = false;
+                const onDragMove = (ev) => {
+                    if (!drag) return;
+                    if (ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
+                    const dx = ev.clientX - drag.sx;
+                    const dy = ev.clientY - drag.sy;
+                    if (!dx && !dy) return;
+                    drag.moved = true;
+                    body.style.left = Math.max(0, drag.l + dx) + "px";
+                    body.style.top = Math.max(0, drag.t + dy) + "px";
+                };
+                const onDragEnd = (ev) => {
+                    if (!drag) return;
+                    // Ignore a pointerup/cancel that belongs to another pointer.
+                    if (ev && ev.pointerId !== undefined && drag.pid !== undefined &&
+                        ev.pointerId !== drag.pid && ev.type !== "blur") return;
+                    // A pointerup while the button is still reported down, or a
+                    // pointercancel we did not ask for, must not kill the drag.
+                    if (ev && ev.type === "pointerup" && ev.buttons) return;
+                    drag = null;
+                    dragRaf = false;
+                    this._barDragging = false;
+                    try { body.style.userSelect = ""; body.style.cursor = "move"; } catch (e) {}
+                    window.removeEventListener("pointermove", onDragMove, true);
+                    window.removeEventListener("pointerup", onDragEnd, true);
+                    window.removeEventListener("pointercancel", onDragEnd, true);
+                    window.removeEventListener("blur", onBlur, true);
+                };
+                const onBlur = () => onDragEnd({ type: "blur" });
+                header.style.cursor = "move";
+                header.style.touchAction = "none";
+                header.style.userSelect = "none";
+                body.style.cursor = "move";
+                const startDrag = (ev) => {
+                    if (drag) return;
+                    if (ev.button !== undefined && ev.button !== 0) return;
+                    const t = ev.target;
+                    if (t && t.closest && t.closest("button, a, .step-bar-popover-grip")) return;
+                    const r = body.getBoundingClientRect();
+                    // The box is right-aligned with translateX(-100%); drop the
+                    // transform before dragging or it jumps a full width left.
+                    body.style.transform = "none";
+                    body.style.left = r.left + "px";
+                    body.style.top = r.top + "px";
+                    drag = { sx: ev.clientX, sy: ev.clientY, l: r.left, t: r.top, pid: ev.pointerId, moved: false };
+                    // Stop hover handling for the duration of the drag.
+                    this._barDragging = true;
+                    clearTimeout(this._barOpenTimer);
+                    clearTimeout(this._hoverCloseTimer);
+                    try { body.style.userSelect = "none"; body.style.cursor = "grabbing"; } catch (e) {}
+                    // Nothing else in Obsidian gets to see this press: link
+                    // handling, page preview and the editor all bail out.
+                    try { ev.preventDefault(); } catch (e) {}
+                    try { ev.stopPropagation(); } catch (e) {}
+                    window.addEventListener("pointermove", onDragMove, true);
+                    window.addEventListener("pointerup", onDragEnd, true);
+                    window.addEventListener("pointercancel", onDragEnd, true);
+                    window.addEventListener("blur", onBlur, true);
+                };
+                // One entry point only. A single capture listener, so a press
+                // fires startDrag exactly once (the old body+header pair fired
+                // it twice and the second pass could clear the drag state).
+                body.addEventListener("pointerdown", startDrag, true);
+            }
+
+            if (collapsedPopover) {
+                body.style.height = "auto";
+                body.style.minHeight = "0";
+                body.style.maxHeight = "none";
+                body.style.overflow = "hidden";
+                body.style.padding = "0";
+            }
+
+            // Layout (and, when pinned, repositioning) lands a frame or two after
+            // the box is built; re-run the jump until it sticks.
+            if (mentions.length) {
+                requestAnimationFrame(() => {
+                    scrollToMention(0);
+                    requestAnimationFrame(() => {
+                        scrollToMention(0);
+                        requestAnimationFrame(() => scrollToMention(0));
+                    });
+                });
+            }
+
+            entry.anchorEl = anchorEl;
+
+            // Obsidian sets its own stacking on show; re-assert ours a frame
+            // later so a hover note always sits above a pinned one.
+            const wantZ = adjacent
+                ? (pinned ? "1000020" : "1000038")
+                : (pinned ? "1000010" : "1000050");
+            const reassertZ = () => { try { body.style.zIndex = wantZ; } catch (e) {} };
+            reassertZ();
+            requestAnimationFrame(() => { reassertZ(); requestAnimationFrame(reassertZ); });
+            entry.adjacent = adjacent;
+            return entry;
+        };
+
+        // Leaving the window kills any open (unpinned) popover
+        this.plugin.registerDomEvent(document, "mouseleave", () => {
+            // Pointer has left the window: no bar can be under it any more.
+            this._lastBarHit = null;
+            this._scheduleHoverClose();
+        });
+    }
+
+    // Close everything this panel owns: the hover note and the pinned note.
+    closeAll() {
+        try { if (this._closeBarPopover) this._closeBarPopover(); } catch (e) {}
     }
 }

@@ -129,20 +129,17 @@ function parseTypedFile(text, fileBasename) {
     return { entries, crosslinks };
 }
 
-// Canonical book order (matches the verse-count table's key order), used to
-// compare two references positionally.
-const STEP_BOOK_ORDER = ["Genesis","Exodus","Leviticus","Numbers","Deuteronomy","Joshua","Judges","Ruth","1Samuel","2Samuel","1Kings","2Kings","1Chronicles","2Chronicles","Ezra","Nehemiah","Esther","Job","Psalms","Proverbs","Ecclesiastes","SongofSongs","Song","Isaiah","Jeremiah","Lamentations","Ezekiel","Daniel","Hosea","Joel","Amos","Obadiah","Jonah","Micah","Nahum","Habakkuk","Zephaniah","Haggai","Zechariah","Malachi","Matthew","Mark","Luke","John","Acts","Romans","1Corinthians","2Corinthians","Galatians","Ephesians","Philippians","Colossians","1Thessalonians","2Thessalonians","1Timothy","2Timothy","Titus","Philemon","Hebrews","James","1Peter","2Peter","1John","2John","3John","Jude","Revelation"];
-
 /**
  * Turn a canonical reference range ("Genesis.1.1", "Genesis.1", or
  * "Genesis.1.1-Genesis.1.3") into a comparable [start, end] ordinal pair.
+ * Book positions come from BibleInformation.getBookOrder().
  * A chapter-only reference covers the whole chapter.
  */
 function canonBounds(range) {
     if (!range) return null;
     const point = (s) => {
         const p = String(s).trim().split(".");
-        const bi = STEP_BOOK_ORDER.indexOf(p[0]);
+        const bi = BibleInformation.getBookOrder().indexOf(p[0]);
         const ch = parseInt(p[1], 10) || null;
         const v = p[2] ? parseInt(p[2], 10) : null;
         // A bare book name ("Numbers") is a whole-book reference: no chapter.
@@ -552,7 +549,6 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
 
 //SEARCH VIEW ===================================================================
 const STEP_SEARCH_VIEW = "step-search-view";
-
 class StepSearchView extends ItemView {
     constructor(leaf, plugin) {
         super(leaf);
@@ -1702,14 +1698,6 @@ class StepBibleSearchModal extends Modal {
     }
 }
 
-
-
-
-
-
-
-
-
 // PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
@@ -1848,6 +1836,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // messages (the guest has no node integration for ipcRenderer).
             webviewEl.addEventListener("console-message", (ev) => {
                 const msg = (ev && ev.message) || "";
+                if (msg.startsWith("__STEPPAGE__")) {
+                    // STEP navigated without a page load (footnote link opening
+                    // a second passage column). Re-scan and re-inject so the
+                    // new panels get their own bars.
+                    this.scheduleNoteDotsRefresh();
+                    return;
+                }
                 if (msg.startsWith("__STEPBARCLICK__")) {
                     let click = null;
                     try { click = JSON.parse(msg.slice("__STEPBARCLICK__".length)); } catch (e) { click = null; }
@@ -1876,7 +1871,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             webviewEl.addEventListener("did-finish-load", onNav);
             webviewEl.addEventListener("did-navigate-in-page", onNav);
         };
-        
         // On new tab
         this.app.workspace.onLayoutReady(async () => {
             const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
@@ -1896,28 +1890,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
             }
         });
-        // Saved/created/deleted/renamed notes: re-derive the bar map at once.
-        // modify fires when the editor flushes to disk (about 2s after typing
-        // stops); create/delete/rename never fire modify, so they are needed
-        // too or a new note would draw no bar until a reload.
-        this.registerEvent(this.app.vault.on("modify", (f) => {
-            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
-        }));
-        this.registerEvent(this.app.vault.on("create", (f) => {
-            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
-        }));
-        this.registerEvent(this.app.vault.on("delete", (f) => {
-            if (f && f.extension === "md") {
-                if (this._noteDotsTextCache) delete this._noteDotsTextCache[f.path];
-                this.scheduleNoteDotsRefresh();
-            }
-        }));
-        this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
-            if (f && f.extension === "md") {
-                if (this._noteDotsTextCache && oldPath) delete this._noteDotsTextCache[oldPath];
-                this.scheduleNoteDotsRefresh();
-            }
-        }));
         // On tab switch
         this.registerEvent(
             this.app.workspace.on("active-leaf-change", async (leaf) => {
@@ -2196,7 +2168,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
                 //If only a book
                 if (!urlRef.includes(".")) {
-                    const info = this.getBookOverview(urlRef);
+                    const info = BibleInformation.getBookOverview(urlRef);
 
                     if (info) {
                         pop.innerHTML = `
@@ -2288,6 +2260,27 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 new StepBibleSearchModal(this.app, this, prefill).open();
             }
         });
+
+        // REFRESH STEP BARS
+        // ===========================================================================
+        this.registerEvent(this.app.vault.on("modify", (f) => {
+            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
+        }));
+        this.registerEvent(this.app.vault.on("create", (f) => {
+            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
+        }));
+        this.registerEvent(this.app.vault.on("delete", (f) => {
+            if (f && f.extension === "md") {
+                if (this._noteDotsTextCache) delete this._noteDotsTextCache[f.path];
+                this.scheduleNoteDotsRefresh();
+            }
+        }));
+        this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+            if (f && f.extension === "md") {
+                if (this._noteDotsTextCache && oldPath) delete this._noteDotsTextCache[oldPath];
+                this.scheduleNoteDotsRefresh();
+            }
+        }));
 
     }
 
@@ -2440,9 +2433,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // CONVERTERS =============================================================================================
     inputRef_urlRef(inputRef) {
 
-        const getBookMap = () => this.getBookMap();
-        const getMaxVerse = (book, chap) => this.getMaxVerse(book, chap);
-        const getMaxChapter = (book) => this.getMaxChapter(book);
+        const getBookMap = () => BibleInformation.getBookMap();
+        const getMaxVerse = (book, chap) => BibleInformation.getMaxVerse(book, chap);
+        const getMaxChapter = (book) => BibleInformation.getMaxChapter(book);
 
         const normalizeBook = (rawBook) => {
             const lookup = rawBook.replace(/\s+/g, " ").toLowerCase();
@@ -2674,58 +2667,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         new Notice(`Invalid reference range format: "${text}".`);
         return null;
     }
-    urlRef_displayRef(urlRef) {
-
-        const canonicalToDisplay = (canonical) => {
-            return canonical.replace(/^([1-3])([A-Za-z].*)$/, "$1 $2");
-        };
-
-        const range = urlRef.split("-");
-        const left = range[0].split(".");
-        const right = range.length > 1 ? range[1].split(".") : null;
-
-        const book1 = canonicalToDisplay(left[0]);
-        const chap1 = left[1];
-        const verse1 = left[2] || null;
-
-        if (!chap1) return book1;
-
-        if (!right) {
-            if (!verse1) return `${book1} ${chap1}`;
-            return `${book1} ${chap1}:${verse1}`;
-        }
-
-        const book2 = canonicalToDisplay(right[0]);
-        const chap2 = right[1];
-        const verse2 = right[2] || null;
-
-        // SAME BOOK, SAME CHAPTER, VERSE RANGE
-        if (book1 === book2 && chap1 === chap2 && verse1 && verse2) {
-            return `${book1} ${chap1}:${verse1}-${verse2}`;
-        }
-
-        // CROSS-CHAPTER VERSE RANGE (this must come early)
-        if (book1 === book2 && verse1 && verse2 && chap1 !== chap2) {
-            return `${book1} ${chap1}:${verse1}-${chap2}:${verse2}`;
-        }
-
-        // SAME BOOK, CHAPTER → CHAPTER
-        if (book1 === book2 && !verse1 && !verse2) {
-            return `${book1} ${chap1}-${chap2}`;
-        }
-
-        // CHAPTER → VERSE (cross-chapter end)
-        if (!verse1 && verse2) {
-            return `${book1} ${chap1} - ${book2} ${chap2}:${verse2}`;
-        }
-
-        // SAME BOOK, SAME CHAPTER, VERSE → CHAPTER
-        if (book1 === book2 && verse1 && !verse2) {
-            return `${book1} ${chap1}:${verse1}-${chap2}`;
-        }
-
-        return urlRef;
-    }
     url_urlRef(url) {
         const match = url.match(/reference=([^&]+)/);
         if (!match) return null;
@@ -2733,7 +2674,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const raw = decodeURIComponent(match[1]).trim();
         if (!raw) return null;
 
-        const bookMap = this.getBookMap(); // abbreviation → full name
+        const bookMap = BibleInformation.getBookMap(); // abbreviation → full name
 
         // Normalize a single book token (no dots)
         const normalizeBook = (bookToken) => {
@@ -2890,7 +2831,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (parts.length === 2) {
                 const [book, chapStr] = parts;
                 const chap = parseInt(chapStr, 10);
-                const maxVerse = this.getMaxVerse(book, chap);
+                const maxVerse = BibleInformation.getMaxVerse(book, chap);
                 if (!maxVerse) return [urlRef];
                 const list = [];
                 for (let v = 1; v <= maxVerse; v++) {
@@ -2913,9 +2854,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const eChap = parseInt(eParts[1], 10);
         const eVerse = eParts.length >= 3
             ? parseInt(eParts[2], 10)
-            : this.getMaxVerse(eBook, eChap);
+            : BibleInformation.getMaxVerse(eBook, eChap);
 
-        if (!this.getMaxVerse(book, sChap) || !this.getMaxVerse(eBook, eChap)) {
+        if (!BibleInformation.getMaxVerse(book, sChap) || !BibleInformation.getMaxVerse(eBook, eChap)) {
             return [startRef];
         }
 
@@ -2929,13 +2870,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         }
 
         if (book === eBook) {
-            const maxStart = this.getMaxVerse(book, sChap);
+            const maxStart = BibleInformation.getMaxVerse(book, sChap);
             for (let v = sVerse; v <= maxStart; v++) {
                 list.push(`${book}.${sChap}.${v}`);
             }
 
             for (let c = sChap + 1; c < eChap; c++) {
-                const maxMid = this.getMaxVerse(book, c);
+                const maxMid = BibleInformation.getMaxVerse(book, c);
                 for (let v = 1; v <= maxMid; v++) {
                     list.push(`${book}.${c}.${v}`);
                 }
@@ -2953,7 +2894,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
     // BIBLE INFORMATION HELPERS =================================================================================
     getAllBookPatterns() {
-        const map = this.getBookMap(); // flat lookup: "1 peter" → "1Peter"
+        const map = BibleInformation.getBookMap(); // flat lookup: "1 peter" → "1Peter"
         const keys = Object.keys(map);
 
         // Escape spaces for regex
@@ -2966,791 +2907,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         return escaped;
     }
-    getBookMap() {
-        const rawData = {
-            "en": [
-                { bookName: "Genesis", abbreviations: ["Gen", "Ge", "Gn"] },
-                { bookName: "Exodus", abbreviations: ["Exod", "Ex"] },
-                { bookName: "Leviticus", abbreviations: ["Lev", "Lv", "Le"] },
-                { bookName: "Numbers", abbreviations: ["Num", "Nm", "Nu"] },
-                { bookName: "Deuteronomy", abbreviations: ["Deut", "Dt", "De", "Du"] },
-                { bookName: "Joshua", abbreviations: ["Josh", "Jos", "Jo"] },
-                { bookName: "Judges", abbreviations: ["Judg", "Jdg", "Jgs"] },
-                { bookName: "Ruth", abbreviations: ["Ruth", "Ru"] },
-                { bookName: "1 Samuel", abbreviations: ["1 Sam", "1Sm", "1Sa"] },
-                { bookName: "2 Samuel", abbreviations: ["2 Sam", "2Sm", "2Sa"] },
-                { bookName: "1 Kings", abbreviations: ["1 Kgs", "1Kg", "1Ki"] },
-                { bookName: "2 Kings", abbreviations: ["2 Kgs", "2Kg", "2Ki"] },
-                { bookName: "1 Chronicles", abbreviations: ["1 Chr", "1 Chron", "1Ch"] },
-                { bookName: "2 Chronicles", abbreviations: ["2 Chr", "2 Chron", "2Ch"] },
-                { bookName: "Ezra", abbreviations: ["Ezra", "Ezr"] },
-                { bookName: "Nehemiah", abbreviations: ["Neh", "Ne"] },
-                { bookName: "Esther", abbreviations: ["Esth", "Est", "Es"] },
-                { bookName: "Job", abbreviations: ["Job", "Jb"] },
-                { bookName: "Psalms", abbreviations: ["Ps", "Pss", "Psalm"] },
-                { bookName: "Proverbs", abbreviations: ["Prov", "Prv", "Pr"] },
-                { bookName: "Ecclesiastes", abbreviations: ["Qoheleth", "Eccl", "Eccles", "Ec", "Qoh"] },
-                { bookName: "Song", abbreviations: ["Song", "SS", "So", "Sg", "Song of Solomon"] },
-                { bookName: "Isaiah", abbreviations: ["Isa", "Is"] },
-                { bookName: "Jeremiah", abbreviations: ["Jer", "Je"] },
-                { bookName: "Lamentations", abbreviations: ["Lam", "La"] },
-                { bookName: "Ezekiel", abbreviations: ["Ezek", "Ezk", "Ez"] },
-                { bookName: "Daniel", abbreviations: ["Dan", "Dn", "Da"] },
-                { bookName: "Hosea", abbreviations: ["Hos", "Ho"] },
-                { bookName: "Joel", abbreviations: ["Joel", "Joe", "Jl"] },
-                { bookName: "Amos", abbreviations: ["Amos", "Am"] },
-                { bookName: "Obadiah", abbreviations: ["Obad", "Ob"] },
-                { bookName: "Jonah", abbreviations: ["Jonah", "Jon"] },
-                { bookName: "Micah", abbreviations: ["Mic", "Mi"] },
-                { bookName: "Nahum", abbreviations: ["Nah", "Na"] },
-                { bookName: "Habakkuk", abbreviations: ["Hab", "Hb"] },
-                { bookName: "Zephaniah", abbreviations: ["Zeph", "Zep"] },
-                { bookName: "Haggai", abbreviations: ["Hag", "Hg"] },
-                { bookName: "Zechariah", abbreviations: ["Zech", "Zec"] },
-                { bookName: "Malachi", abbreviations: ["Mal", "Ml"] },
-                { bookName: "Matthew", abbreviations: ["Matt", "Mat", "Mt"] },
-                { bookName: "Mark", abbreviations: ["Mark", "Mar", "Mk"] },
-                { bookName: "Luke", abbreviations: ["Luke", "Lk", "Lu"] },
-                { bookName: "John", abbreviations: ["John", "Jn", "Jo"] },
-                { bookName: "Acts", abbreviations: ["Acts", "Ac"] },
-                { bookName: "Romans", abbreviations: ["Rom", "Rm", "Ro"] },
-                { bookName: "1 Corinthians", abbreviations: ["1 Cor", "1 Co", "1C"] },
-                { bookName: "2 Corinthians", abbreviations: ["2 Cor", "2 Co", "2C"] },
-                { bookName: "Galatians", abbreviations: ["Gal", "Ga"] },
-                { bookName: "Ephesians", abbreviations: ["Eph", "Ep"] },
-                { bookName: "Philippians", abbreviations: ["Phil", "Php"] },
-                { bookName: "Colossians", abbreviations: ["Col", "Co"] },
-                { bookName: "1 Thessalonians", abbreviations: ["1 Thess", "1 Thes", "1Th"] },
-                { bookName: "2 Thessalonians", abbreviations: ["2 Thess", "2 Thes", "2Th"] },
-                { bookName: "1 Timothy", abbreviations: ["1 Tim", "1 Tm", "1 Ti", "1T"] },
-                { bookName: "2 Timothy", abbreviations: ["2 Tim", "2 Tm", "2 Ti", "2T"] },
-                { bookName: "Titus", abbreviations: ["Titus", "Tit", "Ti"] },
-                { bookName: "Philemon", abbreviations: ["Phlm", "Philem", "Phm"] },
-                { bookName: "Hebrews", abbreviations: ["Heb", "He"] },
-                { bookName: "James", abbreviations: ["Jas", "Ja"] },
-                { bookName: "1 Peter", abbreviations: ["1 Pet", "1Pet", "1peter", "1 Pt", "1P"] },
-                { bookName: "2 Peter", abbreviations: ["2 Pet", "2Pet", "2peter", "2 Pt", "2P"] },
-                { bookName: "1 John", abbreviations: ["1 John", "1 Jn", "1 Jo", "1J"] },
-                { bookName: "2 John", abbreviations: ["2 John", "2 Jn", "2 Jo", "2J"] },
-                { bookName: "3 John", abbreviations: ["3 John", "3 Jn", "3 Jo", "3J"] },
-                { bookName: "Jude", abbreviations: ["Jude", "Ju"] },
-                { bookName: "Revelation", abbreviations: ["Rev", "Re", "Rv"] }
-            ]
-        };
-
-        const flatMap = {};
-        rawData.en.forEach(item => {
-            const standardName = item.bookName.trim();
-            flatMap[standardName.toLowerCase()] = standardName;
-            item.abbreviations.forEach(abbr => {
-                flatMap[abbr.replace(/\s+/g, ' ').trim().toLowerCase()] = standardName;
-            });
-        });
-        return flatMap;
-    }
-    getMaxVerse(book, chapter) {
-        const verseCounts = {
-            "Genesis": [0, 31, 25, 24, 26, 32, 22, 24, 22, 29, 32, 32, 20, 18, 24, 21, 16, 27, 33, 38, 18, 34, 24, 20, 67, 34, 35, 46, 22, 35, 43, 55, 32, 20, 31, 29, 43, 36, 30, 23, 23, 57, 38, 34, 34, 28, 34, 31, 22, 33],
-            "Exodus": [0, 22, 25, 22, 31, 23, 30, 25, 32, 35, 29, 10, 51, 22, 31, 27, 36, 16, 27, 25, 26, 36, 31, 33, 18, 40, 37, 21, 43, 46, 38, 18, 35, 23, 35, 35, 38, 29, 31, 43],
-            "Leviticus": [0, 17, 16, 17, 35, 19, 30, 38, 36, 24, 20, 47, 8, 59, 57, 33, 34, 16, 30, 37, 27, 24, 33, 44, 23, 55, 46, 34],
-            "Numbers": [0, 54, 34, 51, 49, 31, 27, 89, 26, 23, 36, 35, 16, 33, 45, 41, 50, 13, 32, 22, 29, 35, 41, 30, 25, 18, 65, 23, 31, 40, 16, 54, 42, 56, 29, 34, 13],
-            "Deuteronomy": [0, 46, 37, 29, 49, 33, 25, 26, 20, 29, 22, 32, 32, 18, 29, 23, 22, 20, 22, 21, 20, 23, 30, 25, 22, 19, 19, 26, 68, 29, 20, 30, 52, 29],
-            "Joshua": [0, 18, 24, 17, 24, 15, 27, 26, 35, 27, 43, 23, 24, 33, 15, 63, 10, 18, 28, 51, 9, 45, 34, 16],
-            "Judges": [0, 36, 23, 31, 24, 31, 40, 25, 35, 57, 18, 40, 15, 25, 20, 20, 31, 13, 31, 30, 48, 25],
-            "Ruth": [0, 22, 23, 18, 22],
-            "1Samuel": [0, 28, 36, 21, 22, 12, 21, 17, 22, 27, 27, 15, 25, 23, 52, 35, 23, 58, 30, 24, 42, 15, 23, 28, 23, 44, 25, 12, 25, 11, 31],
-            "2Samuel": [0, 27, 32, 39, 12, 25, 23, 29, 18, 13, 19, 27, 31, 39, 33, 37, 23, 29, 33, 43, 26, 22, 51, 39, 25],
-            "1Kings": [0, 53, 46, 28, 34, 18, 38, 51, 66, 28, 29, 43, 33, 34, 31, 34, 34, 24, 46, 21, 43, 29, 53],
-            "2Kings": [0, 18, 25, 27, 44, 27, 33, 20, 29, 37, 36, 21, 21, 25, 29, 38, 20, 41, 37, 37, 21, 26, 20, 37, 20, 30],
-            "1Chronicles": [0, 54, 55, 24, 43, 26, 81, 40, 40, 44, 14, 47, 40, 14, 17, 29, 43, 27, 17, 19, 8, 30, 19, 32, 31, 31, 32, 34, 21],
-            "2Chronicles": [0, 17, 18, 17, 22, 14, 42, 22, 18, 31, 19, 23, 16, 22, 15, 19, 14, 19, 34, 11, 37, 20, 12, 21, 27, 28, 23, 9, 27, 36],
-            "Ezra": [0, 11, 70, 13, 24, 17, 22, 28, 36, 15, 44],
-            "Nehemiah": [0, 11, 20, 32, 23, 19, 19, 73, 18, 38, 39, 36, 47, 31],
-            "Esther": [0, 22, 23, 15, 17, 14, 14, 10, 17, 32, 3],
-            "Job": [0, 22, 13, 26, 21, 27, 30, 21, 22, 35, 22, 20, 25, 28, 22, 35, 22, 16, 21, 29, 34, 30, 17, 25, 6, 14, 23, 28, 25, 31, 40, 22, 33, 37, 16, 33, 24, 41, 30, 32, 26, 17],
-            "Psalms": [0, 6, 12, 8, 8, 12, 10, 17, 9, 20, 18, 7, 9, 6, 7, 5, 11, 15, 50, 14, 9, 13, 31, 6, 10, 22, 12, 14, 9, 11, 12, 24, 11, 22, 22, 28, 12, 40, 22, 13, 17, 13, 11, 5, 26, 17, 11, 9, 14, 20, 23, 19, 9, 6, 7, 23, 13, 11, 11, 17, 12, 8, 12, 11, 10, 13, 20, 7, 35, 36, 5, 24, 20, 28, 23, 10, 12, 20, 72, 13, 19, 16, 8, 18, 12, 13, 17, 7, 18, 52, 17, 16, 15, 5, 23, 11, 13, 12, 9, 9, 5, 8, 28, 22, 35, 45, 48, 43, 13, 31, 7, 10, 10, 9, 8, 18, 19, 2, 29, 176, 7, 8, 9, 4, 8, 5, 6, 5, 6, 8, 8, 3, 18, 3, 3, 21, 26, 9, 8, 24, 13, 10, 7, 12, 15, 21, 10, 20, 14, 9, 6],
-            "Proverbs": [0, 33, 22, 35, 27, 23, 35, 27, 36, 18, 32, 31, 28, 25, 35, 33, 33, 28, 24, 29, 30, 31, 29, 35, 34, 28, 28, 27, 28, 27, 33],
-            "Ecclesiastes": [0, 18, 26, 22, 16, 20, 12, 29, 17, 18, 20, 10, 14],
-            "SongofSongs": [0, 17, 17, 11, 16, 16, 13, 13, 14],
-            "Isaiah": [0, 31, 22, 26, 6, 30, 13, 25, 22, 21, 34, 16, 6, 22, 32, 9, 14, 14, 7, 25, 6, 17, 25, 18, 23, 12, 21, 13, 29, 24, 33, 9, 20, 24, 17, 10, 22, 38, 22, 8, 31, 29, 25, 28, 28, 25, 13, 15, 22, 26, 11, 23, 15, 12, 17, 13, 12, 21, 14, 21, 22, 11, 12, 19, 12, 25, 24],
-            "Jeremiah": [0, 19, 37, 25, 31, 31, 30, 34, 22, 26, 25, 23, 17, 27, 22, 21, 21, 27, 23, 15, 18, 14, 30, 40, 10, 38, 24, 22, 17, 32, 24, 40, 44, 26, 22, 19, 32, 21, 28, 18, 16, 18, 22, 13, 30, 5, 28, 7, 47, 39, 46, 64],
-            "Lamentations": [0, 22, 22, 66, 22, 22],
-            "Ezekiel": [0, 28, 10, 27, 17, 17, 14, 27, 27, 11, 22, 25, 28, 23, 23, 8, 63, 24, 32, 14, 49, 32, 31, 49, 27, 17, 21, 36, 26, 21, 26, 18, 32, 33, 31, 15, 38, 28, 23, 29, 49, 26, 20, 27, 31, 25, 24, 23],
-            "Daniel": [0, 21, 49, 30, 37, 31, 28, 28, 27, 27, 21, 45, 13],
-            "Hosea": [0, 11, 23, 5, 19, 15, 11, 16, 14, 17, 15, 11, 15, 15, 10],
-            "Joel": [0, 20, 32, 21],
-            "Amos": [0, 15, 16, 15, 13, 27, 14, 17, 14, 15],
-            "Obadiah": [0, 21],
-            "Jonah": [0, 17, 10, 10, 11],
-            "Micah": [0, 16, 13, 12, 13, 15, 16, 20],
-            "Nahum": [0, 15, 13, 19],
-            "Habakkuk": [0, 17, 20, 19],
-            "Zephaniah": [0, 18, 15, 20],
-            "Haggai": [0, 15, 23],
-            "Zechariah": [0, 21, 13, 10, 14, 11, 15, 14, 23, 17, 12, 17, 14, 9, 21],
-            "Malachi": [0, 14, 17, 18, 6],
-            "Matthew": [0, 25, 23, 17, 25, 48, 34, 29, 34, 38, 42, 30, 50, 58, 36, 39, 28, 27, 35, 30, 34, 46, 46, 39, 51, 46, 75, 66, 20],
-            "Mark": [0, 45, 28, 35, 41, 43, 56, 37, 38, 50, 52, 33, 44, 37, 72, 47, 20],
-            "Luke": [0, 80, 52, 38, 44, 39, 49, 50, 56, 62, 42, 54, 59, 35, 35, 32, 31, 37, 43, 48, 47, 38, 71, 56, 53],
-            "John": [0, 51, 25, 36, 54, 47, 71, 53, 59, 41, 42, 57, 50, 38, 31, 27, 33, 26, 40, 42, 31, 25],
-            "Acts": [0, 26, 47, 26, 37, 42, 15, 60, 40, 43, 48, 30, 25, 52, 28, 41, 40, 34, 28, 41, 38, 40, 30, 35, 27, 27, 32, 44, 31],
-            "Romans": [0, 32, 29, 31, 25, 21, 23, 25, 39, 33, 21, 36, 21, 14, 23, 33, 27],
-            "1Corinthians": [0, 31, 16, 23, 21, 13, 20, 40, 13, 27, 33, 34, 31, 13, 40, 58, 24],
-            "2Corinthians": [0, 24, 17, 18, 18, 21, 18, 16, 24, 15, 18, 33, 21, 14],
-            "Galatians": [0, 24, 21, 29, 31, 26, 18],
-            "Ephesians": [0, 23, 22, 21, 32, 33, 24],
-            "Philippians": [0, 30, 30, 21, 23],
-            "Colossians": [0, 29, 23, 25, 18],
-            "1Thessalonians": [0, 10, 20, 13, 18, 28],
-            "2Thessalonians": [0, 12, 17, 18],
-            "1Timothy": [0, 20, 15, 16, 16, 25, 21],
-            "2Timothy": [0, 18, 26, 17, 22],
-            "Titus": [0, 16, 15, 15],
-            "Philemon": [0, 25],
-            "Hebrews": [0, 14, 18, 19, 16, 14, 20, 28, 13, 28, 39, 40, 29, 25],
-            "James": [0, 27, 26, 18, 17, 20],
-            "1Peter": [0, 25, 25, 22, 19, 14],
-            "2Peter": [0, 21, 22, 18],
-            "1John": [0, 10, 29, 24, 21, 21],
-            "2John": [0, 13],
-            "3John": [0, 15],
-            "Jude": [0, 25],
-            "Revelation": [0, 20, 29, 22, 11, 14, 17, 17, 13, 21, 11, 19, 17, 18, 20, 8, 21, 18, 24, 21, 15, 27]
-        };
-
-        const key = book.replace(/\s+/g, '');
-        const arr = verseCounts[key];
-        if (!arr) return null;
-        if (chapter < 1 || chapter >= arr.length) return null;
-        return arr[chapter];
-    }
-    getMaxChapter(book) {
-        const chapterCounts = {
-            Genesis: 50,
-            Exodus: 40,
-            Leviticus: 27,
-            Numbers: 36,
-            Deuteronomy: 34,
-            Joshua: 24,
-            Judges: 21,
-            Ruth: 4,
-            "1Samuel": 31,
-            "2Samuel": 24,
-            "1Kings": 22,
-            "2Kings": 25,
-            "1Chronicles": 29,
-            "2Chronicles": 36,
-            Ezra: 10,
-            Nehemiah: 13,
-            Esther: 10,
-            Job: 42,
-            Psalms: 150,
-            Proverbs: 31,
-            Ecclesiastes: 12,
-            Song: 8,
-            Isaiah: 66,
-            Jeremiah: 52,
-            Lamentations: 5,
-            Ezekiel: 48,
-            Daniel: 12,
-            Hosea: 14,
-            Joel: 3,
-            Amos: 9,
-            Obadiah: 1,
-            Jonah: 4,
-            Micah: 7,
-            Nahum: 3,
-            Habakkuk: 3,
-            Zephaniah: 3,
-            Haggai: 2,
-            Zechariah: 14,
-            Malachi: 4,
-            Matthew: 28,
-            Mark: 16,
-            Luke: 24,
-            John: 21,
-            Acts: 28,
-            Romans: 16,
-            "1Corinthians": 16,
-            "2Corinthians": 13,
-            Galatians: 6,
-            Ephesians: 6,
-            Philippians: 4,
-            Colossians: 4,
-            "1Thessalonians": 5,
-            "2Thessalonians": 3,
-            "1Timothy": 6,
-            "2Timothy": 4,
-            Titus: 3,
-            Philemon: 1,
-            Hebrews: 13,
-            James: 5,
-            "1Peter": 5,
-            "2Peter": 3,
-            "1John": 5,
-            "2John": 1,
-            "3John": 1,
-            Jude: 1,
-            Revelation: 22
-        };
-
-        const key = book.replace(/\s+/g, '');
-        return chapterCounts[key] || null;
-    }
-    getBookOverview(book) {
-        const overviews = {
-            // PENTATEUCH
-            "Genesis": {
-                name: "Genesis",
-                chapters: 50,
-                author: "Moses",
-                location: "Wilderness (likely during Israel’s wanderings)",
-                date: "c. 1446–1406 BC",
-                synopsis: "Creation, the fall, the flood, and God’s covenant with Abraham, Isaac, Jacob, and Joseph."
-            },
-            "Exodus": {
-                name: "Exodus",
-                chapters: 40,
-                author: "Moses",
-                location: "Wilderness (Sinai region)",
-                date: "c. 1446–1406 BC",
-                synopsis: "God delivers Israel from Egypt, gives the Law, and instructs them to build the tabernacle."
-            },
-            "Leviticus": {
-                name: "Leviticus",
-                chapters: 27,
-                author: "Moses",
-                location: "Mount Sinai",
-                date: "c. 1446–1406 BC",
-                synopsis: "Laws for sacrifices, priesthood, purity, and holiness for Israel’s worship and daily life."
-            },
-            "Numbers": {
-                name: "Numbers",
-                chapters: 36,
-                author: "Moses",
-                location: "Wilderness (Sinai to Moab)",
-                date: "c. 1446–1406 BC",
-                synopsis: "Censuses, wilderness wanderings, rebellions, and God’s faithful guidance toward the Promised Land."
-            },
-            "Deuteronomy": {
-                name: "Deuteronomy",
-                chapters: 34,
-                author: "Moses",
-                location: "Plains of Moab",
-                date: "c. 1406 BC",
-                synopsis: "Moses’ final sermons, reviewing the Law and calling Israel to covenant faithfulness before entering Canaan."
-            },
-
-            // HISTORICAL (OT)
-            "Joshua": {
-                name: "Joshua",
-                chapters: 24,
-                author: "Joshua (with later editorial additions)",
-                location: "Canaan",
-                date: "c. 1406–1375 BC",
-                synopsis: "Israel’s conquest and division of the Promised Land under Joshua’s leadership."
-            },
-            "Judges": {
-                name: "Judges",
-                chapters: 21,
-                author: "Traditionally Samuel",
-                location: "Israel",
-                date: "c. 1050–1000 BC",
-                synopsis: "Cycles of Israel’s sin, oppression, crying out, and deliverance through God‑raised judges."
-            },
-            "Ruth": {
-                name: "Ruth",
-                chapters: 4,
-                author: "Traditionally Samuel",
-                location: "Israel (Bethlehem)",
-                date: "c. 1100–1000 BC (events earlier, in the time of the judges)",
-                synopsis: "A Moabite woman’s loyalty leads to blessing and her inclusion in the line of David and Christ."
-            },
-            "1Samuel": {
-                name: "1 Samuel",
-                chapters: 31,
-                author: "Traditionally Samuel, with later prophets (Nathan, Gad)",
-                location: "Israel",
-                date: "c. 1050–1000 BC",
-                synopsis: "Transition from judges to monarchy: Samuel, Saul’s rise and fall, and David’s anointing."
-            },
-            "2Samuel": {
-                name: "2 Samuel",
-                chapters: 24,
-                author: "Traditionally Nathan, Gad, and other court prophets",
-                location: "Israel (Jerusalem)",
-                date: "c. 1000–960 BC",
-                synopsis: "David’s reign, his victories, sins, family turmoil, and God’s covenant promise to his house."
-            },
-            "1Kings": {
-                name: "1 Kings",
-                chapters: 22,
-                author: "Unknown, traditionally a prophetic historian",
-                location: "Israel/Judah (likely during exile)",
-                date: "c. 560–540 BC",
-                synopsis: "Solomon’s reign, the kingdom’s division, and the early history of Israel and Judah’s kings."
-            },
-            "2Kings": {
-                name: "2 Kings",
-                chapters: 25,
-                author: "Unknown, traditionally a prophetic historian",
-                location: "Exilic context (Babylon)",
-                date: "c. 560–540 BC",
-                synopsis: "The decline of Israel and Judah, leading to the fall of Samaria and Jerusalem and exile."
-            },
-            "1Chronicles": {
-                name: "1 Chronicles",
-                chapters: 29,
-                author: "Unknown, traditionally Ezra",
-                location: "Post‑exilic Judah",
-                date: "c. 450–400 BC",
-                synopsis: "Genealogies and a retelling of David’s reign with focus on worship and the temple."
-            },
-            "2Chronicles": {
-                name: "2 Chronicles",
-                chapters: 36,
-                author: "Unknown, traditionally Ezra",
-                location: "Post‑exilic Judah",
-                date: "c. 450–400 BC",
-                synopsis: "History of Judah’s kings, temple worship, and the fall of Jerusalem, ending with Cyrus’ decree."
-            },
-            "Ezra": {
-                name: "Ezra",
-                chapters: 10,
-                author: "Ezra",
-                location: "Babylon and Jerusalem",
-                date: "c. 458–440 BC",
-                synopsis: "Return from exile, rebuilding the temple, and Ezra’s reforms to restore covenant faithfulness."
-            },
-            "Nehemiah": {
-                name: "Nehemiah",
-                chapters: 13,
-                author: "Nehemiah (with possible editorial additions)",
-                location: "Susa and Jerusalem",
-                date: "c. 445–430 BC",
-                synopsis: "Rebuilding Jerusalem’s walls and renewing the people’s commitment to God’s Law."
-            },
-            "Esther": {
-                name: "Esther",
-                chapters: 10,
-                author: "Unknown (possibly a Persian‑period Jew)",
-                location: "Persian Empire (Susa)",
-                date: "c. 460–430 BC",
-                synopsis: "God’s providential preservation of the Jews through Esther and Mordecai in Persia."
-            },
-
-            // POETRY / WISDOM
-            "Job": {
-                name: "Job",
-                chapters: 42,
-                author: "Unknown (possibly early patriarchal era)",
-                location: "Land of Uz",
-                date: "Possibly second millennium BC (patriarchal period)",
-                synopsis: "A righteous man’s suffering, dialogues on God’s justice, and God’s sovereign answer from the whirlwind."
-            },
-            "Psalms": {
-                name: "Psalms",
-                chapters: 150,
-                author: "Multiple (David, Asaph, sons of Korah, others)",
-                location: "Israel",
-                date: "c. 1000–400 BC (compiled over centuries)",
-                synopsis: "A collection of prayers, songs, and praises expressing the full range of human experience before God."
-            },
-            "Proverbs": {
-                name: "Proverbs",
-                chapters: 31,
-                author: "Primarily Solomon, with other wise men",
-                location: "Israel",
-                date: "c. 970–700 BC (compiled)",
-                synopsis: "Short sayings and teachings on wise living in the fear of the Lord."
-            },
-            "Ecclesiastes": {
-                name: "Ecclesiastes",
-                chapters: 12,
-                author: "Traditionally Solomon (“Qoheleth”)",
-                location: "Jerusalem",
-                date: "c. 950–930 BC",
-                synopsis: "Reflections on life’s vanity apart from God and the call to fear God and keep His commandments."
-            },
-            "Song of Solomon": {
-                name: "Song of Solomon",
-                chapters: 8,
-                author: "Solomon",
-                location: "Israel",
-                date: "c. 950–930 BC",
-                synopsis: "A poetic celebration of marital love, often seen as reflecting God’s love for His people."
-            },
-
-            // MAJOR PROPHETS
-            "Isaiah": {
-                name: "Isaiah",
-                chapters: 66,
-                author: "Isaiah son of Amoz",
-                location: "Jerusalem",
-                date: "c. 740–680 BC",
-                synopsis: "Prophecies of judgment and hope, including strong messianic promises and visions of future restoration."
-            },
-            "Jeremiah": {
-                name: "Jeremiah",
-                chapters: 52,
-                author: "Jeremiah the prophet",
-                location: "Jerusalem (later Egypt)",
-                date: "c. 627–580 BC",
-                synopsis: "Warnings of coming judgment on Judah, calls to repentance, and promises of a new covenant."
-            },
-            "Lamentations": {
-                name: "Lamentations",
-                chapters: 5,
-                author: "Traditionally Jeremiah",
-                location: "Jerusalem (after its fall)",
-                date: "c. 586–580 BC",
-                synopsis: "Poetic laments over the destruction of Jerusalem, mingled with hope in God’s steadfast love."
-            },
-            "Ezekiel": {
-                name: "Ezekiel",
-                chapters: 48,
-                author: "Ezekiel the priest‑prophet",
-                location: "Babylon (among the exiles)",
-                date: "c. 593–571 BC",
-                synopsis: "Visions of God’s glory, judgment on Israel and the nations, and future restoration and a new temple."
-            },
-            "Daniel": {
-                name: "Daniel",
-                chapters: 12,
-                author: "Daniel",
-                location: "Babylon and Persia",
-                date: "c. 605–536 BC",
-                synopsis: "Narratives of faith in exile and apocalyptic visions of future kingdoms and God’s ultimate rule."
-            },
-
-            // MINOR PROPHETS
-            "Hosea": {
-                name: "Hosea",
-                chapters: 14,
-                author: "Hosea",
-                location: "Northern Kingdom (Israel)",
-                date: "c. 755–715 BC",
-                synopsis: "Hosea’s marriage illustrates God’s faithful love toward an unfaithful people."
-            },
-            "Joel": {
-                name: "Joel",
-                chapters: 3,
-                author: "Joel",
-                location: "Judah",
-                date: "c. 835–800 BC (conservative estimate)",
-                synopsis: "A locust plague foreshadows the day of the Lord and God’s promise to pour out His Spirit."
-            },
-            "Amos": {
-                name: "Amos",
-                chapters: 9,
-                author: "Amos, a shepherd from Tekoa",
-                location: "Judah and Israel",
-                date: "c. 760–750 BC",
-                synopsis: "Oracles of judgment against social injustice and religious hypocrisy, with a promise of restoration."
-            },
-            "Obadiah": {
-                name: "Obadiah",
-                chapters: 1,
-                author: "Obadiah",
-                location: "Judah",
-                date: "c. 586–550 BC",
-                synopsis: "Judgment on Edom for its pride and violence, and the future triumph of the Lord’s kingdom."
-            },
-            "Jonah": {
-                name: "Jonah",
-                chapters: 4,
-                author: "Traditionally Jonah",
-                location: "Israel and Nineveh",
-                date: "c. 780–760 BC",
-                synopsis: "A reluctant prophet is sent to Nineveh, revealing God’s compassion for repentant sinners."
-            },
-            "Micah": {
-                name: "Micah",
-                chapters: 7,
-                author: "Micah",
-                location: "Judah",
-                date: "c. 740–700 BC",
-                synopsis: "Judgment on Samaria and Jerusalem, with promises of a coming ruler from Bethlehem."
-            },
-            "Nahum": {
-                name: "Nahum",
-                chapters: 3,
-                author: "Nahum",
-                location: "Judah",
-                date: "c. 663–612 BC",
-                synopsis: "Prophecy of Nineveh’s fall, showing God’s justice against oppressive nations."
-            },
-            "Habakkuk": {
-                name: "Habakkuk",
-                chapters: 3,
-                author: "Habakkuk",
-                location: "Judah",
-                date: "c. 620–600 BC",
-                synopsis: "A dialogue with God about evil and injustice, concluding with trust in God’s sovereign plan."
-            },
-            "Zephaniah": {
-                name: "Zephaniah",
-                chapters: 3,
-                author: "Zephaniah",
-                location: "Judah",
-                date: "c. 640–620 BC",
-                synopsis: "Warnings of the day of the Lord and promises of purification and restoration for a humble remnant."
-            },
-            "Haggai": {
-                name: "Haggai",
-                chapters: 2,
-                author: "Haggai",
-                location: "Jerusalem",
-                date: "520 BC",
-                synopsis: "Calls the returned exiles to rebuild the temple and promises God’s future glory."
-            },
-            "Zechariah": {
-                name: "Zechariah",
-                chapters: 14,
-                author: "Zechariah",
-                location: "Jerusalem",
-                date: "c. 520–518 BC (visions) and later oracles",
-                synopsis: "Visions and prophecies encouraging the rebuilding of the temple and pointing to the coming Messiah."
-            },
-            "Malachi": {
-                name: "Malachi",
-                chapters: 4,
-                author: "Malachi",
-                location: "Post‑exilic Judah",
-                date: "c. 460–430 BC",
-                synopsis: "Confronts spiritual apathy and promises a coming messenger before the day of the Lord."
-            },
-
-            // GOSPELS
-            "Matthew": {
-                name: "Matthew",
-                chapters: 28,
-                author: "Matthew the apostle",
-                location: "Likely Syria or Palestine",
-                date: "c. AD 50–65",
-                synopsis: "Presents Jesus as the promised Messiah and King, fulfilling Old Testament prophecy."
-            },
-            "Mark": {
-                name: "Mark",
-                chapters: 16,
-                author: "John Mark (associate of Peter)",
-                location: "Likely Rome",
-                date: "c. AD 50–60",
-                synopsis: "A fast‑paced account of Jesus’ ministry, emphasizing His authority and servanthood."
-            },
-            "Luke": {
-                name: "Luke",
-                chapters: 24,
-                author: "Luke the physician",
-                location: "Likely Greece or Syria",
-                date: "c. AD 60–62",
-                synopsis: "An orderly narrative of Jesus’ life, highlighting His compassion for the marginalized."
-            },
-            "John": {
-                name: "John",
-                chapters: 21,
-                author: "John the apostle",
-                location: "Likely Ephesus",
-                date: "c. AD 80–90",
-                synopsis: "Emphasizes Jesus as the eternal Son of God, that readers may believe and have life in His name."
-            },
-
-            // ACTS
-            "Acts": {
-                name: "Acts",
-                chapters: 28,
-                author: "Luke",
-                location: "Likely Rome",
-                date: "c. AD 62",
-                synopsis: "The spread of the gospel from Jerusalem to Rome through the apostles, especially Peter and Paul."
-            },
-
-            // PAULINE EPISTLES
-            "Romans": {
-                name: "Romans",
-                chapters: 16,
-                author: "Paul",
-                location: "Corinth",
-                date: "c. AD 56–57",
-                synopsis: "A systematic exposition of the gospel, justification by faith, and life in Christ."
-            },
-            "1Corinthians": {
-                name: "1 Corinthians",
-                chapters: 16,
-                author: "Paul",
-                location: "Ephesus",
-                date: "c. AD 54–55",
-                synopsis: "Addresses church divisions, immorality, spiritual gifts, and the resurrection."
-            },
-            "2Corinthians": {
-                name: "2 Corinthians",
-                chapters: 13,
-                author: "Paul",
-                location: "Macedonia",
-                date: "c. AD 55–56",
-                synopsis: "Defends Paul’s ministry and highlights God’s power in weakness and generous giving."
-            },
-            "Galatians": {
-                name: "Galatians",
-                chapters: 6,
-                author: "Paul",
-                location: "Likely Antioch or Corinth",
-                date: "c. AD 48–55 (early letter)",
-                synopsis: "Defends justification by faith alone against legalism and insists on freedom in Christ."
-            },
-            "Ephesians": {
-                name: "Ephesians",
-                chapters: 6,
-                author: "Paul",
-                location: "Imprisonment (likely Rome)",
-                date: "c. AD 60–62",
-                synopsis: "Explores the believer’s position in Christ and the unity and conduct of the church."
-            },
-            "Philippians": {
-                name: "Philippians",
-                chapters: 4,
-                author: "Paul",
-                location: "Imprisonment (likely Rome)",
-                date: "c. AD 60–62",
-                synopsis: "A joyful letter encouraging humility, unity, and rejoicing in Christ in all circumstances."
-            },
-            "Colossians": {
-                name: "Colossians",
-                chapters: 4,
-                author: "Paul",
-                location: "Imprisonment (likely Rome)",
-                date: "c. AD 60–62",
-                synopsis: "Affirms Christ’s supremacy over all creation and warns against false teaching."
-            },
-            "1Thessalonians": {
-                name: "1 Thessalonians",
-                chapters: 5,
-                author: "Paul",
-                location: "Corinth",
-                date: "c. AD 50–51",
-                synopsis: "Encourages a young church in faith, love, hope, and readiness for Christ’s return."
-            },
-            "2Thessalonians": {
-                name: "2 Thessalonians",
-                chapters: 3,
-                author: "Paul",
-                location: "Corinth",
-                date: "c. AD 51–52",
-                synopsis: "Clarifies teaching about the day of the Lord and exhorts believers to steadfastness and work."
-            },
-            "1Timothy": {
-                name: "1 Timothy",
-                chapters: 6,
-                author: "Paul",
-                location: "Macedonia",
-                date: "c. AD 62–64",
-                synopsis: "Instructions to Timothy on church leadership, sound doctrine, and godly living."
-            },
-            "2Timothy": {
-                name: "2 Timothy",
-                chapters: 4,
-                author: "Paul",
-                location: "Imprisonment in Rome",
-                date: "c. AD 64–67",
-                synopsis: "Paul’s final letter, urging Timothy to endure, preach the Word, and remain faithful."
-            },
-            "Titus": {
-                name: "Titus",
-                chapters: 3,
-                author: "Paul",
-                location: "Possibly Macedonia or Nicopolis",
-                date: "c. AD 62–64",
-                synopsis: "Guidance for appointing elders and promoting sound doctrine and good works in Crete."
-            },
-            "Philemon": {
-                name: "Philemon",
-                chapters: 1,
-                author: "Paul",
-                location: "Imprisonment (likely Rome)",
-                date: "c. AD 60–62",
-                synopsis: "A personal appeal for Onesimus, a runaway slave, to be received as a brother in Christ."
-            },
-
-            // GENERAL EPISTLES
-            "Hebrews": {
-                name: "Hebrews",
-                chapters: 13,
-                author: "Unknown (traditionally Paul or a close associate)",
-                location: "Unknown",
-                date: "c. AD 60–70",
-                synopsis: "Shows Christ’s superiority over all and encourages perseverance in faith amid persecution."
-            },
-            "James": {
-                name: "James",
-                chapters: 5,
-                author: "James, the brother of Jesus",
-                location: "Jerusalem",
-                date: "c. AD 44–49",
-                synopsis: "Practical teaching on living out genuine faith through works and godly wisdom."
-            },
-            "1Peter": {
-                name: "1 Peter",
-                chapters: 5,
-                author: "Peter the apostle",
-                location: "“Babylon” (likely Rome)",
-                date: "c. AD 62–64",
-                synopsis: "Encourages suffering believers with hope, holiness, and the example of Christ."
-            },
-            "2Peter": {
-                name: "2 Peter",
-                chapters: 3,
-                author: "Peter the apostle",
-                location: "Likely Rome",
-                date: "c. AD 64–67",
-                synopsis: "Warns against false teachers and reminds believers of Christ’s promised return."
-            },
-            "1John": {
-                name: "1 John",
-                chapters: 5,
-                author: "John the apostle",
-                location: "Likely Ephesus",
-                date: "c. AD 85–95",
-                synopsis: "Assures believers of eternal life and emphasizes love, obedience, and true doctrine."
-            },
-            "2John": {
-                name: "2 John",
-                chapters: 1,
-                author: "John the apostle",
-                location: "Likely Ephesus",
-                date: "c. AD 85–95",
-                synopsis: "A brief letter urging love and truth while rejecting false teachers."
-            },
-            "3John": {
-                name: "3 John",
-                chapters: 1,
-                author: "John the apostle",
-                location: "Likely Ephesus",
-                date: "c. AD 85–95",
-                synopsis: "Commends Gaius for hospitality and warns against Diotrephes’ pride and opposition."
-            },
-            "Jude": {
-                name: "Jude",
-                chapters: 1,
-                author: "Jude, the brother of James",
-                location: "Unknown",
-                date: "c. AD 65–80",
-                synopsis: "Urges believers to contend for the faith against false teachers and to remain in God’s love."
-            },
-
-            // REVELATION
-            "Revelation": {
-                name: "Revelation",
-                chapters: 22,
-                author: "John the apostle",
-                location: "Island of Patmos",
-                date: "c. AD 95–96",
-                synopsis: "Apocalyptic visions revealing Christ’s ultimate victory, final judgment, and the new creation."
-            }
-        };
-
-        return overviews[book] || null;
-    }
-
     // DOM EDITORS
     async autoCollapseStepToolbar(webviewEl) {
         if (!webviewEl || typeof webviewEl.executeJavaScript !== "function") return;
@@ -3808,24 +2964,53 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // rebuilt from cached texts on the next injection. Debounced because a
     // save can fire several events at once (e.g. sync + editor flush).
     scheduleNoteDotsRefresh() {
+        // One rebuild at a time. STEP fires several navigation signals in a
+        // row (URL swap, then verse rendering), and overlapping rebuilds fight
+        // over the same webview and leave the page with no bars at all.
+        if (this._noteDotsBusy) {
+            this._noteDotsRefreshPending = true;
+            return;
+        }
         if (this._noteDotsRefreshTimer) clearTimeout(this._noteDotsRefreshTimer);
         this._noteDotsRefreshTimer = setTimeout(() => {
             this._noteDotsRefreshTimer = null;
             this.refreshNoteDots();
-        }, 150);
+        }, 200);
     }
 
     // Re-scan the vault and re-inject bars into every open STEP webview.
     // Used after settings changes (e.g. type colours) so they apply immediately.
     refreshNoteDots() {
+        if (this._noteDotsBusy) { this._noteDotsRefreshPending = true; return; }
+        this._noteDotsBusy = true;
+        // Watchdog: executeJavaScript can hang while the page is navigating,
+        // and a wedged "busy" flag would block every future rebuild — the page
+        // would then have no bars and no way to recover.
+        if (this._noteDotsBusyTimer) clearTimeout(this._noteDotsBusyTimer);
+        this._noteDotsBusyTimer = setTimeout(() => {
+            this._noteDotsBusyTimer = null;
+            if (!this._noteDotsBusy) return;
+            console.warn("STEP Plugin: note scan timed out; retrying.");
+            this._noteDotsBusy = false;
+            this.scheduleNoteDotsRefresh();
+        }, 15000);
         this._noteDotsCache = null;
+        const jobs = [];
         for (const leaf of this.app.workspace.getLeavesOfType("webviewer")) {
             const wv = leaf.view?.webview;
             const url = leaf.view?.url || wv?.getURL?.() || "";
             if (wv && (url.includes("stepbible.org") || url.includes("localhost:8989"))) {
-                this.injectNoteDots(wv).catch(e => console.error("STEP Plugin: refresh error:", e));
+                jobs.push(this.injectNoteDots(wv).catch(e => console.error("STEP Plugin: refresh error:", e)));
             }
         }
+        Promise.all(jobs).finally(() => {
+            this._noteDotsBusy = false;
+            if (this._noteDotsBusyTimer) { clearTimeout(this._noteDotsBusyTimer); this._noteDotsBusyTimer = null; }
+            if (this._noteDotsRefreshPending) {
+                this._noteDotsRefreshPending = false;
+                this.scheduleNoteDotsRefresh();
+            }
+        });
     }
 
     // Small badge in the top right of the STEP page while the initial vault
@@ -3860,7 +3045,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         let res = null;
         try {
-            const bookMap = this.getBookMap();
+            const bookMap = BibleInformation.getBookMap();
             const toCanonical = (ref) => {
                 const parts = ref.split(".");
                 const lookup = parts[0].replace(/\s+/g, " ").trim().toLowerCase();
@@ -3948,7 +3133,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             searchRef: left + (right ? "-" + right : ""),
                         };
 
-                        const maxV = (c) => this.getMaxVerse(bookL, parseInt(c, 10)) || 0;
+                        const maxV = (c) => BibleInformation.getMaxVerse(bookL, parseInt(c, 10)) || 0;
                         const fill = (c, firstV, lastV) => {
                             for (let v = firstV; v <= lastV; v++) {
                                 const key = `${bookL}.${c}.${v}`;
@@ -3959,7 +3144,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         // Book-only reference (no chapter): one solid bar across
                         // the whole book, exactly like any other reference.
                         if (!chapL) {
-                            const lastChap = this.getMaxChapter(bookL) || 0;
+                            const lastChap = BibleInformation.getMaxChapter(bookL) || 0;
                             for (let c = 1; c <= lastChap; c++) fill(c, 1, maxV(c));
                             continue;
                         }
@@ -4006,9 +3191,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         // verse of the book, so it still draws a bar and appears
                         // in the overflow list.
                         if (!chapL) {
-                            const lastC = this.getMaxChapter(bookL) || 0;
+                            const lastC = BibleInformation.getMaxChapter(bookL) || 0;
                             for (let c = 1; c <= lastC; c++) {
-                                const mv = this.getMaxVerse(bookL, c) || 0;
+                                const mv = BibleInformation.getMaxVerse(bookL, c) || 0;
                                 for (let v = 1; v <= mv; v++) {
                                     const k2 = `${bookL}.${c}.${v}`;
                                     (map[k2] = map[k2] || new Set()).add(key);
@@ -4020,7 +3205,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         const chapR = canonR ? canonR.split(".")[1] : chapL;
                         const verseR = canonR ? (canonR.split(".")[2] || null) : null;
                         if (bookL !== bookR) return;
-                        const maxV = (c) => this.getMaxVerse(bookL, parseInt(c, 10)) || 0;
+                        const maxV = (c) => BibleInformation.getMaxVerse(bookL, parseInt(c, 10)) || 0;
                         // chapter-only ref (reference=Genesis.1): whole chapter
                         const startV = verseL ? parseInt(verseL, 10) : 1;
                         for (let c = parseInt(chapL, 10); c <= parseInt(chapR, 10); c++) {
@@ -4149,7 +3334,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 `window.__stepBookRefs = ${JSON.stringify(this._noteDotsCache.bookRefs || {})};` +
                 `window.__stepTypedData = ${JSON.stringify(this._noteDotsCache.typedData || { colourOf: {}, contentOf: {}, outlineOf: {} })};` +
                 `window.__stepNoteBounds = ${JSON.stringify(this._noteDotsCache.bounds || {})};` +
-                `window.__stepBookOrder = ${JSON.stringify(STEP_BOOK_ORDER)};`);
+                `window.__stepBookOrder = ${JSON.stringify(BibleInformation.getBookOrder())};`);
 
             // 4b. Define the in-page injector + MutationObserver:
             //  - observes document.body (survives STEP's container swaps)
@@ -4235,9 +3420,36 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 document.head.appendChild(style);
                             }
 
-                            // Collect the page's verses in DOM order
-                            const verses = [];
-                            window.__stepVerses = verses; // exposed for host-driven highlight
+                            // Canonical ordering: needed to sort each panel's
+                            // verses before its bars are measured.
+                            const order = window.__stepBookOrder || [];
+                            const ordOf = (canon) => {
+                                const p = String(canon).split(".");
+                                const bi = order.indexOf(p[0]);
+                                const ch = parseInt(p[1], 10);
+                                const v = p[2] ? parseInt(p[2], 10) : 0;
+                                if (bi < 0 || !ch) return null;
+                                return bi * 1e9 + ch * 1e6 + (v || 0);
+                            };
+
+                            // Collect the page's verses, grouped by the passage
+                            // panel they live in. STEP can show two columns at
+                            // once — following a footnote opens a second passage
+                            // alongside the first — and each panel needs its own
+                            // independent set of bars. Bars are absolutely
+                            // positioned inside their panel, so a single mixed
+                            // set measured some bars against the wrong container
+                            // (and drew them all in the first panel).
+                            const panelOf = (verseEl) =>
+                                verseEl.closest(".passageContentHolder") ||
+                                verseEl.closest("[class*='passage']") ||
+                                document.body;
+                            const panels = [];
+                            const panelFor = (cont) => {
+                                let p = panels.find(x => x.cont === cont);
+                                if (!p) { p = { cont, verses: [], page: "", list: [], start: 0, x: 0 }; panels.push(p); }
+                                return p;
+                            };
                             const seenVerses = new Set();
                             document.querySelectorAll("a.verseLink").forEach(anchor => {
                                 const name = anchor.getAttribute("name");
@@ -4247,10 +3459,110 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 const verseEl = anchor.closest(".verse") || anchor.parentElement;
                                 if (!verseEl || seenVerses.has(verseEl)) return;
                                 seenVerses.add(verseEl);
-                                verses.push({ verse: verseEl, canon });
+                                panelFor(panelOf(verseEl)).verses.push({ verse: verseEl, canon });
                             });
+                            // Document order stops being canonical order once a
+                            // second panel can start anywhere, so sort per panel.
+                            // STEP's second passage panel (opened by following a
+                            // footnote) is not always its own passageContentHolder:
+                            // it can render as a second column inside the same
+                            // article. One holder then means one "page" spanning
+                            // both passages, so notes that cover a single column
+                            // stop looking like page-covering references and every
+                            // bar is drawn in the first column's gutter. Split any
+                            // holder whose verses form more than one horizontal
+                            // column, and give each split its own subtree root as a
+                            // bar container.
+                            const splitColumns = (list) => {
+                                const items = list.map(v => {
+                                    const r = v.verse.getBoundingClientRect();
+                                    return { v, left: r.left, right: r.right, top: r.top, h: r.height };
+                                });
+                                const cols = [];
+                                items.forEach(it => {
+                                    const c = cols.find(c => Math.abs(c.left - it.left) < 40);
+                                    if (c) {
+                                        c.items.push(it);
+                                        if (it.left < c.left) c.left = it.left;
+                                        if (it.right > c.right) c.right = it.right;
+                                    } else cols.push({ left: it.left, right: it.right, items: [it] });
+                                });
+                                if (cols.length < 2) return null;
+                                cols.sort((a, b) => a.left - b.left);
+                                // Indentation can push a verse's left edge past
+                                // the 40px grouping tolerance and fake a second
+                                // "column" inside a single passage. Two real
+                                // columns are horizontally disjoint: each must
+                                // clear the previous column's right edge, and no
+                                // stray verse may form a column of its own.
+                                for (let i = 0; i < cols.length; i++) {
+                                    if (cols[i].items.length < 3) return null;
+                                    if (i > 0 && cols[i].left - cols[i - 1].right < 40) return null;
+                                }
+                                return cols.map(c => {
+                                    const mine = c.items.map(it => it.v);
+                                    let root = mine[0].verse;
+                                    while (root && !mine.every(m => root.contains(m.verse))) root = root.parentElement;
+                                    while (root && root !== document.body
+                                        && items.some(o => mine.indexOf(o.v) < 0 && o.v.verse && root.contains(o.v.verse))) {
+                                        root = root.parentElement;
+                                    }
+                                    if (!root || root === document.body) root = null;
+                                    return { verses: mine, root };
+                                });
+                            };
+                            const refined = [];
+                            panels.forEach(p => {
+                                const split = splitColumns(p.verses);
+                                if (!split) { refined.push(p); return; }
+                                const paneRect = p.cont === document.body ? null : p.cont.getBoundingClientRect();
+                                split.forEach(col => {
+                                    const root = col.root || p.cont;
+                                    const rr = root === document.body ? null : root.getBoundingClientRect();
+                                    refined.push({
+                                        cont: root,
+                                        verses: col.verses,
+                                        page: "", list: [], start: 0,
+                                        // Bars are absolute inside cont; when the
+                                        // column has no container of its own, shift
+                                        // them right to the column's own edge.
+                                        x: (rr && paneRect) ? Math.max(0, Math.round(rr.left - paneRect.left)) : 0
+                                    });
+                                });
+                            });
+                            panels.length = 0;
+                            refined.forEach(p => panels.push(p));
 
-                            // For each note, the min/max verse index present on this page
+                            panels.forEach(p => p.verses.sort((a, b) => {
+                                const oa = ordOf(a.canon), ob = ordOf(b.canon);
+                                if (oa == null || ob == null) return 0;
+                                return oa - ob;
+                            }));
+                            // One flat, panel-by-panel list: a bar's __range
+                            // indexes straight into it for highlighting.
+                            const verses = [];
+                            panels.forEach(p => {
+                                p.start = verses.length;
+                                p.verses.forEach(v => { v.__page = p.page || ""; verses.push(v); });
+                            });
+                            window.__stepVerses = verses; // exposed for host-driven highlight
+                            window.__stepPanels = panels;
+
+                            let totalAdded = 0;
+                            const allDbg = [];
+                            panels.forEach((panel, pi) => {
+                            const verses = panel.verses;
+                            const cont = panel.cont;
+                            let contRect = null;
+                            if (cont) {
+                                cont.style.position = "relative";
+                                contRect = cont.getBoundingClientRect();
+                            }
+                            panel.page = "#" + pi;
+                            panel.list = [];
+
+                            // For each note, the min/max verse index present in
+                            // this panel
                             const noteIdx = {};
                             verses.forEach((v, i) => {
                                 const notes = fullMap[v.canon];
@@ -4261,20 +3573,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     if (i > e.max) e.max = i;
                                 });
                             });
-
-                            // Bars are anchored to the passage container, not the
-                            // verse spans: inline spans have unreliable bounding
-                            // boxes, so measure from rects relative to the container.
-                            const cont = verses.length
-                                ? (verses[0].verse.closest(".passageContentHolder") ||
-                                   verses[0].verse.closest("[class*='passage']") ||
-                                   document.body)
-                                : null;
-                            let contRect = null;
-                            if (cont) {
-                                cont.style.position = "relative";
-                                contRect = cont.getBoundingClientRect();
-                            }
 
                             // Build note list in verse order, then assign slots by
                             // vertical overlap: each bar gets the first slot whose
@@ -4293,15 +3591,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // drawn as a misleading fragment. They share one grey
                             // lane on the far left instead.
                             const boundsOf = window.__stepNoteBounds || {};
-                            const order = window.__stepBookOrder || [];
-                            const ordOf = (canon) => {
-                                const p = String(canon).split(".");
-                                const bi = order.indexOf(p[0]);
-                                const ch = parseInt(p[1], 10);
-                                const v = p[2] ? parseInt(p[2], 10) : 0;
-                                if (bi < 0 || !ch) return null;
-                                return bi * 1e9 + ch * 1e6 + (v || 0);
-                            };
                             let pageStart = null, pageEnd = null;
                             verses.forEach(v => {
                                 const o = ordOf(v.canon);
@@ -4309,6 +3598,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 if (pageStart === null || o < pageStart) pageStart = o;
                                 if (pageEnd === null || o > pageEnd) pageEnd = o;
                             });
+                            // The page key identifies one lane. Two panels can be
+                            // on the same passage, so the panel index is part of
+                            // it — otherwise a list pinned in panel one would be
+                            // treated as the lane for panel two.
+                            panel.page = (pageStart === null ? "" : pageStart + "-" + pageEnd) + "#" + pi;
+                            // Retag this panel's verses with its final page key.
+                            // The flat list was built before the key existed, so
+                            // __page was left empty and every page-scoped
+                            // highlight (bar hover) filtered every verse out.
+                            for (let vi = panel.start; vi < panel.start + verses.length; vi++) {
+                                if (verses[vi]) verses[vi].__page = panel.page;
+                            }
                             const overflowList = [];
                             const drawnList = [];
                             noteList.forEach(item => {
@@ -4388,7 +3689,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     // Fixed gutter position; widths live in the
                                     // stylesheet so :hover can still widen a bar.
                                     const baseLeft = 2;
-                                    bar.style.left = (baseLeft + slotX * 8) + "px";
+                                    bar.style.left = ((panel.x || 0) + baseLeft + slotX * 8) + "px";
 
                                     // Measure the range from viewport rects, converted
                                     // to container-content coordinates (accounting for
@@ -4408,12 +3709,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     bar.style.height = Math.max(10, bottom2 - top1) + "px";
                                     dbg.push("#" + added + " s" + slot + " t" + Math.round(top1) + " h" + Math.round(bottom2 - top1) + " " + verses[item.e.min].canon + ".." + verses[item.e.max].canon);
 
-                                    bar.__range = { min: item.e.min, max: item.e.max };
+                                    bar.__range = { min: panel.start + item.e.min, max: panel.start + item.e.max };
+                                    // Which passage panel this bar belongs to. Two
+                                    // columns on one page are independent: a hover
+                                    // or hold must never touch the other column.
+                                    bar.__page = panel.page;
                                     // Hover: highlight the whole referenced range in-page.
                                     // Typed bars show their content in an Obsidian-managed
                                     // popover (plugin side), so no in-page tip for them.
                                     bar.addEventListener("mouseenter", () => {
-                                        window.__stepHighlight(item.nb);
+                                        window.__stepHighlight(item.nb, "", panel.page);
                                         if (tinfo) {
                                             // Widen this crosslink's section bar too.
                                             const pid = tinfo.parentId;
@@ -4446,7 +3751,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     });
                                     bar.addEventListener("mouseleave", () => {
                                         // Don't wipe a highlight the popover is holding.
-                                        if (!(window.__stepHl && window.__stepHl.hold)) window.__stepHighlight("");
+                                        if (!(window.__stepHl && window.__stepHl.hold)) window.__stepHighlight("", "", panel.page);
                                         if (bar.__parentLit) { bar.__parentLit.removeAttribute("data-parent-lit"); bar.__parentLit = null; }
                                         if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
                                     });
@@ -4463,7 +3768,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 if (!overflowList.length) {
                                     const oldBar = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
                                     if (oldBar) oldBar.remove();
-                                    window.__stepOverflowList = [];
+                                    panel.list = [];
                                 } else {
                                     // Least verses first, so the smallest note (the
                                     // most specific reference) is at the top.
@@ -4472,15 +3777,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                         return b ? (b.end - b.start) : (it.e.max - it.e.min);
                                     };
                                     const ovf = overflowList.slice().sort((a, b) => spanOf(a) - spanOf(b));
-                                    window.__stepOverflowList = ovf.map(it => it.nb);
-                                    window.__stepOverflowPage = (pageStart === null ? "" : pageStart + "-" + pageEnd);
+                                    // This panel's lane contents. The host keys a
+                                    // list by hit.page, which now carries the
+                                    // panel index, so the two lanes stay apart.
+                                    panel.list = ovf.slice();
+                                    panel.list = ovf.map(it => it.nb);
                                     let ob = cont.querySelector('.step-note-bar[data-note="' + OVF_ID + '"]');
+                                    if (ob) { ob.__panel = panel; ob.__page = panel.page; ob.style.left = ((panel.x || 0) + 2) + "px"; }
                                     if (!ob) {
                                         ob = document.createElement("div");
                                         ob.className = "step-note-bar step-note-overflow";
                                         ob.dataset.note = OVF_ID;
+                                        ob.__panel = panel;
+                                        ob.__page = panel.page;
                                         ob.style.background = "rgba(150,150,150,0.55)";
-                                        ob.style.left = "2px";
+                                        ob.style.left = ((panel.x || 0) + 2) + "px";
                                         // No inline width: it would override both
                                         // the 4px base and the 6px :hover rule,
                                         // leaving the lane permanently wide.
@@ -4533,7 +3844,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             if (dbg.length) {
                                 // debug info goes to the console log in the plugin; no title edit
                             }
-                            return { added, dbg: dbg.join(" | "), cont: cont === document.body ? "BODY" : (cont && cont.className) || "?", verses: verses.length };
+                            totalAdded += added;
+                            allDbg.push(dbg.join(" | "));
+                            });
+
+                            // The union of every panel's lane, for the in-page
+                            // helpers that only need "is this note in a lane".
+                            window.__stepOverflowList = [].concat.apply([], panels.map(p => p.list));
+                            return {
+                                added: totalAdded,
+                                dbg: allDbg.join(" || "),
+                                cont: panels.length > 1 ? ("PANELS:" + panels.length)
+                                    : (panels[0] ? (panels[0].cont === document.body ? "BODY" : (panels[0].cont && panels[0].cont.className) || "?") : "NONE"),
+                                verses: verses.length,
+                                panels: panels.length
+                            };
                         };
 
                         // Host-driven highlight: while the mouse is over a bar or
@@ -4541,27 +3866,35 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         // second argument adds a canonical range ("Gen.1.1" or
                         // "Gen.1.1-Gen.1.3") — used by crosslinks to light up the
                         // note's own reference as well as the linked one.
-                        window.__stepHighlight = function(id, sourceRange) {
-                            const clear = () => {
+                        window.__stepHighlight = function(id, sourceRange, page) {
+                            if (page === undefined) page = "";
+                            const clear = (onlyPage) => {
                                 if (window.__stepHl) {
-                                    if (window.__stepHl.els) window.__stepHl.els.forEach(el => el.classList.remove("step-ref-hover"));
+                                    if (window.__stepHl.els) window.__stepHl.els.forEach(el => { if (!onlyPage || el.__page === onlyPage) el.classList.remove("step-ref-hover"); });
                                     if (window.__stepHl.bars) window.__stepHl.bars.forEach(el => el.classList.remove("step-bar-expand"));
                                 }
                                 window.__stepHl = null;
                             };
-                            clear();
+                            // Scoped to this panel: moving along a bar in one
+                            // column must not unlight the other column's verses.
+                            clear(page || undefined);
                             if (!id) return;
                             const verses = window.__stepVerses || [];
                             const els = [];
+                            // With a page given, only that panel's verses can light up.
                             const lit = (v) => {
                                 if (!v || !v.verse || els.indexOf(v.verse) !== -1) return;
+                                if (page && v.__page !== page) return;
                                 v.verse.classList.add("step-ref-hover");
                                 els.push(v.verse);
                             };
-                            const bar = document.querySelector('.step-note-bar[data-note="' + CSS.escape(id) + '"]');
-                            if (bar && bar.__range) {
+                            // The same note can have a bar in each panel; light
+                            // only the one(s) in the panel being hovered.
+                            document.querySelectorAll('.step-note-bar[data-note="' + CSS.escape(id) + '"]').forEach(bar => {
+                                if (!bar.__range) return;
+                                if (page && bar.__page !== page) return;
                                 for (let i = bar.__range.min; i <= bar.__range.max; i++) lit(verses[i]);
-                            }
+                            });
                             // A ref bar lights only what it points at — never the
                             // note text the ref was written in.
                             const range = sourceRange || "";
@@ -4580,15 +3913,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     if (cmp(q, lo) >= 0 && cmp(q, hi) <= 0) lit(v);
                                 });
                             }
-                            window.__stepHl = { els: els, bars: [] };
+                            window.__stepHl = { els: els, bars: [], page: page || "" };
                         };
 
                         // A bar belongs to the grey lane if its note does, or
                         // if the crosslink it stands for belongs to a note
                         // that does: a crosslink bar carries the crosslink's
                         // own id, not its parent's.
-                        window.__stepInLane = function(id) {
-                            const ids = window.__stepOverflowList;
+                        window.__stepInLane = function(id, page) {
+                            // Lanes are per panel: a note reaching past the left
+                            // column says nothing about the right one.
+                            let ids = null;
+                            if (page && Array.isArray(window.__stepPanels)) {
+                                const pn = window.__stepPanels.filter(p => p.page === page)[0];
+                                if (pn) ids = pn.list;
+                            }
+                            if (!Array.isArray(ids)) ids = window.__stepOverflowList;
                             if (!Array.isArray(ids) || !id) return false;
                             if (ids.indexOf(id) >= 0) return true;
                             const td = window.__stepTypedData || {};
@@ -4607,15 +3947,65 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         // note whose popover is currently open; a bar is wide exactly
                         // while its id is in that list, so the popout and the bar
                         // appear and disappear together.
-                        window.__stepHoldBars = function(ids) {
-                            const set = new Set(Array.isArray(ids) ? ids : []);
-                            document.querySelectorAll(".step-note-bar[data-hold='1']").forEach(b => {
-                                if (!set.has(b.dataset.note || "")) b.removeAttribute("data-hold");
+                        window.__stepHoldBars = function(byPage) {
+                            // A map of panel page -> ids, so each column is handled
+                            // on its own. A bare array means the unnamed panel.
+                            let map = byPage;
+                            if (!map || Array.isArray(map)) map = { "": Array.isArray(map) ? map : [] };
+                            const sets = {};
+                            Object.keys(map).forEach(k => { sets[k] = new Set(map[k] || []); });
+                            // A note open from the lane must widen the lane in the
+                            // panel it was opened from — and only that panel. The
+                            // id reaching us here is the note, not "__STEPOVF__"
+                            // (the host only adds the lane id when the pointer is
+                            // directly on a lane), so membership is checked
+                            // against that panel's own list.
+                            const lanePage = {};
+                            if (Array.isArray(window.__stepPanels)) {
+                                window.__stepPanels.forEach(pn => {
+                                    const ids = pn.list || [];
+                                    const hit = (sets[pn.page || ""] || new Set());
+                                    lanePage[pn.page || ""] = ids.some(id => hit.has(id));
+                                });
+                            }
+                            document.querySelectorAll(".step-note-bar").forEach(b => {
+                                const page = b.__page || "";
+                                const set = sets[page];
+                                const id = b.dataset.note || "";
+                                if (id === "__STEPOVF__") {
+                                    if (set && (set.has(id) || lanePage[page])) b.setAttribute("data-hold", "1");
+                                    else if (b.getAttribute("data-hold") === "1") b.removeAttribute("data-hold");
+                                    return;
+                                }
+                                if (set && set.has(id)) b.setAttribute("data-hold", "1");
+                                else if (b.getAttribute("data-hold") === "1") b.removeAttribute("data-hold");
                             });
-                            set.forEach(id => {
-                                const b = document.querySelector('.step-note-bar[data-note="' + CSS.escape(id) + '"]');
-                                if (b) b.setAttribute("data-hold", "1");
-                            });
+                        };
+
+                        // Widening and highlighting arrive as one message, in
+                        // one call, with a sequence number. Applying both here,
+                        // in order, means the page can never show a wide bar
+                        // with no lit text (or the reverse) and can never apply
+                        // an older state after a newer one.
+                        window.__stepBarState = function(state) {
+                            if (!state || typeof state.seq !== "number") return;
+                            if (typeof window.__stepBarStateSeq === "number"
+                                && state.seq < window.__stepBarStateSeq) return;
+                            window.__stepBarStateSeq = state.seq;
+                            try { if (window.__stepHoldBars) window.__stepHoldBars(state.hold || {}); } catch (e) {}
+                            try { if (window.__stepHighlight) window.__stepHighlight(state.id || "", "", state.page || ""); } catch (e) {}
+                        };
+
+                        // The grey lane belonging to one panel page. Looked up
+                        // through that panel's own container, so a page can only
+                        // ever resolve to its own lane. Returns null when the
+                        // page is unknown: better no highlight than the wrong
+                        // passage's lane.
+                        window.__stepLaneOf = function(page) {
+                            if (!Array.isArray(window.__stepPanels)) return null;
+                            const pn = window.__stepPanels.filter(p => p.page === (page || ""))[0];
+                            if (!pn || !pn.cont) return null;
+                            return pn.cont.querySelector('.step-note-bar[data-note="__STEPOVF__"]');
                         };
 
                         // Hit-test for the plugin-side hover popover: which bar sits
@@ -4650,17 +4040,34 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             if (b.dataset.note === "__STEPOVF__") {
                                 // The grey lane stands for every note that reaches
                                 // past this page; the host renders them as a list.
-                                return { id: "__STEPOVF__", overflow: true, list: window.__stepOverflowList || [], page: window.__stepOverflowPage || "" };
+                                const pn = b.__panel;
+                                return {
+                                    id: "__STEPOVF__",
+                                    overflow: true,
+                                    list: pn ? pn.list : (window.__stepOverflowList || []),
+                                    page: pn ? pn.page : "",
+                                    panel: pn ? pn.page : "",
+                                    // The lane element itself. Every highlight of
+                                    // a lane must use the lane the pointer is on,
+                                    // never a document-wide lookup (two columns
+                                    // each have one, and the first found belongs
+                                    // to the other passage).
+                                    laneEl: b
+                                };
                             }
                             return {
                                 id: b.dataset.note || "",
                                 ref: b.dataset.ref || "",
                                 typed: b.dataset.typed === "1",
-                                laneParent: !!window.__stepInLane && window.__stepInLane(b.dataset.note),
+                                page: b.__page || "",
+                                // This bar's own panel lane, for lighting when
+                                // the bar's note lives in that lane.
+                                ovfEl: window.__stepLaneOf ? window.__stepLaneOf(b.__page || "") : null,
+                                laneParent: !!window.__stepInLane && window.__stepInLane(b.dataset.note, b.__page || ""),
                                 // True when this bar also stands in the grey
                                 // lane, so the host can widen it for hovers and
                                 // pins that never go through the list.
-                                ovf: window.__stepInLane ? window.__stepInLane(b.dataset.note) : false
+                                ovf: window.__stepInLane ? window.__stepInLane(b.dataset.note, b.__page || "") : false
                             };
                         };
 
@@ -4678,13 +4085,26 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 // well: the host round trip is not needed for a
                                 // highlight that lives entirely in this page.
                                 try {
-                                    const lane = document.querySelector('.step-note-bar[data-note="__STEPOVF__"]');
+                                    // Each column has its own lane. Light only the
+                                    // lane of the bar under the pointer, resolved
+                                    // through that bar's own panel; then clear every
+                                    // other lane so a highlight can never linger on
+                                    // the opposite column after the pointer moves.
+                                    let lane = null;
+                                    if (hit && (hit.id === "__STEPOVF__")) lane = hit.laneEl || null;
+                                    else if (hit && hit.laneParent) lane = hit.ovfEl || null;
+                                    document.querySelectorAll('.step-note-bar[data-lane-hover="1"]').forEach(el => {
+                                        if (el !== lane) el.removeAttribute("data-lane-hover");
+                                    });
                                     if (lane) {
-                                        if (hit && hit.laneParent) lane.setAttribute("data-lane-hover", "1");
+                                        if (hit && (hit.id === "__STEPOVF__" || hit.laneParent)) lane.setAttribute("data-lane-hover", "1");
                                         else lane.removeAttribute("data-lane-hover");
                                     }
                                 } catch (e) {}
-                                const key = hit ? hit.id : "";
+                                // Keyed by page as well as id: each panel has its
+                                // own grey lane with the same id, and moving
+                                // between them must still be reported.
+                                const key = hit ? (hit.id + "|" + (hit.page || "")) : "";
                                 if (key === lastHover) return; // only report changes
                                 lastHover = key;
                                 console.log("__STEPBAR__" + JSON.stringify(hit));
@@ -4724,6 +4144,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                         let n;
                                         try { n = window.__stepInjectDots(); }
                                         finally { if (window.__stepDotObserve) window.__stepDotObserve(); }
+                                        // A DOM swap that moved us to a new
+                                        // passage still needs a host re-scan:
+                                        // the note index comes from the vault.
+                                        try { if (window.__stepNotifyPage) window.__stepNotifyPage(); } catch (e) {}
                                     } catch (e) {
                                         console.log("[step-dots] OBS ERR " + (e && e.message ? e.message.slice(0, 80) : e));
                                     }
@@ -4748,15 +4172,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 // Watch the passage container itself: pane resizes, scrollbar
                                 // changes and rewraps all change its size without a window event.
                                 if (window.ResizeObserver) {
+                                    // Every passage panel, not just the first: a
+                                    // second column opened from a footnote resizes
+                                    // without a window event and its bars go stale.
                                     const hookCont = () => {
-                                        const c = document.querySelector(".passageContentHolder") || document.body;
-                                        if (window.__stepBarRO && window.__stepBarRO._cont === c) return;
+                                        const cs = Array.from(document.querySelectorAll(".passageContentHolder"));
+                                        if (!cs.length) cs.push(document.body);
+                                        const key = cs.join(",");
+                                        if (window.__stepBarRO && window.__stepBarRO._key === key) return;
                                         if (window.__stepBarRO) window.__stepBarRO.disconnect();
                                         window.__stepBarRO = new ResizeObserver(debounced);
-                                        window.__stepBarRO._cont = c;
-                                        window.__stepBarRO.observe(c);
+                                        window.__stepBarRO._key = key;
+                                        cs.forEach(c => window.__stepBarRO.observe(c));
                                     };
                                     hookCont();
+                                    setTimeout(hookCont, 1500);
                                 }
                                 // Fonts finish loading after first paint and rewrap text;
                                 // re-measure once they do, plus one late safety pass.
@@ -4768,6 +4198,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             window.__stepDotObserve = () => {
                                 try { obs.disconnect(); } catch (e) {}
                                 getTargets().forEach(t => obs.observe(t, { childList: true, subtree: true }));
+                                obs.__root = document.body;
                             };
                             window.__stepDotObserve();
                         }
@@ -4777,6 +4208,58 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         let res = null;
                         try { res = window.__stepInjectDots(); } finally {
                             if (window.__stepDotObserve) window.__stepDotObserve();
+                        }
+
+                        // STEP navigates in place: following a footnote link
+                        // swaps the article and opens a second passage column
+                        // without a page load, so the host never learns the
+                        // page changed. Watch for that here and tell the host.
+                        // Fenced off and run AFTER injection: this must never
+                        // be able to stop the bars being drawn.
+                        try {
+                            const pageKey = () => location.href
+                                + "|" + document.querySelectorAll(".passageContentHolder").length
+                                + "|" + document.querySelectorAll(".verse").length;
+                            if (typeof window.__stepLastPageKey !== "string") {
+                                window.__stepLastPageKey = pageKey();
+                            }
+                            window.__stepNotifyPage = () => {
+                                let k;
+                                try {
+                                    if (!document.querySelectorAll(".verse").length) return;
+                                    k = pageKey();
+                                } catch (e) { return; }
+                                if (k === window.__stepLastPageKey) return;
+                                window.__stepLastPageKey = k;
+                                try { console.log("__STEPPAGE__"); } catch (e) {}
+                            };
+                            if (!window.__stepPageWatchHooked) {
+                                window.__stepPageWatchHooked = true;
+                                const fire = () => setTimeout(() => {
+                                    try { window.__stepNotifyPage && window.__stepNotifyPage(); } catch (e) {}
+                                }, 500);
+                                window.addEventListener("hashchange", fire);
+                                window.addEventListener("popstate", fire);
+                                try {
+                                    ["pushState", "replaceState"].forEach((n) => {
+                                        const orig = history[n];
+                                        if (!orig || orig.__stepWrapped) return;
+                                        const w = function (...a) { const r = orig.apply(this, a); fire(); return r; };
+                                        w.__stepWrapped = true;
+                                        history[n] = w;
+                                    });
+                                } catch (e) {}
+                                setInterval(() => {
+                                    try {
+                                        if (window.__stepDotObserver && window.__stepDotObserver.__root !== document.body) {
+                                            window.__stepDotObserve && window.__stepDotObserve();
+                                        }
+                                        window.__stepNotifyPage && window.__stepNotifyPage();
+                                    } catch (e) {}
+                                }, 1500);
+                            }
+                        } catch (e) {
+                            window.__stepLastPageWatchError = e && e.message ? e.message : String(e);
                         }
 
                         window.__stepLastInjectError = null;
@@ -4791,6 +4274,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         } catch (err) {
             console.error("STEP Plugin: injectNoteDots error:", err);
+        }
+        if (!res) {
+            // Surface the guest-side error instead of failing silently.
+            try {
+                const why = await webviewEl.executeJavaScript(
+                    'JSON.stringify({inject: window.__stepLastInjectError || null, watch: window.__stepLastPageWatchError || null, verses: document.querySelectorAll(".verse").length})'
+                );
+                console.warn("STEP Plugin: inject produced no result:", why);
+            } catch (e) {
+                console.warn("STEP Plugin: inject produced no result (and the page did not answer).");
+            }
         }
         if (res) {
             if (res.dbg) console.log("STEP Plugin: bars =>", "cont=" + res.cont, "verses=" + res.verses, res.dbg);
@@ -4935,9 +4429,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (!entry) return;
             if (this._ovfList && this._ovfList.body === entry.body) this._ovfList = null;
             const pop = entry.pop;
-            clearTimeout(this._hoverCloseTimer);
+            // Only a hover close is cancelled by a hover teardown. Clearing it
+            // when a pinned box closes threw away a hover note's already-
+            // scheduled removal, so the note sat there until the next pointer
+            // event — the delay that showed up right after closing a pin.
+            if (!entry.pinned) clearTimeout(this._hoverCloseTimer);
             this._barDragging = false;
-            if (!entry.pinned) this._pointerInPopover = false;
+            // The flag describes the hover note's own body. Once a box is torn
+            // down it can never be a true statement, whoever owned it, and a
+            // stuck `true` made pointerOverHoverPop() keep every later hover
+            // note alive.
+            this._pointerInPopover = false;
             // Drop the slot first, then sync: the bar narrows on the same tick
             // the popover is torn down.
             // A row-owned note has nothing left to belong to.
@@ -4957,6 +4459,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     if (this._adjHover && this._adjHover.note === entry) this._adjHover = null;
                 }
             }
+            // The enter/leave flag belongs to that one popover. Once it is
+            // torn down the pointer cannot be inside it, but no mouseleave
+            // ever fires for an element removed under a stationary cursor, so
+            // the flag survived. Pinning disposes the hover note (the pointer
+            // is inside it — that is where the pin button was), so the flag
+            // stayed true for good: with no host pointer moves over the page,
+            // pointerOverHoverPop() had no geometry to fall back on and held
+            // every later hover note open until the user clicked or left the
+            // window. That is the "only after I pin something" bug.
+            if (this._hoverPop === entry) this._pointerInPopover = false;
             if (entry.pinned) {
                 if (this._pinnedPop === entry) this._pinnedPop = null;
                 this._barPinned = false;
@@ -4966,64 +4478,105 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // the pointer re-entered the page. Closing by clicking the bar
                 // already clears it; this makes every close path do the same.
                 this._lastBarHit = null;
+                // The X is host-side: the guest never reports the pointer
+                // leaving the lane, so a lane hover would otherwise stay lit
+                // and wide until the pointer re-entered the page.
+                this._barHitOvf = false;
+                this._barHitOvfPage = "";
             } else if (this._hoverPop === entry) this._hoverPop = null;
             try { (entry.hide || pop.hide.bind(pop))(); } catch (e) { try { pop.hide(); } catch (e2) {} }
             // Narrow the bars in the same tick the popover goes away.
             this._syncBarHold();
+            // The lit passage follows the bar that lit it, on this same tick.
+            this._restoreHighlight();
             if (entry.anchorEl && entry.anchorEl.parentNode) entry.anchorEl.remove();
             if (!entry.pinned) {
                 // No fade-out: a hover note goes the instant the bar is left.
                 try { if (entry.body) { entry.body.style.display = "none"; entry.body.remove(); } } catch (e) {}
             }
             if (entry.pinned) {
-                // Closing the pinned note releases the lit passage.
-                try {
-                    if (this._barWebview && this._barWebview.executeJavaScript)
-                        this._barWebview.executeJavaScript(`window.__stepHighlight && window.__stepHighlight("")`).catch(() => {});
-                } catch (e) {}
+                // A hover note can be open when the pin goes. Nothing will
+                // re-evaluate it until the pointer moves, so check now.
+                this._scheduleHoverClose();
+                // The X lives in the host document: the click took focus off
+                // the page, so hover reports from the guest would stall until
+                // the next click inside it. Give focus back straight away.
+                this._focusPage();
             }
         };
         // Keep the guest's widened bars in step with the open popovers.
         this._syncBarHold = () => {
-            const ids = [];
-            const add = (id) => {
+            // Per panel: a note open in one column must never widen a bar in
+            // the other, and the two grey lanes are separate lanes.
+            const byPage = new Map();
+            const add = (id, page) => {
                 if (!id) return;
+                page = page || "";
+                if (!byPage.has(page)) byPage.set(page, []);
+                const ids = byPage.get(page);
                 if (ids.indexOf(id) < 0) ids.push(id);
                 // A crosslink's section bar stays widened with it.
                 const td = this._noteDotsCache && this._noteDotsCache.typedData;
                 const p = td && td.contentOf && td.contentOf[id] && td.contentOf[id].parentId;
                 if (p && ids.indexOf(p) < 0) ids.push(p);
             };
-            if (this._pinnedPop) add(this._pinnedPop.id);
-            if (this._hoverPop) add(this._hoverPop.id);
+            const pageOf = (entry) => (entry && entry.page) || "";
+            if (this._pinnedPop) add(this._pinnedPop.id, pageOf(this._pinnedPop));
+            if (this._hoverPop) add(this._hoverPop.id, pageOf(this._hoverPop));
             // A note opened from the Wider References list lives in the list's
             // own slots, not in the hover/pinned ones, so it has to be added
             // separately or its bar (and the lane it belongs to) never widen.
-            if (this._adjPinned && this._adjPinned.note) add(this._adjPinned.note.id);
-            if (this._adjHover && this._adjHover.note) add(this._adjHover.note.id);
+            if (this._adjPinned && this._adjPinned.note) add(this._adjPinned.note.id, pageOf(this._adjPinned));
+            if (this._adjHover && this._adjHover.note) add(this._adjHover.note.id, pageOf(this._adjHover));
             // The grey lane stands for its whole list, so it stays wide while
             // any note in that list is open — including a crosslink inside one
             // of those notes, whose id only reaches the note through
             // parentId above.
-            if (this._barHitOvf ||
-                (this._pinnedPop && this._pinnedPop.ovf) ||
-                (this._hoverPop && this._hoverPop.ovf)) {
-                add("__STEPOVF__");
-            }
+            if (this._barHitOvf) add("__STEPOVF__", this._barHitOvfPage || "");
+            if (this._pinnedPop && this._pinnedPop.ovf) add("__STEPOVF__", pageOf(this._pinnedPop));
+            if (this._hoverPop && this._hoverPop.ovf) add("__STEPOVF__", pageOf(this._hoverPop));
             const ovf = this._ovfList;
             if (ovf && ovf.ids && ovf.ids.length) {
-                for (const id of ids.slice()) {
-                    if (ovf.ids.indexOf(id) >= 0) { add("__STEPOVF__"); break; }
-                }
+                byPage.forEach((ids, page) => {
+                    if (page !== (ovf.page || "")) return;
+                    for (const id of ids.slice()) {
+                        if (ovf.ids.indexOf(id) >= 0) { add("__STEPOVF__", page); break; }
+                    }
+                });
             }
             const wv = this._barWebview;
             if (!wv || !wv.executeJavaScript) return;
+            const payload = {};
+            byPage.forEach((ids, page) => { payload[page] = ids; });
+            // One message carries both halves of the hover: which bars widen
+            // and which passage is lit. Two separate fire-and-forget calls
+            // could land out of order after a pin, leaving bars wide or text
+            // lit with nothing open.
+            const lit = this._litEntry();
+            this._highlightPage = lit ? lit.page : "";
+            const state = {
+                seq: ++this._barStateSeq,
+                hold: payload,
+                id: lit ? lit.id : "",
+                page: lit ? lit.page : ""
+            };
             try {
-                wv.executeJavaScript(`window.__stepHoldBars && window.__stepHoldBars(${JSON.stringify(ids)})`).catch(() => {});
+                wv.executeJavaScript(`window.__stepBarState && window.__stepBarState(${JSON.stringify(state)})`).catch(() => {});
             } catch (e) {}
         };
         const closeHover = () => dispose(this._hoverPop);
         const closePinned = () => dispose(this._pinnedPop);
+        // Hand focus back to the page. Clicking any of our own chrome (an X,
+        // a title bar, the list header) moves focus to the host document, and
+        // while the webview is unfocused the guest stops reporting bar hovers
+        // until the user clicks back into the page — which looked exactly like
+        // "hover notes stop closing after I use the X".
+        this._focusPage = () => {
+            const wv = this._barWebview;
+            if (!wv) return;
+            try { if (wv.focus) wv.focus(); } catch (e) {}
+            try { wv.executeJavaScript("try{window.focus()}catch(e){}").catch(() => {}); } catch (e) {}
+        };
         const closePopover = () => { closeHover(); closePinned(); };
         this._closeBarPopover = closePopover;
         this._closeHoverPopover = closeHover;
@@ -5057,36 +4610,54 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // made notes linger for seconds.
         const pointerOverHoverPop = () => {
             if (!this._hoverPop) return false;
-            // Use the tracked popover's own element. A pinned Wider References
-            // list is also a .step-bar-popover (it never takes the -pinned
-            // class), so a document-wide query could pick that list instead of
-            // the hover note and keep the note alive for as long as the
-            // pointer happened to sit over the list.
             const own = this._hoverPop.body;
-            // Only the tracked hover note counts. A document-wide fallback can
-            // match a pinned Wider References list (which never takes the
-            // -pinned class) and hold the note open forever.
             if (!own || !own.isConnected) return false;
             const c = own;
             const p = this._lastPointer;
             if (!p) return this._pointerInPopover;
+            try {
+                const stack = document.elementsFromPoint(p.x, p.y) || [];
+                for (const el of stack) {
+                    if (el === c || (c.contains && c.contains(el))) return true;
+                    // Nothing of ours sits above the hover note except other
+                    // popovers and stretched title bars — anything else (the
+                    // webview, page chrome) means the pointer is off the note.
+                    if (el.closest && el.closest(".step-bar-popover, .step-adj-bar, .step-overflow-list")) return false;
+                    break;
+                }
+            } catch (e) {}
             const r = c.getBoundingClientRect();
             return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
         };
+
+        this._barStateSeq = 0;
+        this._litEntry = () => {
+            if (this._hoverPop && !this._hoverPop.ovf) return { id: this._hoverPop.id, page: this._hoverPop.page };
+            if (this._lastBarHit) return { id: this._lastBarHit.id || "", page: this._lastBarHit.page || "" };
+            if (this._adjHover && this._adjHover.note) return { id: this._adjHover.note.id, page: this._adjHover.note.page || this._adjHover.page };
+            if (this._pinnedPop && !this._pinnedPop.ovf) return { id: this._pinnedPop.id, page: this._pinnedPop.page };
+            if (this._adjPinned && this._adjPinned.note) return { id: this._adjPinned.note.id, page: this._adjPinned.note.page || this._adjPinned.page };
+            return null;
+        };
+        // Kept for the call sites that only mean "make the page match what is
+        // open": widening and highlighting travel together, so this is the
+        // same push.
+        this._restoreHighlight = () => this._syncBarHold();
+
+        // A hover note lives only while the pointer is on its bar or on the
+        // note itself. No timer: if neither is true, it goes now.
         this._scheduleHoverClose = () => {
             clearTimeout(this._hoverCloseTimer);
-            this._hoverCloseTimer = setTimeout(() => {
-                // Only a hovered stretched bar keeps a hover note alive; a
-                // pinned note (or a pinned Wider References list) is no reason
-                // to leave a transient note on screen.
-                if (this._adjHover) return;
-                if (pointerOverHoverPop()) return;
-                if (this._lastBarHit) return;
-                closeHover();
-                if (!this._barPinned && this._barWebview) {
-                    try { this._barWebview.executeJavaScript(`window.__stepHighlight && window.__stepHighlight("")`).catch(() => {}); } catch (e) {}
-                }
-            }, 90);
+            // An adjacent (wider-references row) note owns its own lifetime
+            // through its own enter/leave flags and timer. It is NOT a reason
+            // to keep an ordinary hover note alive: when a row hover got stuck
+            // after a pin, this guard made every later hover note immortal, and
+            // the only escape was a click or leaving the window — which is
+            // exactly how the "delay after pinning" bug behaved.
+            if (this._lastBarHit) return;
+            if (pointerOverHoverPop()) return;
+            closeHover();
+            this._restoreHighlight();
         };
 
         // Called from the webview's ipc-message listener. A null hit means the
@@ -5094,6 +4665,29 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // popover after a short hover delay (later messages cancel the timer).
         this.handleBarHoverMessage = (webviewEl, hit) => {
             this._barWebview = webviewEl;
+            // Attach the focus safety net once per webview element. Coming back
+            // into the page is the moment any state left behind by our own
+            // chrome can be corrected, whatever caused it.
+            if (!webviewEl.__stepFocusHook) {
+                webviewEl.__stepFocusHook = true;
+                try {
+                    webviewEl.addEventListener("focus", () => {
+                        this._lastBarHit = null;
+                        this._pointerInPopover = false;
+                        this._syncBarHold();
+                        this._scheduleHoverClose();
+                    });
+                } catch (e) {}
+            }
+            // A report can only come from inside the webview, so the pointer is
+            // no longer over host chrome. The tracked host position is stale
+            // from wherever the pointer last sat in the plugin UI (typically the
+            // pin's X button), and pointerOverHoverPop() testing that old point
+            // kept a hover note alive for as long as its rectangle happened to
+            // cover it — which read as a multi-second delay after closing a
+            // pinned note with X. Over the page, only the popover enter/leave
+            // flag is trustworthy.
+            this._lastPointer = null;
             // Mid-drag the guest still reports whatever bar the box happens to
             // sit over; rebuilding or closing popovers then would move the box
             // out from under the pointer and kill the drag.
@@ -5101,26 +4695,28 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // Push highlight state into the guest: the verses stay lit while
             // the mouse is on the bar OR on the popover (guest can't see the
             // popover, the host bridges it).
-            const pushHighlight = (id) => {
-                webviewEl.executeJavaScript(`window.__stepHighlight && window.__stepHighlight(${JSON.stringify(id || "")})`).catch(() => {});
-            };
             if (!hit || (!hit.typed && !hit.overflow)) {
                 // Cancel any pending open: a timer that fires after the pointer
                 // has left would pop a note up with no bar hovered under it.
                 clearTimeout(this._barOpenTimer);
                 this._lastBarHit = null;
                 this._barHitOvf = false;
+                this._barHitOvfPage = "";
                 this._syncBarHold();
-                // While pinned, moving off the bar must not close the pinned
-                // note — but a transient hover note still goes away.
+                // Unlight on this tick, before any close timer runs.
+                this._restoreHighlight();
+                // Unlight and thin on this tick. openBarPopover is opened
+                // synchronously above, so a hover note the pointer is still on
+                // is kept by pointerOverHoverPop(); anything else is stale.
                 this._scheduleHoverClose();
                 return;
             }
             this._lastBarHit = hit;
             this._barHitOvf = !!hit.ovf;
+            this._barHitOvfPage = hit.page || "";
+            // Widens and lights together, on this tick.
             this._syncBarHold();
             clearTimeout(this._hoverCloseTimer);
-            pushHighlight(hit.id);
             // A pinned list for this page already stands for the lane. Hovering
             // the lane must not build a second one beside it: the new list
             // would take over `_ovfList`, stranding the pinned list on screen
@@ -5132,10 +4728,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 return;
             }
             // Already showing this bar (pinned or hovering): nothing to do.
-            if (this._pinnedPop && this._pinnedPop.id === hit.id) { closeHover(); return; }
-            if (this._hoverPop && this._hoverPop.id === hit.id) return;
+            // The lane id is the same in every panel, so compare its page too —
+            // otherwise panel two's lane would look like panel one's.
+            // Pages are compared for every bar, not just the lane: one note can
+            // have a bar in each panel, and hovering the second column's must
+            // not be mistaken for the note already open from the first.
+            const sameBar = (a) => a && a.id === hit.id
+                && (a.page || "") === (hit.page || "");
+            if (sameBar(this._pinnedPop)) { closeHover(); return; }
+            if (sameBar(this._hoverPop)) return;
             clearTimeout(this._barOpenTimer);
-            this._barOpenTimer = setTimeout(() => this.openBarPopover(webviewEl, hit, false), 150);
+            // Open on this tick: the widened bar, the lit text and the note
+            // are one event. A delayed open meant a bar could be left wide
+            // with no note, or a note could arrive after the pointer had gone.
+            this._barOpenTimer = null;
+            this.openBarPopover(webviewEl, hit, false);
         };
 
         // Click on a bar: pin the popover (stays put, movable, resizable)
@@ -5224,7 +4831,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             body.style.maxHeight = "45vh";
             body.style.overflow = "hidden";
 
-            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body };
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "" };
             if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
             else this._hoverPop = entry;
             this._barWebview = webviewEl;
@@ -5290,6 +4897,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 try { dispose(entry); } catch (e) {}
                 try { dispose(listEntry); } catch (e) {}
                 closeHover();
+                if (this._focusPage) this._focusPage();
             };
             closeBtn.addEventListener("click", (ev) => { ev.stopPropagation(); closeAll(); });
             listEntry.closeAll = closeAll;
@@ -5559,17 +5167,25 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!makePinned) {
                     // Alive while the pointer is on the bar, the row, or the
                     // note itself — and gone the moment it leaves all three.
-                    const inRect = (r, p) => p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
-                    const still = () => {
-                        const p = this._lastPointer;
-                        if (!p) return true;
-                        try {
-                            if (bar.isConnected && inRect(bar.getBoundingClientRect(), p)) return true;
-                            if (note.body && note.body.isConnected && inRect(note.body.getBoundingClientRect(), p)) return true;
-                            if (row.isConnected && inRect(row.getBoundingClientRect(), p)) return true;
-                        } catch (e) {}
-                        return false;
+                    // Presence is tracked with enter/leave flags, not a tracked
+                    // pointer point: while the cursor is over the guest page the
+                    // host never sees a mousemove, so a remembered host position
+                    // is stale and would either keep this note alive (if the old
+                    // point fell inside it) or kill it early.
+                    const over = { bar: false, row: false, body: false };
+                    const track = (el, key) => {
+                        if (!el) return;
+                        el.addEventListener("mouseenter", () => { over[key] = true; clearTimeout(ent.timer); });
+                        el.addEventListener("mouseleave", () => { over[key] = false; maybe(); });
                     };
+                    // A flag can only count while its element is still in the
+                    // document: a row torn down under a stationary cursor never
+                    // fires mouseleave, and a stuck `true` kept the note alive
+                    // forever (and, before the fix above, every ordinary hover
+                    // note with it).
+                    const still = () => (over.bar && bar.isConnected)
+                        || (over.row && row.isConnected)
+                        || (over.body && note.body && note.body.isConnected);
                     const maybe = () => {
                         clearTimeout(ent.timer);
                         ent.timer = window.setTimeout(() => {
@@ -5581,10 +5197,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         }, 90);
                     };
                     ent.maybe = maybe;
-                    bar.addEventListener("mouseenter", () => clearTimeout(ent.timer));
-                    bar.addEventListener("mouseleave", maybe);
-                    note.body.addEventListener("mouseenter", () => clearTimeout(ent.timer));
-                    note.body.addEventListener("mouseleave", maybe);
+                    track(bar, "bar");
+                    track(row, "row");
+                    track(note.body, "body");
+                    // A row scrolled out from under the pointer sends no
+                    // mouseleave; the scroll handler re-tests instead.
+                    const recheck = () => {
+                        over.row = !!row.isConnected && row.matches(":hover");
+                        over.bar = !!bar.isConnected && bar.matches(":hover");
+                        over.body = !!note.body && note.body.isConnected && note.body.matches(":hover");
+                        if (!still()) maybe();
+                    };
+                    listEl.addEventListener("scroll", recheck, { passive: true });
                 }
 
                 // Clicking the stretched bar pins that note; a pinned note is
@@ -5772,7 +5396,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
             // Register immediately: any later failure must still leave the
             // popover closeable (otherwise the X does nothing).
-            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, ovf: !!hit.ovf };
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, ovf: !!hit.ovf, page: hit.page || "" };
             entry.goToNote = goToNote;
             if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
             else this._hoverPop = entry;
@@ -6454,5 +6078,825 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             this.activePopover.parentNode.removeChild(this.activePopover);
         }
         console.log('STEP Bible Linker unloaded.');
+    }
+}
+
+// BIBLE INFORMATION ==========================================================================
+// Static reference data for the 66-book canon. Single source of truth for book order, book
+// names and abbreviations, chapter counts, per-chapter verse counts, and book overviews.
+// Callers use the class directly: BibleInformation.getMaxVerse("Genesis", 1).
+// ==========================================================================================
+class BibleInformation {
+    // Canonical book order (no spaces), used to compare references.
+    static _bookOrder = [
+        "Genesis",
+        "Exodus",
+        "Leviticus",
+        "Numbers",
+        "Deuteronomy",
+        "Joshua",
+        "Judges",
+        "Ruth",
+        "1Samuel",
+        "2Samuel",
+        "1Kings",
+        "2Kings",
+        "1Chronicles",
+        "2Chronicles",
+        "Ezra",
+        "Nehemiah",
+        "Esther",
+        "Job",
+        "Psalms",
+        "Proverbs",
+        "Ecclesiastes",
+        "Song",
+        "Isaiah",
+        "Jeremiah",
+        "Lamentations",
+        "Ezekiel",
+        "Daniel",
+        "Hosea",
+        "Joel",
+        "Amos",
+        "Obadiah",
+        "Jonah",
+        "Micah",
+        "Nahum",
+        "Habakkuk",
+        "Zephaniah",
+        "Haggai",
+        "Zechariah",
+        "Malachi",
+        "Matthew",
+        "Mark",
+        "Luke",
+        "John",
+        "Acts",
+        "Romans",
+        "1Corinthians",
+        "2Corinthians",
+        "Galatians",
+        "Ephesians",
+        "Philippians",
+        "Colossians",
+        "1Thessalonians",
+        "2Thessalonians",
+        "1Timothy",
+        "2Timothy",
+        "Titus",
+        "Philemon",
+        "Hebrews",
+        "James",
+        "1Peter",
+        "2Peter",
+        "1John",
+        "2John",
+        "3John",
+        "Jude",
+        "Revelation"
+    ];
+
+    // Per-chapter verse counts. Index 0 is a placeholder so that chapter N is arr[N],
+    // and the number of chapters in a book is arr.length - 1.
+    static _verseCounts = {
+        "Genesis": [0, 31, 25, 24, 26, 32, 22, 24, 22, 29, 32, 32, 20, 18, 24, 21, 16, 27, 33, 38, 18, 34, 24, 20, 67, 34, 35, 46, 22, 35, 43, 55, 32, 20, 31, 29, 43, 36, 30, 23, 23, 57, 38, 34, 34, 28, 34, 31, 22, 33, 26],
+        "Exodus": [0, 22, 25, 22, 31, 23, 30, 25, 32, 35, 29, 10, 51, 22, 31, 27, 36, 16, 27, 25, 26, 36, 31, 33, 18, 40, 37, 21, 43, 46, 38, 18, 35, 23, 35, 35, 38, 29, 31, 43, 38],
+        "Leviticus": [0, 17, 16, 17, 35, 19, 30, 38, 36, 24, 20, 47, 8, 59, 57, 33, 34, 16, 30, 37, 27, 24, 33, 44, 23, 55, 46, 34],
+        "Numbers": [0, 54, 34, 51, 49, 31, 27, 89, 26, 23, 36, 35, 16, 33, 45, 41, 50, 13, 32, 22, 29, 35, 41, 30, 25, 18, 65, 23, 31, 40, 16, 54, 42, 56, 29, 34, 13],
+        "Deuteronomy": [0, 46, 37, 29, 49, 33, 25, 26, 20, 29, 22, 32, 32, 18, 29, 23, 22, 20, 22, 21, 20, 23, 30, 25, 22, 19, 19, 26, 68, 29, 20, 30, 52, 29, 12],
+        "Joshua": [0, 18, 24, 17, 24, 15, 27, 26, 35, 27, 43, 23, 24, 33, 15, 63, 10, 18, 28, 51, 9, 45, 34, 16, 33],
+        "Judges": [0, 36, 23, 31, 24, 31, 40, 25, 35, 57, 18, 40, 15, 25, 20, 20, 31, 13, 31, 30, 48, 25],
+        "Ruth": [0, 22, 23, 18, 22],
+        "1Samuel": [0, 28, 36, 21, 22, 12, 21, 17, 22, 27, 27, 15, 25, 23, 52, 35, 23, 58, 30, 24, 42, 15, 23, 28, 23, 44, 25, 12, 25, 11, 31, 13],
+        "2Samuel": [0, 27, 32, 39, 12, 25, 23, 29, 18, 13, 19, 27, 31, 39, 33, 37, 23, 29, 33, 43, 26, 22, 51, 39, 25],
+        "1Kings": [0, 53, 46, 28, 34, 18, 38, 51, 66, 28, 29, 43, 33, 34, 31, 34, 34, 24, 46, 21, 43, 29, 53],
+        "2Kings": [0, 18, 25, 27, 44, 27, 33, 20, 29, 37, 36, 21, 21, 25, 29, 38, 20, 41, 37, 37, 21, 26, 20, 37, 20, 30],
+        "1Chronicles": [0, 54, 55, 24, 43, 26, 81, 40, 40, 44, 14, 47, 40, 14, 17, 29, 43, 27, 17, 19, 8, 30, 19, 32, 31, 31, 32, 34, 21, 30],
+        "2Chronicles": [0, 17, 18, 17, 22, 14, 42, 22, 18, 31, 19, 23, 16, 22, 15, 19, 14, 19, 34, 11, 37, 20, 12, 21, 27, 28, 23, 9, 27, 36, 27, 21, 33, 25, 33, 27, 23],
+        "Ezra": [0, 11, 70, 13, 24, 17, 22, 28, 36, 15, 44],
+        "Nehemiah": [0, 11, 20, 32, 23, 19, 19, 73, 18, 38, 39, 36, 47, 31],
+        "Esther": [0, 22, 23, 15, 17, 14, 14, 10, 17, 32, 3],
+        "Job": [0, 22, 13, 26, 21, 27, 30, 21, 22, 35, 22, 20, 25, 28, 22, 35, 22, 16, 21, 29, 34, 30, 17, 25, 6, 14, 23, 28, 25, 31, 40, 22, 33, 37, 16, 33, 24, 41, 30, 32, 26, 17, 17],
+        "Psalms": [0, 6, 12, 8, 8, 12, 10, 17, 9, 20, 18, 7, 9, 6, 7, 5, 11, 15, 50, 14, 9, 13, 31, 6, 10, 22, 12, 14, 9, 11, 12, 24, 11, 22, 22, 28, 12, 40, 22, 13, 17, 13, 11, 5, 26, 17, 11, 9, 14, 20, 23, 19, 9, 6, 7, 23, 13, 11, 11, 17, 12, 8, 12, 11, 10, 13, 20, 7, 35, 36, 5, 24, 20, 28, 23, 10, 12, 20, 72, 13, 19, 16, 8, 18, 12, 13, 17, 7, 18, 52, 17, 16, 15, 5, 23, 11, 13, 12, 9, 9, 5, 8, 28, 22, 35, 45, 48, 43, 13, 31, 7, 10, 10, 9, 8, 18, 19, 2, 29, 176, 7, 8, 9, 4, 8, 5, 6, 5, 6, 8, 8, 3, 18, 3, 3, 21, 26, 9, 8, 24, 13, 10, 7, 12, 15, 21, 10, 20, 14, 9, 6],
+        "Proverbs": [0, 33, 22, 35, 27, 23, 35, 27, 36, 18, 32, 31, 28, 25, 35, 33, 33, 28, 24, 29, 30, 31, 29, 35, 34, 28, 28, 27, 28, 27, 33, 31],
+        "Ecclesiastes": [0, 18, 26, 22, 16, 20, 12, 29, 17, 18, 20, 10, 14],
+        "Song": [0, 17, 17, 11, 16, 16, 13, 13, 14],
+        "Isaiah": [0, 31, 22, 26, 6, 30, 13, 25, 22, 21, 34, 16, 6, 22, 32, 9, 14, 14, 7, 25, 6, 17, 25, 18, 23, 12, 21, 13, 29, 24, 33, 9, 20, 24, 17, 10, 22, 38, 22, 8, 31, 29, 25, 28, 28, 25, 13, 15, 22, 26, 11, 23, 15, 12, 17, 13, 12, 21, 14, 21, 22, 11, 12, 19, 12, 25, 24],
+        "Jeremiah": [0, 19, 37, 25, 31, 31, 30, 34, 22, 26, 25, 23, 17, 27, 22, 21, 21, 27, 23, 15, 18, 14, 30, 40, 10, 38, 24, 22, 17, 32, 24, 40, 44, 26, 22, 19, 32, 21, 28, 18, 16, 18, 22, 13, 30, 5, 28, 7, 47, 39, 46, 64, 34],
+        "Lamentations": [0, 22, 22, 66, 22, 22],
+        "Ezekiel": [0, 28, 10, 27, 17, 17, 14, 27, 27, 11, 22, 25, 28, 23, 23, 8, 63, 24, 32, 14, 49, 32, 31, 49, 27, 17, 21, 36, 26, 21, 26, 18, 32, 33, 31, 15, 38, 28, 23, 29, 49, 26, 20, 27, 31, 25, 24, 23, 35],
+        "Daniel": [0, 21, 49, 30, 37, 31, 28, 28, 27, 27, 21, 45, 13],
+        "Hosea": [0, 11, 23, 5, 19, 15, 11, 16, 14, 17, 15, 11, 15, 15, 10],
+        "Joel": [0, 20, 32, 21],
+        "Amos": [0, 15, 16, 15, 13, 27, 14, 17, 14, 15],
+        "Obadiah": [0, 21],
+        "Jonah": [0, 17, 10, 10, 11],
+        "Micah": [0, 16, 13, 12, 13, 15, 16, 20],
+        "Nahum": [0, 15, 13, 19],
+        "Habakkuk": [0, 17, 20, 19],
+        "Zephaniah": [0, 18, 15, 20],
+        "Haggai": [0, 15, 23],
+        "Zechariah": [0, 21, 13, 10, 14, 11, 15, 14, 23, 17, 12, 17, 14, 9, 21],
+        "Malachi": [0, 14, 17, 18, 6],
+        "Matthew": [0, 25, 23, 17, 25, 48, 34, 29, 34, 38, 42, 30, 50, 58, 36, 39, 28, 27, 35, 30, 34, 46, 46, 39, 51, 46, 75, 66, 20],
+        "Mark": [0, 45, 28, 35, 41, 43, 56, 37, 38, 50, 52, 33, 44, 37, 72, 47, 20],
+        "Luke": [0, 80, 52, 38, 44, 39, 49, 50, 56, 62, 42, 54, 59, 35, 35, 32, 31, 37, 43, 48, 47, 38, 71, 56, 53],
+        "John": [0, 51, 25, 36, 54, 47, 71, 53, 59, 41, 42, 57, 50, 38, 31, 27, 33, 26, 40, 42, 31, 25],
+        "Acts": [0, 26, 47, 26, 37, 42, 15, 60, 40, 43, 48, 30, 25, 52, 28, 41, 40, 34, 28, 41, 38, 40, 30, 35, 27, 27, 32, 44, 31],
+        "Romans": [0, 32, 29, 31, 25, 21, 23, 25, 39, 33, 21, 36, 21, 14, 23, 33, 27],
+        "1Corinthians": [0, 31, 16, 23, 21, 13, 20, 40, 13, 27, 33, 34, 31, 13, 40, 58, 24],
+        "2Corinthians": [0, 24, 17, 18, 18, 21, 18, 16, 24, 15, 18, 33, 21, 14],
+        "Galatians": [0, 24, 21, 29, 31, 26, 18],
+        "Ephesians": [0, 23, 22, 21, 32, 33, 24],
+        "Philippians": [0, 30, 30, 21, 23],
+        "Colossians": [0, 29, 23, 25, 18],
+        "1Thessalonians": [0, 10, 20, 13, 18, 28],
+        "2Thessalonians": [0, 12, 17, 18],
+        "1Timothy": [0, 20, 15, 16, 16, 25, 21],
+        "2Timothy": [0, 18, 26, 17, 22],
+        "Titus": [0, 16, 15, 15],
+        "Philemon": [0, 25],
+        "Hebrews": [0, 14, 18, 19, 16, 14, 20, 28, 13, 28, 39, 40, 29, 25],
+        "James": [0, 27, 26, 18, 17, 20],
+        "1Peter": [0, 25, 25, 22, 19, 14],
+        "2Peter": [0, 21, 22, 18],
+        "1John": [0, 10, 29, 24, 21, 21],
+        "2John": [0, 13],
+        "3John": [0, 15],
+        "Jude": [0, 25],
+        "Revelation": [0, 20, 29, 22, 11, 14, 17, 17, 13, 21, 11, 19, 17, 18, 20, 8, 21, 18, 24, 21, 15, 27, 21]
+    };
+
+    // Book names and accepted abbreviations.
+    static _bookIndex = {
+        "en": [
+            { bookName: "Genesis", abbreviations: ["Gen", "Ge", "Gn"] },
+            { bookName: "Exodus", abbreviations: ["Exod", "Ex"] },
+            { bookName: "Leviticus", abbreviations: ["Lev", "Lv", "Le"] },
+            { bookName: "Numbers", abbreviations: ["Num", "Nm", "Nu"] },
+            { bookName: "Deuteronomy", abbreviations: ["Deut", "Dt", "De", "Du"] },
+            { bookName: "Joshua", abbreviations: ["Josh", "Jos", "Jo"] },
+            { bookName: "Judges", abbreviations: ["Judg", "Jdg", "Jgs"] },
+            { bookName: "Ruth", abbreviations: ["Ruth", "Ru"] },
+            { bookName: "1 Samuel", abbreviations: ["1 Sam", "1Sm", "1Sa"] },
+            { bookName: "2 Samuel", abbreviations: ["2 Sam", "2Sm", "2Sa"] },
+            { bookName: "1 Kings", abbreviations: ["1 Kgs", "1Kg", "1Ki"] },
+            { bookName: "2 Kings", abbreviations: ["2 Kgs", "2Kg", "2Ki"] },
+            { bookName: "1 Chronicles", abbreviations: ["1 Chr", "1 Chron", "1Ch"] },
+            { bookName: "2 Chronicles", abbreviations: ["2 Chr", "2 Chron", "2Ch"] },
+            { bookName: "Ezra", abbreviations: ["Ezra", "Ezr"] },
+            { bookName: "Nehemiah", abbreviations: ["Neh", "Ne"] },
+            { bookName: "Esther", abbreviations: ["Esth", "Est", "Es"] },
+            { bookName: "Job", abbreviations: ["Job", "Jb"] },
+            { bookName: "Psalms", abbreviations: ["Ps", "Pss", "Psalm"] },
+            { bookName: "Proverbs", abbreviations: ["Prov", "Prv", "Pr"] },
+            { bookName: "Ecclesiastes", abbreviations: ["Qoheleth", "Eccl", "Eccles", "Ec", "Qoh"] },
+            { bookName: "Song", abbreviations: ["Song", "SS", "So", "Sg", "Song of Solomon", "SongofSongs"] },
+            { bookName: "Isaiah", abbreviations: ["Isa", "Is"] },
+            { bookName: "Jeremiah", abbreviations: ["Jer", "Je"] },
+            { bookName: "Lamentations", abbreviations: ["Lam", "La"] },
+            { bookName: "Ezekiel", abbreviations: ["Ezek", "Ezk", "Ez"] },
+            { bookName: "Daniel", abbreviations: ["Dan", "Dn", "Da"] },
+            { bookName: "Hosea", abbreviations: ["Hos", "Ho"] },
+            { bookName: "Joel", abbreviations: ["Joel", "Joe", "Jl"] },
+            { bookName: "Amos", abbreviations: ["Amos", "Am"] },
+            { bookName: "Obadiah", abbreviations: ["Obad", "Ob"] },
+            { bookName: "Jonah", abbreviations: ["Jonah", "Jon"] },
+            { bookName: "Micah", abbreviations: ["Mic", "Mi"] },
+            { bookName: "Nahum", abbreviations: ["Nah", "Na"] },
+            { bookName: "Habakkuk", abbreviations: ["Hab", "Hb"] },
+            { bookName: "Zephaniah", abbreviations: ["Zeph", "Zep"] },
+            { bookName: "Haggai", abbreviations: ["Hag", "Hg"] },
+            { bookName: "Zechariah", abbreviations: ["Zech", "Zec"] },
+            { bookName: "Malachi", abbreviations: ["Mal", "Ml"] },
+            { bookName: "Matthew", abbreviations: ["Matt", "Mat", "Mt"] },
+            { bookName: "Mark", abbreviations: ["Mark", "Mar", "Mk"] },
+            { bookName: "Luke", abbreviations: ["Luke", "Lk", "Lu"] },
+            { bookName: "John", abbreviations: ["John", "Jn", "Jo"] },
+            { bookName: "Acts", abbreviations: ["Acts", "Ac"] },
+            { bookName: "Romans", abbreviations: ["Rom", "Rm", "Ro"] },
+            { bookName: "1 Corinthians", abbreviations: ["1 Cor", "1 Co", "1C"] },
+            { bookName: "2 Corinthians", abbreviations: ["2 Cor", "2 Co", "2C"] },
+            { bookName: "Galatians", abbreviations: ["Gal", "Ga"] },
+            { bookName: "Ephesians", abbreviations: ["Eph", "Ep"] },
+            { bookName: "Philippians", abbreviations: ["Phil", "Php"] },
+            { bookName: "Colossians", abbreviations: ["Col", "Co"] },
+            { bookName: "1 Thessalonians", abbreviations: ["1 Thess", "1 Thes", "1Th"] },
+            { bookName: "2 Thessalonians", abbreviations: ["2 Thess", "2 Thes", "2Th"] },
+            { bookName: "1 Timothy", abbreviations: ["1 Tim", "1 Tm", "1 Ti", "1T"] },
+            { bookName: "2 Timothy", abbreviations: ["2 Tim", "2 Tm", "2 Ti", "2T"] },
+            { bookName: "Titus", abbreviations: ["Titus", "Tit", "Ti"] },
+            { bookName: "Philemon", abbreviations: ["Phlm", "Philem", "Phm"] },
+            { bookName: "Hebrews", abbreviations: ["Heb", "He"] },
+            { bookName: "James", abbreviations: ["Jas", "Ja"] },
+            { bookName: "1 Peter", abbreviations: ["1 Pet", "1Pet", "1peter", "1 Pt", "1P"] },
+            { bookName: "2 Peter", abbreviations: ["2 Pet", "2Pet", "2peter", "2 Pt", "2P"] },
+            { bookName: "1 John", abbreviations: ["1 John", "1 Jn", "1 Jo", "1J"] },
+            { bookName: "2 John", abbreviations: ["2 John", "2 Jn", "2 Jo", "2J"] },
+            { bookName: "3 John", abbreviations: ["3 John", "3 Jn", "3 Jo", "3J"] },
+            { bookName: "Jude", abbreviations: ["Jude", "Ju"] },
+            { bookName: "Revelation", abbreviations: ["Rev", "Re", "Rv"] }
+        ]
+    };
+
+    // Short reference notes per book, shown when only a book is referenced.
+    static _overviews = {
+        // PENTATEUCH
+        "Genesis": {
+            name: "Genesis",
+            chapters: 50,
+            author: "Moses",
+            location: "Wilderness (likely during Israel’s wanderings)",
+            date: "c. 1446–1406 BC",
+            synopsis: "Creation, the fall, the flood, and God’s covenant with Abraham, Isaac, Jacob, and Joseph."
+        },
+        "Exodus": {
+            name: "Exodus",
+            chapters: 40,
+            author: "Moses",
+            location: "Wilderness (Sinai region)",
+            date: "c. 1446–1406 BC",
+            synopsis: "God delivers Israel from Egypt, gives the Law, and instructs them to build the tabernacle."
+        },
+        "Leviticus": {
+            name: "Leviticus",
+            chapters: 27,
+            author: "Moses",
+            location: "Mount Sinai",
+            date: "c. 1446–1406 BC",
+            synopsis: "Laws for sacrifices, priesthood, purity, and holiness for Israel’s worship and daily life."
+        },
+        "Numbers": {
+            name: "Numbers",
+            chapters: 36,
+            author: "Moses",
+            location: "Wilderness (Sinai to Moab)",
+            date: "c. 1446–1406 BC",
+            synopsis: "Censuses, wilderness wanderings, rebellions, and God’s faithful guidance toward the Promised Land."
+        },
+        "Deuteronomy": {
+            name: "Deuteronomy",
+            chapters: 34,
+            author: "Moses",
+            location: "Plains of Moab",
+            date: "c. 1406 BC",
+            synopsis: "Moses’ final sermons, reviewing the Law and calling Israel to covenant faithfulness before entering Canaan."
+        },
+
+        // HISTORICAL (OT)
+        "Joshua": {
+            name: "Joshua",
+            chapters: 24,
+            author: "Joshua (with later editorial additions)",
+            location: "Canaan",
+            date: "c. 1406–1375 BC",
+            synopsis: "Israel’s conquest and division of the Promised Land under Joshua’s leadership."
+        },
+        "Judges": {
+            name: "Judges",
+            chapters: 21,
+            author: "Traditionally Samuel",
+            location: "Israel",
+            date: "c. 1050–1000 BC",
+            synopsis: "Cycles of Israel’s sin, oppression, crying out, and deliverance through God‑raised judges."
+        },
+        "Ruth": {
+            name: "Ruth",
+            chapters: 4,
+            author: "Traditionally Samuel",
+            location: "Israel (Bethlehem)",
+            date: "c. 1100–1000 BC (events earlier, in the time of the judges)",
+            synopsis: "A Moabite woman’s loyalty leads to blessing and her inclusion in the line of David and Christ."
+        },
+        "1Samuel": {
+            name: "1 Samuel",
+            chapters: 31,
+            author: "Traditionally Samuel, with later prophets (Nathan, Gad)",
+            location: "Israel",
+            date: "c. 1050–1000 BC",
+            synopsis: "Transition from judges to monarchy: Samuel, Saul’s rise and fall, and David’s anointing."
+        },
+        "2Samuel": {
+            name: "2 Samuel",
+            chapters: 24,
+            author: "Traditionally Nathan, Gad, and other court prophets",
+            location: "Israel (Jerusalem)",
+            date: "c. 1000–960 BC",
+            synopsis: "David’s reign, his victories, sins, family turmoil, and God’s covenant promise to his house."
+        },
+        "1Kings": {
+            name: "1 Kings",
+            chapters: 22,
+            author: "Unknown, traditionally a prophetic historian",
+            location: "Israel/Judah (likely during exile)",
+            date: "c. 560–540 BC",
+            synopsis: "Solomon’s reign, the kingdom’s division, and the early history of Israel and Judah’s kings."
+        },
+        "2Kings": {
+            name: "2 Kings",
+            chapters: 25,
+            author: "Unknown, traditionally a prophetic historian",
+            location: "Exilic context (Babylon)",
+            date: "c. 560–540 BC",
+            synopsis: "The decline of Israel and Judah, leading to the fall of Samaria and Jerusalem and exile."
+        },
+        "1Chronicles": {
+            name: "1 Chronicles",
+            chapters: 29,
+            author: "Unknown, traditionally Ezra",
+            location: "Post‑exilic Judah",
+            date: "c. 450–400 BC",
+            synopsis: "Genealogies and a retelling of David’s reign with focus on worship and the temple."
+        },
+        "2Chronicles": {
+            name: "2 Chronicles",
+            chapters: 36,
+            author: "Unknown, traditionally Ezra",
+            location: "Post‑exilic Judah",
+            date: "c. 450–400 BC",
+            synopsis: "History of Judah’s kings, temple worship, and the fall of Jerusalem, ending with Cyrus’ decree."
+        },
+        "Ezra": {
+            name: "Ezra",
+            chapters: 10,
+            author: "Ezra",
+            location: "Babylon and Jerusalem",
+            date: "c. 458–440 BC",
+            synopsis: "Return from exile, rebuilding the temple, and Ezra’s reforms to restore covenant faithfulness."
+        },
+        "Nehemiah": {
+            name: "Nehemiah",
+            chapters: 13,
+            author: "Nehemiah (with possible editorial additions)",
+            location: "Susa and Jerusalem",
+            date: "c. 445–430 BC",
+            synopsis: "Rebuilding Jerusalem’s walls and renewing the people’s commitment to God’s Law."
+        },
+        "Esther": {
+            name: "Esther",
+            chapters: 10,
+            author: "Unknown (possibly a Persian‑period Jew)",
+            location: "Persian Empire (Susa)",
+            date: "c. 460–430 BC",
+            synopsis: "God’s providential preservation of the Jews through Esther and Mordecai in Persia."
+        },
+
+        // POETRY / WISDOM
+        "Job": {
+            name: "Job",
+            chapters: 42,
+            author: "Unknown (possibly early patriarchal era)",
+            location: "Land of Uz",
+            date: "Possibly second millennium BC (patriarchal period)",
+            synopsis: "A righteous man’s suffering, dialogues on God’s justice, and God’s sovereign answer from the whirlwind."
+        },
+        "Psalms": {
+            name: "Psalms",
+            chapters: 150,
+            author: "Multiple (David, Asaph, sons of Korah, others)",
+            location: "Israel",
+            date: "c. 1000–400 BC (compiled over centuries)",
+            synopsis: "A collection of prayers, songs, and praises expressing the full range of human experience before God."
+        },
+        "Proverbs": {
+            name: "Proverbs",
+            chapters: 31,
+            author: "Primarily Solomon, with other wise men",
+            location: "Israel",
+            date: "c. 970–700 BC (compiled)",
+            synopsis: "Short sayings and teachings on wise living in the fear of the Lord."
+        },
+        "Ecclesiastes": {
+            name: "Ecclesiastes",
+            chapters: 12,
+            author: "Traditionally Solomon (“Qoheleth”)",
+            location: "Jerusalem",
+            date: "c. 950–930 BC",
+            synopsis: "Reflections on life’s vanity apart from God and the call to fear God and keep His commandments."
+        },
+        "Song": {
+            name: "Song",
+            chapters: 8,
+            author: "Solomon",
+            location: "Israel",
+            date: "c. 950–930 BC",
+            synopsis: "A poetic celebration of marital love, often seen as reflecting God’s love for His people."
+        },
+
+        // MAJOR PROPHETS
+        "Isaiah": {
+            name: "Isaiah",
+            chapters: 66,
+            author: "Isaiah son of Amoz",
+            location: "Jerusalem",
+            date: "c. 740–680 BC",
+            synopsis: "Prophecies of judgment and hope, including strong messianic promises and visions of future restoration."
+        },
+        "Jeremiah": {
+            name: "Jeremiah",
+            chapters: 52,
+            author: "Jeremiah the prophet",
+            location: "Jerusalem (later Egypt)",
+            date: "c. 627–580 BC",
+            synopsis: "Warnings of coming judgment on Judah, calls to repentance, and promises of a new covenant."
+        },
+        "Lamentations": {
+            name: "Lamentations",
+            chapters: 5,
+            author: "Traditionally Jeremiah",
+            location: "Jerusalem (after its fall)",
+            date: "c. 586–580 BC",
+            synopsis: "Poetic laments over the destruction of Jerusalem, mingled with hope in God’s steadfast love."
+        },
+        "Ezekiel": {
+            name: "Ezekiel",
+            chapters: 48,
+            author: "Ezekiel the priest‑prophet",
+            location: "Babylon (among the exiles)",
+            date: "c. 593–571 BC",
+            synopsis: "Visions of God’s glory, judgment on Israel and the nations, and future restoration and a new temple."
+        },
+        "Daniel": {
+            name: "Daniel",
+            chapters: 12,
+            author: "Daniel",
+            location: "Babylon and Persia",
+            date: "c. 605–536 BC",
+            synopsis: "Narratives of faith in exile and apocalyptic visions of future kingdoms and God’s ultimate rule."
+        },
+
+        // MINOR PROPHETS
+        "Hosea": {
+            name: "Hosea",
+            chapters: 14,
+            author: "Hosea",
+            location: "Northern Kingdom (Israel)",
+            date: "c. 755–715 BC",
+            synopsis: "Hosea’s marriage illustrates God’s faithful love toward an unfaithful people."
+        },
+        "Joel": {
+            name: "Joel",
+            chapters: 3,
+            author: "Joel",
+            location: "Judah",
+            date: "c. 835–800 BC (conservative estimate)",
+            synopsis: "A locust plague foreshadows the day of the Lord and God’s promise to pour out His Spirit."
+        },
+        "Amos": {
+            name: "Amos",
+            chapters: 9,
+            author: "Amos, a shepherd from Tekoa",
+            location: "Judah and Israel",
+            date: "c. 760–750 BC",
+            synopsis: "Oracles of judgment against social injustice and religious hypocrisy, with a promise of restoration."
+        },
+        "Obadiah": {
+            name: "Obadiah",
+            chapters: 1,
+            author: "Obadiah",
+            location: "Judah",
+            date: "c. 586–550 BC",
+            synopsis: "Judgment on Edom for its pride and violence, and the future triumph of the Lord’s kingdom."
+        },
+        "Jonah": {
+            name: "Jonah",
+            chapters: 4,
+            author: "Traditionally Jonah",
+            location: "Israel and Nineveh",
+            date: "c. 780–760 BC",
+            synopsis: "A reluctant prophet is sent to Nineveh, revealing God’s compassion for repentant sinners."
+        },
+        "Micah": {
+            name: "Micah",
+            chapters: 7,
+            author: "Micah",
+            location: "Judah",
+            date: "c. 740–700 BC",
+            synopsis: "Judgment on Samaria and Jerusalem, with promises of a coming ruler from Bethlehem."
+        },
+        "Nahum": {
+            name: "Nahum",
+            chapters: 3,
+            author: "Nahum",
+            location: "Judah",
+            date: "c. 663–612 BC",
+            synopsis: "Prophecy of Nineveh’s fall, showing God’s justice against oppressive nations."
+        },
+        "Habakkuk": {
+            name: "Habakkuk",
+            chapters: 3,
+            author: "Habakkuk",
+            location: "Judah",
+            date: "c. 620–600 BC",
+            synopsis: "A dialogue with God about evil and injustice, concluding with trust in God’s sovereign plan."
+        },
+        "Zephaniah": {
+            name: "Zephaniah",
+            chapters: 3,
+            author: "Zephaniah",
+            location: "Judah",
+            date: "c. 640–620 BC",
+            synopsis: "Warnings of the day of the Lord and promises of purification and restoration for a humble remnant."
+        },
+        "Haggai": {
+            name: "Haggai",
+            chapters: 2,
+            author: "Haggai",
+            location: "Jerusalem",
+            date: "520 BC",
+            synopsis: "Calls the returned exiles to rebuild the temple and promises God’s future glory."
+        },
+        "Zechariah": {
+            name: "Zechariah",
+            chapters: 14,
+            author: "Zechariah",
+            location: "Jerusalem",
+            date: "c. 520–518 BC (visions) and later oracles",
+            synopsis: "Visions and prophecies encouraging the rebuilding of the temple and pointing to the coming Messiah."
+        },
+        "Malachi": {
+            name: "Malachi",
+            chapters: 4,
+            author: "Malachi",
+            location: "Post‑exilic Judah",
+            date: "c. 460–430 BC",
+            synopsis: "Confronts spiritual apathy and promises a coming messenger before the day of the Lord."
+        },
+
+        // GOSPELS
+        "Matthew": {
+            name: "Matthew",
+            chapters: 28,
+            author: "Matthew the apostle",
+            location: "Likely Syria or Palestine",
+            date: "c. AD 50–65",
+            synopsis: "Presents Jesus as the promised Messiah and King, fulfilling Old Testament prophecy."
+        },
+        "Mark": {
+            name: "Mark",
+            chapters: 16,
+            author: "John Mark (associate of Peter)",
+            location: "Likely Rome",
+            date: "c. AD 50–60",
+            synopsis: "A fast‑paced account of Jesus’ ministry, emphasizing His authority and servanthood."
+        },
+        "Luke": {
+            name: "Luke",
+            chapters: 24,
+            author: "Luke the physician",
+            location: "Likely Greece or Syria",
+            date: "c. AD 60–62",
+            synopsis: "An orderly narrative of Jesus’ life, highlighting His compassion for the marginalized."
+        },
+        "John": {
+            name: "John",
+            chapters: 21,
+            author: "John the apostle",
+            location: "Likely Ephesus",
+            date: "c. AD 80–90",
+            synopsis: "Emphasizes Jesus as the eternal Son of God, that readers may believe and have life in His name."
+        },
+
+        // ACTS
+        "Acts": {
+            name: "Acts",
+            chapters: 28,
+            author: "Luke",
+            location: "Likely Rome",
+            date: "c. AD 62",
+            synopsis: "The spread of the gospel from Jerusalem to Rome through the apostles, especially Peter and Paul."
+        },
+
+        // PAULINE EPISTLES
+        "Romans": {
+            name: "Romans",
+            chapters: 16,
+            author: "Paul",
+            location: "Corinth",
+            date: "c. AD 56–57",
+            synopsis: "A systematic exposition of the gospel, justification by faith, and life in Christ."
+        },
+        "1Corinthians": {
+            name: "1 Corinthians",
+            chapters: 16,
+            author: "Paul",
+            location: "Ephesus",
+            date: "c. AD 54–55",
+            synopsis: "Addresses church divisions, immorality, spiritual gifts, and the resurrection."
+        },
+        "2Corinthians": {
+            name: "2 Corinthians",
+            chapters: 13,
+            author: "Paul",
+            location: "Macedonia",
+            date: "c. AD 55–56",
+            synopsis: "Defends Paul’s ministry and highlights God’s power in weakness and generous giving."
+        },
+        "Galatians": {
+            name: "Galatians",
+            chapters: 6,
+            author: "Paul",
+            location: "Likely Antioch or Corinth",
+            date: "c. AD 48–55 (early letter)",
+            synopsis: "Defends justification by faith alone against legalism and insists on freedom in Christ."
+        },
+        "Ephesians": {
+            name: "Ephesians",
+            chapters: 6,
+            author: "Paul",
+            location: "Imprisonment (likely Rome)",
+            date: "c. AD 60–62",
+            synopsis: "Explores the believer’s position in Christ and the unity and conduct of the church."
+        },
+        "Philippians": {
+            name: "Philippians",
+            chapters: 4,
+            author: "Paul",
+            location: "Imprisonment (likely Rome)",
+            date: "c. AD 60–62",
+            synopsis: "A joyful letter encouraging humility, unity, and rejoicing in Christ in all circumstances."
+        },
+        "Colossians": {
+            name: "Colossians",
+            chapters: 4,
+            author: "Paul",
+            location: "Imprisonment (likely Rome)",
+            date: "c. AD 60–62",
+            synopsis: "Affirms Christ’s supremacy over all creation and warns against false teaching."
+        },
+        "1Thessalonians": {
+            name: "1 Thessalonians",
+            chapters: 5,
+            author: "Paul",
+            location: "Corinth",
+            date: "c. AD 50–51",
+            synopsis: "Encourages a young church in faith, love, hope, and readiness for Christ’s return."
+        },
+        "2Thessalonians": {
+            name: "2 Thessalonians",
+            chapters: 3,
+            author: "Paul",
+            location: "Corinth",
+            date: "c. AD 51–52",
+            synopsis: "Clarifies teaching about the day of the Lord and exhorts believers to steadfastness and work."
+        },
+        "1Timothy": {
+            name: "1 Timothy",
+            chapters: 6,
+            author: "Paul",
+            location: "Macedonia",
+            date: "c. AD 62–64",
+            synopsis: "Instructions to Timothy on church leadership, sound doctrine, and godly living."
+        },
+        "2Timothy": {
+            name: "2 Timothy",
+            chapters: 4,
+            author: "Paul",
+            location: "Imprisonment in Rome",
+            date: "c. AD 64–67",
+            synopsis: "Paul’s final letter, urging Timothy to endure, preach the Word, and remain faithful."
+        },
+        "Titus": {
+            name: "Titus",
+            chapters: 3,
+            author: "Paul",
+            location: "Possibly Macedonia or Nicopolis",
+            date: "c. AD 62–64",
+            synopsis: "Guidance for appointing elders and promoting sound doctrine and good works in Crete."
+        },
+        "Philemon": {
+            name: "Philemon",
+            chapters: 1,
+            author: "Paul",
+            location: "Imprisonment (likely Rome)",
+            date: "c. AD 60–62",
+            synopsis: "A personal appeal for Onesimus, a runaway slave, to be received as a brother in Christ."
+        },
+
+        // GENERAL EPISTLES
+        "Hebrews": {
+            name: "Hebrews",
+            chapters: 13,
+            author: "Unknown (traditionally Paul or a close associate)",
+            location: "Unknown",
+            date: "c. AD 60–70",
+            synopsis: "Shows Christ’s superiority over all and encourages perseverance in faith amid persecution."
+        },
+        "James": {
+            name: "James",
+            chapters: 5,
+            author: "James, the brother of Jesus",
+            location: "Jerusalem",
+            date: "c. AD 44–49",
+            synopsis: "Practical teaching on living out genuine faith through works and godly wisdom."
+        },
+        "1Peter": {
+            name: "1 Peter",
+            chapters: 5,
+            author: "Peter the apostle",
+            location: "“Babylon” (likely Rome)",
+            date: "c. AD 62–64",
+            synopsis: "Encourages suffering believers with hope, holiness, and the example of Christ."
+        },
+        "2Peter": {
+            name: "2 Peter",
+            chapters: 3,
+            author: "Peter the apostle",
+            location: "Likely Rome",
+            date: "c. AD 64–67",
+            synopsis: "Warns against false teachers and reminds believers of Christ’s promised return."
+        },
+        "1John": {
+            name: "1 John",
+            chapters: 5,
+            author: "John the apostle",
+            location: "Likely Ephesus",
+            date: "c. AD 85–95",
+            synopsis: "Assures believers of eternal life and emphasizes love, obedience, and true doctrine."
+        },
+        "2John": {
+            name: "2 John",
+            chapters: 1,
+            author: "John the apostle",
+            location: "Likely Ephesus",
+            date: "c. AD 85–95",
+            synopsis: "A brief letter urging love and truth while rejecting false teachers."
+        },
+        "3John": {
+            name: "3 John",
+            chapters: 1,
+            author: "John the apostle",
+            location: "Likely Ephesus",
+            date: "c. AD 85–95",
+            synopsis: "Commends Gaius for hospitality and warns against Diotrephes’ pride and opposition."
+        },
+        "Jude": {
+            name: "Jude",
+            chapters: 1,
+            author: "Jude, the brother of James",
+            location: "Unknown",
+            date: "c. AD 65–80",
+            synopsis: "Urges believers to contend for the faith against false teachers and to remain in God’s love."
+        },
+
+        // REVELATION
+        "Revelation": {
+            name: "Revelation",
+            chapters: 22,
+            author: "John the apostle",
+            location: "Island of Patmos",
+            date: "c. AD 95–96",
+            synopsis: "Apocalyptic visions revealing Christ’s ultimate victory, final judgment, and the new creation."
+        }
+    };
+
+    static _flatMap = null;
+
+    // Canonical book order, e.g. for comparing two references' positions.
+    static getBookOrder() {
+        return BibleInformation._bookOrder;
+    }
+
+    // Flat lookup map: "1 peter" → "1Peter", "ps" → "Psalms", "song of solomon" → "Song".
+    static getBookMap() {
+        if (!BibleInformation._flatMap) {
+            const flatMap = {};
+            for (const item of BibleInformation._bookIndex.en) {
+                const standardName = item.bookName.trim();
+                flatMap[standardName.toLowerCase()] = standardName;
+                item.abbreviations.forEach(abbr => {
+                    flatMap[abbr.replace(/\s+/g, ' ').trim().toLowerCase()] = standardName;
+                });
+            }
+            BibleInformation._flatMap = flatMap;
+        }
+        return BibleInformation._flatMap;
+    }
+
+    // Verse counts for a book, or null if the book is unknown.
+    static _chapterVerses(book) {
+        if (!book) return null;
+        return BibleInformation._verseCounts[String(book).replace(/\s+/g, '')] || null;
+    }
+
+    // Number of chapters in a book, derived from the verse counts. Null if unknown.
+    static getMaxChapter(book) {
+        const arr = BibleInformation._chapterVerses(book);
+        return arr ? arr.length - 1 : null;
+    }
+
+    // Number of verses in a chapter. Null if the book or chapter is unknown.
+    static getMaxVerse(book, chapter) {
+        const arr = BibleInformation._chapterVerses(book);
+        if (!arr) return null;
+        if (chapter < 1 || chapter >= arr.length) return null;
+        return arr[chapter];
+    }
+
+    // Overview for a book (name, chapters, author, location, date, synopsis). Null if unknown.
+    static getBookOverview(book) {
+        if (!book) return null;
+        return BibleInformation._overviews[book] || null;
     }
 }

@@ -1,10 +1,8 @@
-const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder, setIcon } = require('obsidian');
+const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder, setIcon } = require('obsidian');
 
 //SETTINGS ======================================================================
 /**
  * @typedef {Object} StepBibleLinkerSettings
- * @property {boolean} autoSyncOnNavigation - If true, STEP auto-syncs on navigation
- * @property {boolean} autoCloseSearchPanel - If true, the STEP search panel auto-closes when switching to a non-STEP tab
  * @property {boolean} useLocalStepServer - If true, use local URL prefix
  * @property {string[]} globalVersions - Master list and ordering of versions configured in settings
  * @property {string[]} localVersions - Active versions toggled in search modal and used in links
@@ -12,8 +10,6 @@ const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, ItemView, Setting, re
 
 /** @type {StepBibleLinkerSettings} */
 const DEFAULT_SETTINGS = {
-    autoSyncOnNavigation: true,
-    autoCloseSearchPanel: true,
     useLocalStepServer: true,
     globalVersions: ["ESV", "THOT", "SBLG"],
     localVersions: ["ESV", "THOT", "SBLG"],
@@ -22,9 +18,6 @@ const DEFAULT_SETTINGS = {
     noteTypesFolder: "",
 };
 
-/**
- * Suggests vault folders as the user types into a text input.
- */
 class FolderSuggest extends AbstractInputSuggest {
     constructor(app, inputEl, onPick) {
         super(app, inputEl);
@@ -49,26 +42,6 @@ class FolderSuggest extends AbstractInputSuggest {
     }
 }
 
-// ==== TYPED NOTE PARSER (pure, testable outside Obsidian) ====
-// START_TYPED_PARSER
-/**
- * Parse one typed note file's text into entries.
- * A reference line is a line that starts with a markdown link whose target
- * contains "reference=". Everything up to the next reference line is that
- * entry's freeform content (text, images, anything).
- *
- * Returns { entries, crosslinks }: entries are [{ refText, refRaw, source,
- * content }] in file order (a repeated reference in the same file produces one
- * entry whose contents are concatenated); crosslinks are references found
- * inside freeform content, each { refText, refRaw, source, target } pointing
- * at the entry it lives in. Sections MUST be separated by a line of only
- * dashes (---, 3 or more), which also closes any escape block: a reference
- * line before the next --- is content (its refs become crosslinks), so refs
- * can be written at the start of lines without opening a new section. A line
- * of only tildes (~~~) toggles an escape block (legacy, kept for
- * compatibility). A reference line may begin with an optional "(["
- * wrapper, e.g. "([Gen 3:16](url)) notes".
- */
 function parseTypedFile(text, fileBasename) {
     const refLine = /^[ \t]*(?:\(\s*)?\[([^\]]+)\]\(([^)]*reference=[^)]*)\)(.*)$/; // optional "(" before the link; link must start the line
     const inlineRef = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
@@ -129,12 +102,6 @@ function parseTypedFile(text, fileBasename) {
     return { entries, crosslinks };
 }
 
-/**
- * Turn a canonical reference range ("Genesis.1.1", "Genesis.1", or
- * "Genesis.1.1-Genesis.1.3") into a comparable [start, end] ordinal pair.
- * Book positions come from BibleInformation.getBookOrder().
- * A chapter-only reference covers the whole chapter.
- */
 function canonBounds(range) {
     if (!range) return null;
     const point = (s) => {
@@ -159,14 +126,6 @@ function canonBounds(range) {
     return { start: ord(a, false), end: ord(b, true) };
 }
 
-/**
- * How does a reference found inside a section relate to that section's own
- * reference? Returns one of:
- *   "self"     — same passage (no bar needed)
- *   "nested"   — the target sits inside the section (detail within scope)
- *   "encloses" — the target wraps the whole section
- *   "external" — a genuine cross-reference elsewhere
- */
 function scopeRelation(sectionCanon, targetCanon) {
     const s = canonBounds(sectionCanon);
     const t = canonBounds(targetCanon);
@@ -177,7 +136,6 @@ function scopeRelation(sectionCanon, targetCanon) {
     if (s.start >= t.start && s.end <= t.end) return "encloses";
     return "external";
 }
-// END_TYPED_PARSER
 
 class StepBibleLinkerSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
@@ -199,30 +157,6 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         containerEl.createEl("h2", { text: "STEP Bible Linker Settings" });
-
-        new Setting(containerEl)
-            .setName("Auto-Search from Webviewer")
-            .setDesc("Automatically update the left search panel when navigating inside STEP Bible.")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.autoSyncOnNavigation)
-                    .onChange(async (value) => {
-                        this.plugin.settings.autoSyncOnNavigation = value;
-                        await this.plugin.saveSettings();
-                    });
-            });
-
-        new Setting(containerEl)
-            .setName("Auto-Close Search Panel")
-            .setDesc("Automatically close the search panel when switching to a non-STEP tab.")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.autoCloseSearchPanel)
-                    .onChange(async (value) => {
-                        this.plugin.settings.autoCloseSearchPanel = value;
-                        await this.plugin.saveSettings();
-                    });
-            });
 
         new Setting(containerEl)
             .setName("Use STEP localhost.")
@@ -547,484 +481,6 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
     }
 }
 
-//SEARCH VIEW ===================================================================
-const STEP_SEARCH_VIEW = "step-search-view";
-class StepSearchView extends ItemView {
-    constructor(leaf, plugin) {
-        super(leaf);
-        this.plugin = plugin;
-
-        this.searchInProgress = false;
-        this.pendingQuery = null;
-    }
-
-    getViewType() {
-        return STEP_SEARCH_VIEW;
-    }
-
-    getDisplayText() {
-        return "STEP Search";
-    }
-
-    getIcon() {
-        return "book-open-text";
-    }
-
-    onOpen() {
-        const container = this.containerEl.children[1];
-        container.empty();
-
-        // Search input
-        this.queryBox = container.createEl("input", {
-            type: "text",
-            placeholder: "STEP search…"
-        });
-
-        this.queryBox.style.width = "100%";
-        this.queryBox.style.marginBottom = "10px";
-        this.queryBox.readOnly = true;
-        this.queryBox.style.backgroundColor = "#3b3b3b";
-        this.queryBox.style.color = "#b9b9b9";
-        this.queryBox.style.fontWeight = "bold";
-
-        // CLICK LISTENER TO OPEN BIBLE SEARCH MODAL
-        this.queryBox.addEventListener("click", async () => {
-            const { MarkdownView } = require("obsidian");
-            const plugin = this.plugin;
-
-            let prefill = "";
-            const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
-
-            if (activeView && activeView.editor) {
-                prefill = activeView.editor.getSelection() || "";
-            } else {
-                try {
-                    prefill = window.getSelection()?.toString() || "";
-                } catch {
-                    prefill = "";
-                }
-            }
-
-            // NEW: open the refactored modal directly
-            const modal = new StepBibleSearchModal(plugin.app, plugin, prefill);
-            modal.open();
-        });
-
-
-
-        // Loading indicator
-        this.searchLoadingIndicator = container.createEl("div", {
-            text: "Searching…"
-        });
-        this.searchLoadingIndicator.style.display = "none";
-        this.searchLoadingIndicator.style.marginBottom = "10px";
-        this.searchLoadingIndicator.style.color = "#888";
-        this.searchLoadingIndicator.style.fontSize = "0.75em";
-
-        // Results area
-        this.resultsEl = container.createEl("div");
-
-        // Tooltip container (hover preview)
-        this.hoverBox = document.body.createEl("div");
-        this.hoverBox.style.position = "fixed";
-        this.hoverBox.style.zIndex = "999999";
-        this.hoverBox.style.display = "none";
-        this.hoverBox.style.maxWidth = "300px";
-        this.hoverBox.style.padding = "10px";
-        this.hoverBox.style.borderRadius = "6px";
-        this.hoverBox.style.backgroundColor = "var(--background-primary)";
-        this.hoverBox.style.boxShadow = "0 4px 12px rgba(0,0,0,0.25)";
-        this.hoverBox.style.fontSize = "0.85em";
-        this.hoverBox.style.lineHeight = "1.4";
-    }
-
-    updateQuery(queryRef, displayRef, force = false) {
-        const queryKey = Array.isArray(queryRef) ? queryRef.join("|") : String(queryRef);
-
-        if (!force && this._currentSearchKey === queryKey) {
-            return;
-        }
-
-        this._currentSearchKey = queryKey;
-
-        // Update the query box to contain the formatted reference
-        if (this.queryBox) {
-            this.queryBox.value = displayRef;
-        }
-
-        // Run a search based on the query array.
-        this.runSearch(queryRef);
-    }
-
-
-    async runSearch(queryRef) {
-        if (this.searchInProgress) {
-            this.pendingQuery = queryRef;
-            return;
-        }
-
-        this.searchInProgress = true;
-        this.showLoading();
-        this.resultsEl.empty();
-
-        if (!Array.isArray(queryRef) || queryRef.length === 0) {
-            this.resultsEl.createEl("div", { text: "No query." });
-            this.searchInProgress = false;
-            return;
-        }
-
-        const files = this.plugin.app.vault.getMarkdownFiles();
-
-        // Build regex list once
-        const regexList = queryRef.map(q => new RegExp(`${q}(?:[.:\\-]|&)`));
-
-        const matchedFiles = [];
-
-        // PRE‑SCAN FILES FOR MATCHES + COUNT LINKS
-        for (const file of files) {
-            const text = await this.plugin.app.vault.read(file);
-
-            // Does the file contain ANY match?
-            const fileMatches = regexList.some(rx => rx.test(text));
-            if (!fileMatches) continue;
-
-            // Count matching links BEFORE rendering
-            let linkCount = 0;
-
-            // Extract all hrefs from Markdown links
-            const hrefScan = [...text.matchAll(/\(([^)]+)\)/g)];
-
-            for (const [, href] of hrefScan) {
-                if (regexList.some(rx => rx.test(href))) {
-                    linkCount++;
-                }
-            }
-
-            matchedFiles.push({ file, linkCount });
-        }
-
-        this.hideLoading();
-
-        if (matchedFiles.length === 0) {
-            const msg = this.resultsEl.createEl("div", { text: "No notes found." });
-            msg.style.color = "#414141"; 
-            msg.style.fontSize = "0.75em";
-        } else {
-            let activeInlinePreview = null;
-
-            for (const { file, linkCount } of matchedFiles) {
-
-                const item = this.resultsEl.createEl("div");
-                item.style.transition = "background-color 0.15s ease";
-                item.style.padding = "4px 6px";
-                item.style.borderRadius = "2px";
-                item.addEventListener("mouseenter", () => item.style.backgroundColor = "var(--background-modifier-hover)");
-                item.addEventListener("mouseleave", () => item.style.backgroundColor = "");
-                item.style.display = "flex";
-                item.style.alignItems = "center";
-                item.style.gap = "10px";
-                item.style.marginBottom = "4px";
-                item.style.fontSize = "0.9em";
-                item.style.lineHeight = "1.4";
-
-                
-                // Circle badge (number always visible, subtle background)
-                const circleBtn = item.createEl("div");
-                circleBtn.classList.add("circle-btn");
-                circleBtn.setAttribute("data-count", linkCount);
-                circleBtn.style.width = "22px";
-                circleBtn.style.height = "22px";
-                circleBtn.style.borderRadius = "4px";
-                circleBtn.style.flexShrink = "0";
-                circleBtn.style.display = "flex";
-                circleBtn.style.alignItems = "center";
-                circleBtn.style.justifyContent = "center";
-                circleBtn.style.fontSize = "0.75em";
-                circleBtn.style.cursor = "pointer";
-                circleBtn.style.userSelect = "none";
-                circleBtn.style.transition = "all 0.15s ease";
-                circleBtn.style.backgroundColor = "var(--background-modifier-border)";
-                circleBtn.style.color = "var(--text-normal)";
-                circleBtn.textContent = linkCount > 0 ? linkCount : "";
-                circleBtn.onmouseenter = () => {
-                    // Only highlight if dropdown is open
-                    if (activeInlinePreview && activeInlinePreview.item === item) {
-                        circleBtn.style.backgroundColor = "var(--interactive-accent)";
-                        circleBtn.style.color = "white";
-                    }
-                };
-                circleBtn.onmouseleave = () => {
-                    // Only un-highlight if dropdown is open
-                    if (activeInlinePreview && activeInlinePreview.item === item) {
-                        circleBtn.style.backgroundColor = "var(--background-modifier-border)";
-                        circleBtn.style.color = "var(--text-normal)";
-                    }
-                };
-
-                // Title text (click to open note)
-                const titleEl = item.createEl("span", { text: file.basename });
-                titleEl.style.cursor = "pointer";
-                titleEl.style.flexGrow = "1";
-
-                // Right‑side open button
-                const openBtn = item.createEl("div");
-                openBtn.innerHTML = `<span class="external-link"></span>`;  // ← replace ICON_NAME
-                openBtn.style.marginLeft = "auto"; // pushes icon to the far right
-                openBtn.style.cursor = "pointer";
-                openBtn.style.fontSize = "1.1em";
-                openBtn.style.color = "var(--interactive-accent)";
-                openBtn.style.opacity = "0.85";
-                openBtn.style.padding = "2px 4px";
-                openBtn.style.borderRadius = "4px";
-                openBtn.onmouseenter = () => {
-                    openBtn.style.opacity = "1";
-                    openBtn.style.backgroundColor = "var(--background-modifier-hover)";
-                };
-                openBtn.onmouseleave = () => {
-                    openBtn.style.opacity = "0.85";
-                    openBtn.style.backgroundColor = "";
-                };
-                openBtn.onclick = () => {
-                    if (file) {
-                        this.plugin.app.workspace.getLeaf(true).openFile(file);
-                    }
-                };
-
-                // Shared state for preview + cycling
-                let previewLinks = [];
-                let cycleIndex = 0;
-
-                // Highlight only the currently selected reference
-                const highlightCurrent = () => {
-                    previewLinks.forEach((link, index) => {
-                        if (index === cycleIndex - 1) {
-                            // Your exact highlight convention
-                            link.style.textDecoration = "none";
-                            link.style.textShadow = "none";
-                            link.style.backgroundColor = "rgba(89, 89, 89, 0.35)";
-                            link.style.borderRadius = "3px";
-                        } else {
-                            link.style.backgroundColor = "";
-                            link.style.borderRadius = "";
-                        }
-                    });
-                };
-
-                // Extract preview-opening logic into a function
-                const openPreview = async () => {
-
-                    // If another preview is open, close it AND reset its circle
-                    if (activeInlinePreview && activeInlinePreview.item !== item) {
-
-                        // Collapse the old preview
-                        activeInlinePreview.wrapper.style.maxHeight = "0";
-
-                        // Reset the old circle to closed state
-                        const oldCircle = activeInlinePreview.item.querySelector(".circle-btn");
-                        if (oldCircle) {
-                            oldCircle.style.backgroundColor = "var(--background-modifier-border)";
-                            oldCircle.style.color = "var(--text-normal)";
-
-                            // Restore plain count
-                            const oldCount = oldCircle.getAttribute("data-count");
-                            oldCircle.textContent = oldCount || "";
-                        }
-
-                        activeInlinePreview = null;
-                    }
-
-                    // If already open, do nothing
-                    if (activeInlinePreview && activeInlinePreview.item === item) {
-                        return;
-                    }
-
-                    // Circle enters "active but not hovered" state
-                    circleBtn.style.backgroundColor = "var(--background-modifier-border-hover)";
-                    circleBtn.style.color = "var(--text-normal)";
-
-                    // Create wrapper for animation
-                    const wrapper = document.createElement("div");
-                    wrapper.style.overflow = "hidden";
-                    wrapper.style.maxHeight = "0";
-                    wrapper.style.transition = "max-height 0.25s ease";
-
-                    // Create preview box
-                    const preview = document.createElement("div");
-                    preview.style.padding = "10px";
-                    preview.style.margin = "6px 0 12px 0";
-                    preview.style.borderRadius = "6px";
-                    preview.style.backgroundColor = "var(--background-primary)";
-                    preview.style.boxShadow = "0 2px 6px rgba(0,0,0,0.15)";
-                    preview.style.fontSize = "0.85em";
-                    preview.style.lineHeight = "1.4";
-                    preview.style.maxHeight = "300px";
-                    preview.style.overflowY = "auto";
-
-                    wrapper.appendChild(preview);
-                    item.insertAdjacentElement("afterend", wrapper);
-
-                    // Load full file
-                    const fullText = await this.plugin.app.vault.read(file);
-
-                    // Render full Markdown file
-                    preview.empty();
-                    await MarkdownRenderer.render(
-                        this.plugin.app,
-                        fullText,
-                        preview,
-                        this.plugin.app.workspace.getActiveFile()?.path || "",
-                        this.plugin
-                    );
-
-                    // Remove tooltips (Obsidian attaches them to the anchors
-                    // themselves) and keep links clickable.
-                    this.plugin.stripLinkTooltips(preview, this.plugin.app.workspace.getActiveFile()?.path || "");
-
-                    // Find matching links in rendered preview
-                    previewLinks = [];
-                    const links = Array.from(preview.querySelectorAll("a"));
-
-                    links.forEach(a => {
-                        if (regexList.some(rx => rx.test(a.href))) {
-                            previewLinks.push(a);
-                        }
-                    });
-
-                    // Start at first match
-                    cycleIndex = 1;
-                    circleBtn.textContent = `${cycleIndex}/${previewLinks.length}`;
-
-                    // Highlight first match
-                    highlightCurrent();
-
-                    // Scroll to first match
-                    if (previewLinks.length > 0) {
-                        const firstTarget = previewLinks[0];
-                        firstTarget.scrollIntoView({
-                            block: "center",
-                            behavior: "smooth"
-                        });
-                    }
-
-                    // Animate open
-                    requestAnimationFrame(() => {
-                        wrapper.style.maxHeight = preview.scrollHeight + "px";
-                    });
-
-                    activeInlinePreview = { item, wrapper, preview };
-                };
-
-                // Title click toggles dropdown
-                titleEl.onclick = async () => {
-
-                    // If open → close it
-                    if (activeInlinePreview && activeInlinePreview.item === item) {
-
-                        activeInlinePreview.wrapper.style.maxHeight = "0";
-                        activeInlinePreview = null;
-
-                        // Circle returns to closed state
-                        circleBtn.style.backgroundColor = "var(--background-modifier-border)";
-                        circleBtn.style.color = "var(--text-normal)";
-                        circleBtn.textContent = linkCount > 0 ? linkCount : "";
-
-                        cycleIndex = 1;
-                        return;
-                    }
-
-                    // If closed → open it
-                    await openPreview();
-
-                    // Show cycling index
-                    circleBtn.textContent = `1/${previewLinks.length}`;
-                    cycleIndex = 1;
-                };
-
-
-                circleBtn.onclick = async () => {
-
-                    // If dropdown is closed → open it
-                    if (!activeInlinePreview || activeInlinePreview.item !== item) {
-                        await openPreview();
-
-                        // Set active state
-                        circleBtn.style.backgroundColor = "var(--interactive-accent)";
-                        circleBtn.style.color = "white";
-
-                        circleBtn.textContent = `1/${previewLinks.length}`;
-                        cycleIndex = 1;
-                        return;
-                    }
-
-                    // If dropdown is open → cycle
-                    if (previewLinks.length === 0) return;
-
-                    cycleIndex = (cycleIndex % previewLinks.length) + 1;
-                    circleBtn.textContent = `${cycleIndex}/${previewLinks.length}`;
-
-                    highlightCurrent();
-
-                    const previewEl = activeInlinePreview.preview;
-                    const target = previewLinks[cycleIndex - 1];
-
-                    if (target) {
-                        target.scrollIntoView({
-                            block: "center",
-                            behavior: "smooth"
-                        });
-                    }                  
-                };
-
-                // Hover behavior (only when dropdown is open)
-                circleBtn.onmouseenter = () => {
-                    if (activeInlinePreview && activeInlinePreview.item === item) {
-                        circleBtn.style.backgroundColor = "var(--interactive-accent)";
-                        circleBtn.style.color = "white";
-                    }
-                };
-
-                circleBtn.onmouseleave = () => {
-                    if (activeInlinePreview && activeInlinePreview.item === item) {
-                        circleBtn.style.backgroundColor = "var(--background-modifier-border-hover)";
-                        circleBtn.style.color = "var(--text-normal)";
-                    }
-                };
-            }
-        }
-
-        this.searchInProgress = false;
-
-        if (this.pendingQuery) {
-            const nextQuery = this.pendingQuery;
-            this.pendingQuery = null;
-            this.runSearch(nextQuery);
-        }
-    }
-
-    showLoading() {
-        this.searchLoadingIndicator.style.display = "block";
-    }
-
-    hideLoading() {
-        this.searchLoadingIndicator.style.display = "none";
-    }
-
-    extractParagraphMatchingQuery(text, queryArray) {
-        const paragraphs = text.split(/\n\s*\n/);
-
-        for (const p of paragraphs) {
-            for (const q of queryArray) {
-                const regex = new RegExp(`${q}(?:[.-]|&)`);
-                if (regex.test(p)) {
-                    return p.trim();
-                }
-            }
-        }
-
-        return null;
-    }
-}
-
 class StepBibleSearchModal extends Modal {
     constructor(app, plugin, prefill = "") {
         super(app);
@@ -1036,8 +492,6 @@ class StepBibleSearchModal extends Modal {
         // Draft state (only applied when Enter is pressed)
         this._draftLocalVersions = [...(this.plugin.settings.localVersions || [])];
         this._draftLocalStepServer = this.plugin.settings.useLocalStepServer;
-        this._draftAutoSync = this.plugin.settings.autoSyncOnNavigation;
-        this._draftAutoClose = this.plugin.settings.autoCloseSearchPanel;
 
         // Track last synced vault states (default to current if not set)
         if (!this.plugin.settings.lastSyncedVersions) {
@@ -1053,29 +507,7 @@ class StepBibleSearchModal extends Modal {
         const currentLocal = this.plugin.settings.localVersions || [];
         const versionsChanged = local.length !== currentLocal.length || local.some((v, i) => v !== currentLocal[i]);
         const serverChanged = this._draftLocalStepServer !== this.plugin.settings.useLocalStepServer;
-        const autoSyncChanged = this._draftAutoSync !== this.plugin.settings.autoSyncOnNavigation;
-        const autoCloseChanged = this._draftAutoClose !== this.plugin.settings.autoCloseSearchPanel;
-        return versionsChanged || serverChanged || autoSyncChanged || autoCloseChanged;
-    }
-
-    async triggerSyncIfWebviewerActive() {
-        const activeLeaf = this.app.workspace.activeLeaf;
-        let view = activeLeaf?.view;
-
-        if (view?.getViewType?.() !== "webviewer") {
-            const webLeaves = this.app.workspace.getLeavesOfType("webviewer");
-            if (webLeaves.length > 0) {
-                view = webLeaves[0].view;
-            }
-        }
-
-        if (view && view.getViewType?.() === "webviewer") {
-            const webviewEl = view.webview;
-            const url = view.url || webviewEl?.getURL?.();
-            if (url && (url.includes("stepbible.org") || url.includes("localhost:8989")) && webviewEl) {
-                await this.plugin.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: true, ignoreDuplicate: false });
-            }
-        }
+        return versionsChanged || serverChanged;
     }
 
     async openStepUrl(url) {
@@ -1121,10 +553,6 @@ class StepBibleSearchModal extends Modal {
                     // Attach centralized listeners via plugin helper
                     if (typeof this.plugin.attachWebviewListeners === "function") {
                         this.plugin.attachWebviewListeners(webviewEl);
-                    }
-
-                    if (this.plugin.settings.autoSyncOnNavigation) {
-                        await this.plugin.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
                     }
 
                     await this.plugin.autoCollapseStepToolbar(webviewEl);
@@ -1383,79 +811,7 @@ class StepBibleSearchModal extends Modal {
         renderVersionPills();
 
         // =========================================================================
-        // SECTION 2: SEARCH PANEL
-        // =========================================================================
-        const searchPanelSection = settingsDrawer.createEl("div");
-        searchPanelSection.style.display = "flex";
-        searchPanelSection.style.flexDirection = "column";
-        searchPanelSection.style.gap = "6px";
-
-        const searchPanelTitle = searchPanelSection.createEl("span", { text: "Search Panel" });
-        searchPanelTitle.style.fontSize = "12px";
-        searchPanelTitle.style.fontWeight = "bold";
-        searchPanelTitle.style.color = "var(--text-muted)";
-
-        const searchPanelPillsContainer = searchPanelSection.createEl("div");
-        searchPanelPillsContainer.style.display = "flex";
-        searchPanelPillsContainer.style.flexWrap = "wrap";
-        searchPanelPillsContainer.style.gap = "6px";
-
-        const renderSearchPanelPills = () => {
-            searchPanelPillsContainer.empty();
-
-            const panelControls = [
-                {
-                    name: "Auto Search",
-                    get: () => this._draftAutoSync,
-                    set: (val) => { this._draftAutoSync = val; }
-                },
-                {
-                    name: "Auto Close",
-                    get: () => this._draftAutoClose,
-                    set: (val) => { this._draftAutoClose = val; }
-                }
-            ];
-
-            panelControls.forEach(ctrl => {
-                const isActive = ctrl.get();
-                const btn = searchPanelPillsContainer.createEl("button", { text: ctrl.name });
-
-                btn.tabIndex = -1;
-                btn.style.padding = "4px 10px";
-                btn.style.fontSize = "12px";
-                btn.style.fontWeight = "bold";
-                btn.style.borderRadius = "12px";
-                btn.style.cursor = "pointer";
-                btn.style.border = "none";
-                btn.style.userSelect = "none";
-                btn.style.outline = "none";
-                btn.style.transition = "all 0.15s ease-in-out";
-
-                if (isActive) {
-                    btn.style.backgroundColor = "var(--interactive-accent)";
-                    btn.style.color = "var(--text-on-accent)";
-                } else {
-                    btn.style.backgroundColor = "var(--background-modifier-border)";
-                    btn.style.color = "var(--text-muted)";
-                    btn.style.opacity = "0.7";
-                }
-
-                btn.onmousedown = (e) => e.preventDefault();
-
-                btn.onclick = (e) => {
-                    e.preventDefault();
-                    ctrl.set(!isActive);
-                    renderSearchPanelPills();
-                    updateDrawerBorder();
-                    input.focus();
-                };
-            });
-        };
-
-        renderSearchPanelPills();
-
-        // =========================================================================
-        // SECTION 3: SERVER
+        // SECTION 2: SERVER
         // =========================================================================
         const serverSection = settingsDrawer.createEl("div");
         serverSection.style.display = "flex";
@@ -1547,13 +903,10 @@ class StepBibleSearchModal extends Modal {
         const commitDraftAndSync = async () => {
             const versionsChanged = isVersionsOutOfSync();
             const serverChanged = isServerOutOfSync();
-            const autoSyncTurnedOn = !this.plugin.settings.autoSyncOnNavigation && this._draftAutoSync;
 
             // Commit all settings directly to plugin
             this.plugin.settings.localVersions = [...this._draftLocalVersions];
             this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
-            this.plugin.settings.autoSyncOnNavigation = this._draftAutoSync;
-            this.plugin.settings.autoCloseSearchPanel = this._draftAutoClose;
             await this.plugin.saveSettings();
 
             if (serverChanged) {
@@ -1563,9 +916,6 @@ class StepBibleSearchModal extends Modal {
             if (versionsChanged) {
                 await this.plugin.rewriteStepLinks();
                 this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
-            }
-            if (autoSyncTurnedOn) {
-                await this.triggerSyncIfWebviewerActive();
             }
             await this.plugin.saveSettings();
             new Notice("Settings updated");
@@ -1610,7 +960,6 @@ class StepBibleSearchModal extends Modal {
                         this._changesCommitted = true;
                         updateDrawerBorder();
                         renderVersionPills();
-                        renderSearchPanelPills();
                         renderServerPill();
                     } finally {
                         resetInputState();
@@ -1641,13 +990,10 @@ class StepBibleSearchModal extends Modal {
                 const url = buildUrlWithDraftVersions(urlRef);
                 const versionsChanged = isVersionsOutOfSync();
                 const serverChanged = isServerOutOfSync();
-                const autoSyncTurnedOn = !this.plugin.settings.autoSyncOnNavigation && this._draftAutoSync;
 
                 // --- CRITICAL FIX: COMMIT SETTINGS SYNCHRONOUSLY BEFORE OPENING TAB ---
                 this.plugin.settings.localVersions = [...this._draftLocalVersions];
                 this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
-                this.plugin.settings.autoSyncOnNavigation = this._draftAutoSync;
-                this.plugin.settings.autoCloseSearchPanel = this._draftAutoClose;
                 this._changesCommitted = true;
 
                 // 1. Search & Open URL inside Obsidian tab
@@ -1661,7 +1007,7 @@ class StepBibleSearchModal extends Modal {
                 // 3. Save settings to disk & update vault in background
                 await this.plugin.saveSettings();
 
-                if (versionsChanged || serverChanged || autoSyncTurnedOn) {
+                if (versionsChanged || serverChanged) {
                     setTimeout(async () => {
                         if (serverChanged) {
                             await this.plugin.toggleLocaltoOnline();
@@ -1670,9 +1016,6 @@ class StepBibleSearchModal extends Modal {
                         if (versionsChanged) {
                             await this.plugin.rewriteStepLinks();
                             this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
-                        }
-                        if (autoSyncTurnedOn) {
-                            await this.triggerSyncIfWebviewerActive();
                         }
                         await this.plugin.saveSettings();
                     }, 50);
@@ -1698,7 +1041,6 @@ class StepBibleSearchModal extends Modal {
     }
 }
 
-// PLUGIN =======================================================================
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
     settings;
@@ -1713,7 +1055,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this._noteDotsTextCache = {};
         this._noteDotsRefreshTimer = null;
         this._localStepRunningCache = { value: null, time: 0 };
-        this._lastSearchQueryRef = null;
         // One StepInterfaceObsidian per webview, created the first time a panel
         // reports in. Keyed by the webview element so each panel keeps its own
         // popover slots.
@@ -1726,12 +1067,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // Load settings and add settings tab
         await this.loadSettings();
         this.addSettingTab(new StepBibleLinkerSettingTab(this.app, this));
-        
-        // REGISTER SEARCH VIEW
-        this.registerView(
-            STEP_SEARCH_VIEW,
-            (leaf) => new StepSearchView(leaf, this)
-        );  
 
         // DETECT AND LINK INPUT REF AT CURSOR 
         //============================================================================
@@ -1800,39 +1135,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             }
         });
 
-        // SEARCH BASED ON STEP URL
-        //============================================================================
-        this.addCommand({
-            id: "step-sync-search-panel",
-            name: "Update STEP Search Panel",
-            callback: async () => {
-
-                const leaf = this.app.workspace.activeLeaf;
-                if (!leaf) return;
-
-                const view = leaf.view;
-                if (!view) return;
-
-                if (view.getViewType?.() !== "webviewer") return;
-
-                // Get URL from view or webview fallback
-                let url = view.url;
-                if (view.webview?.getURL) {
-                    try {
-                        url = view.webview.getURL();
-                    } catch { }
-                }
-
-                if (!url) return;
-
-                // FIX: ensure webviewEl exists
-                const webviewEl = view.webview;
-                if (!webviewEl) return;
-
-                await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: true, ignoreDuplicate: true });
-            }
-        });
-
         // SEARCH PANEL 
         //============================================================================
         this.attachWebviewListeners = (webviewEl) => {
@@ -1867,9 +1169,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const currentUrl = webviewEl.getURL?.();
                 if (!currentUrl) return;
 
-                if (this.settings.autoSyncOnNavigation) {
-                    await this.searchWebviewUrl(currentUrl, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
-                }
                 await this.autoCollapseStepToolbar(webviewEl);
                 await this.injectNoteDots(webviewEl);
             };
@@ -1888,10 +1187,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     this.attachWebviewListeners(webviewEl);
                     // Fresh webviews aren't ready for executeJavaScript yet;
                     if (!webviewEl.getURL?.()) return;
-                    if (this.settings.autoSyncOnNavigation) {
-                        const url = leaf.view.url || webviewEl.getURL?.();
-                        if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
-                    }
                     await this.autoCollapseStepToolbar(webviewEl);
                     await this.injectNoteDots(webviewEl);
                 }
@@ -1908,65 +1203,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     this.attachWebviewListeners(webviewEl);
                     // Fresh webviews aren't ready for executeJavaScript yet;
                     if (!webviewEl.getURL?.()) return;
-                    if (this.settings.autoSyncOnNavigation) {
-                        const url = leaf.view.url || webviewEl.getURL?.();
-                        if (url) await this.searchWebviewUrl(url, webviewEl, { ignoreAutoSync: false, ignoreDuplicate: true });
-                    }
                     await this.autoCollapseStepToolbar(webviewEl);
                     await this.injectNoteDots(webviewEl);
                 }
             })
         );
-        // Close panel
-        this.registerEvent(
-            this.app.workspace.on("active-leaf-change", (leaf) => {
-                if (!this.settings.autoCloseSearchPanel) return;
-
-                const view = leaf?.view;
-                if (!view) return;
-
-                if (leaf.getRoot() !== this.app.workspace.rootSplit) {
-                    // Focus is NOT in the main editor area → do nothing
-                    return;
-                }
-
-                // If the focused tab IS the STEP Search panel → do nothing
-                if (view.getViewType?.() === "step-search-view") {
-                    return;
-                }
-
-                // If the focused tab is NOT a webviewer → close search panel
-                if (view.getViewType?.() !== "webviewer") {
-                    this.minimiseLeftLeaf();
-                    return;
-                }
-
-                // It's a webviewer — check URL
-                const webviewEl = view.webview;
-                if (!webviewEl) {
-                    this.minimiseLeftLeaf();
-                    return;
-                }
-
-                let url = null;
-
-                try {
-                    // Try the live webview URL first
-                    url = webviewEl.getURL?.();
-                } catch (e) {
-                    // WebView not ready — ignore silently
-                }
-
-                // If URL does NOT contain reference= → close search panel
-                if (!url || !url.includes("reference=")) {
-                    this.minimiseLeftLeaf();
-                    return;
-                }
-
-                // Otherwise: keep search panel open
-            })
-        );
-
         // HOVERING HANDLER
         //============================================================================
         this.registerDomEvent(document, "mouseover", async (evt) => {
@@ -2326,70 +1567,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         return new RegExp(pattern, "gi");
     }
 
-
-    // SEARCH HELPERS =======================================================================================
-    async searchWebviewUrl(url, webviewEl, { ignoreAutoSync = false, ignoreDuplicate = false } = {}) {
-        if (!url || !url.includes("reference=")) return;
-
-        // 1. SETTING GATE: Block search if autosearch is OFF unless explicitly bypassed
-        if (!ignoreAutoSync && !this.settings.autoSyncOnNavigation) {
-            return;
-        }
-
-        const urlRef = this.url_urlRef(url);
-        if (!urlRef) return;
-
-        const queryRef = this.urlRef_queryRef(urlRef);
-        const displayRef = this.urlRef_displayRef(urlRef);
-
-        // Convert array/query to comparable string key
-        const queryKey = Array.isArray(queryRef) ? queryRef.join("|") : String(queryRef);
-
-        // 2. DUPLICATE GATE: Block identical queries unless ignoreDuplicate is true
-        if (!ignoreDuplicate && this._lastSearchQueryKey === queryKey) {
-            return;
-        }
-
-        this._lastSearchQueryKey = queryKey;
-        this._lastSearchQueryRef = queryRef;
-
-        this.app.workspace.leftSplit?.expand();
-
-        let leaf = this.app.workspace.getLeavesOfType("step-search-view")[0];
-
-        if (!leaf) {
-            leaf = this.app.workspace.getLeftLeaf(false);
-            await leaf.setViewState({
-                type: "step-search-view",
-                state: {}
-            });
-        }
-
-        this.app.workspace.setActiveLeaf(leaf, { focus: false });
-
-        let searchView = leaf.view;
-
-        for (let i = 0; i < 10; i++) {
-            if (typeof searchView.updateQuery === "function") break;
-            await new Promise(r => requestAnimationFrame(r));
-            searchView = leaf.view;
-        }
-
-        if (typeof searchView.updateQuery !== "function") return;
-
-        searchView.updateQuery(queryRef, displayRef, ignoreDuplicate);
-    }
-    minimiseLeftLeaf() {
-        const leaf = this.app.workspace.getLeavesOfType("step-search-view")[0];
-        if (leaf) {
-            //this.app.workspace.detachLeavesOfType("step-search-view");
-
-            const leftSplit = this.app.workspace.leftSplit;
-            if (leftSplit && leftSplit.collapsed == false) {
-                leftSplit.collapse();
-            }
-        }
-    }
 
     // Clear .step-ref-hover highlights in every STEP webview
     clearAllStepHighlights() {
@@ -3618,11 +2795,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     }
 }
 
-// BIBLE INFORMATION ==========================================================================
-// Static reference data for the 66-book canon. Single source of truth for book order, book
-// names and abbreviations, chapter counts, per-chapter verse counts, and book overviews.
-// Callers use the class directly: BibleInformation.getMaxVerse("Genesis", 1).
-// ==========================================================================================
 class BibleInformation {
     // Canonical book order (no spaces), used to compare references.
     static _bookOrder = [
@@ -4438,10 +3610,6 @@ class BibleInformation {
     }
 }
 
-
-// ---------------------------------------------------------------------------
-// StepInterfaceDOM - the in-page half of the bar overlay.
-// ---------------------------------------------------------------------------
 class StepInterfaceDOM {
     constructor() {
         // Latest layout pass. Mounting always builds a new instance, so these
@@ -5400,8 +4568,6 @@ class StepInterfaceDOM {
     }
 }
 
-// STEP INTERFACE, OBSIDIAN SIDE ==============================================================
-// ============================================================================================
 class StepInterfaceObsidian {
     constructor(plugin, webviewEl) {
         this.plugin = plugin;
@@ -5634,7 +4800,13 @@ class StepInterfaceObsidian {
             // hover note alive for as long as the pointer stayed there.
             const t = e.target;
             if (t && t.closest && t.closest(".step-bar-popover, .step-adj-bar")) {
-                this._lastBarHit = null;
+                if (this._lastBarHit) {
+                    this._lastBarHit = null;
+                    // Leaving the bar for our own chrome lights nothing, and
+                    // the guest cannot tell us (it never sees host events), so
+                    // push the unlit state from here.
+                    this._syncBarHold();
+                }
             }
         }, { passive: true, capture: true });
         // True when the tracked pointer sits inside the open hover popover.
@@ -5673,13 +4845,26 @@ class StepInterfaceObsidian {
         };
 
         this._barStateSeq = 0;
+        // What the guest should leave lit: the bar under the pointer, and
+        // nothing else. A pinned note used to light its passage for as long as
+        // it stayed open, which read as a highlight that could not be shaken
+        // off until the pointer happened to land on the popover. Highlighting
+        // is a hover effect: it follows the pointer, so pinned state does not
+        // count, and neither does a pointer resting on one of our popovers.
+        const litBar = (entry) => (entry && !entry.ovf && entry.id)
+            ? { id: entry.id, page: entry.page || "" }
+            : null;
         this._litEntry = () => {
-            if (this._hoverPop && !this._hoverPop.ovf) return { id: this._hoverPop.id, page: this._hoverPop.page };
-            if (this._lastBarHit) return { id: this._lastBarHit.id || "", page: this._lastBarHit.page || "" };
-            if (this._adjHover && this._adjHover.note) return { id: this._adjHover.note.id, page: this._adjHover.note.page || this._adjHover.page };
-            if (this._pinnedPop && !this._pinnedPop.ovf) return { id: this._pinnedPop.id, page: this._pinnedPop.page };
-            if (this._adjPinned && this._adjPinned.note) return { id: this._adjPinned.note.id, page: this._adjPinned.note.page || this._adjPinned.page };
-            return null;
+            // A Wider References row is a bar too, and it lives in host chrome,
+            // so it is checked before the in-page test below.
+            if (this._adjHover && this._adjHover.note) {
+                return { id: this._adjHover.note.id, page: this._adjHover.note.page || this._adjHover.page || "" };
+            }
+            // Over our own chrome (popover, stretched bar) the pointer is no
+            // longer over the page, so nothing is lit even if the bar it left
+            // is still the last one reported.
+            if (!this._inGuestPage) return null;
+            return litBar(this._lastBarHit);
         };
         // Kept for the call sites that only mean "make the page match what is
         // open": widening and highlighting travel together, so this is the
@@ -5696,7 +4881,7 @@ class StepInterfaceObsidian {
             // after a pin, this guard made every later hover note immortal, and
             // the only escape was a click or leaving the window — which is
             // exactly how the "delay after pinning" bug behaved.
-            if (this._lastBarHit) return;
+            if (this._lastBarHit && this._inGuestPage) return;
             if (pointerOverHoverPop()) return;
             closeHover();
             this._restoreHighlight();
@@ -5793,11 +4978,13 @@ class StepInterfaceObsidian {
         // Click on a bar: pin the popover (stays put, movable, resizable)
         this.handleBarClickMessage = (webviewEl, hit) => {
             clearTimeout(this._barOpenTimer);
-            // The click opens a popover outside the webview, so the guest will
-            // never report "no bar" for it. A hit left over from the hover that
-            // preceded the click would then keep every later hover note alive
-            // until the pointer re-entered the page and left a bar again.
-            this._lastBarHit = null;
+            // The hit is deliberately NOT cleared here. The pointer is still on
+            // the bar at the moment of the click, so the text stays lit while
+            // it remains there and goes out the instant the pointer moves onto
+            // the popover or anywhere else in the page. Leaving a leftover hit
+            // behind is what used to keep hover notes alive; that is now guarded
+            // by _inGuestPage in _scheduleHoverClose and by the host mousemove
+            // above, both of which can tell when the pointer left the page.
             if (!hit || (!hit.typed && !hit.overflow)) return;
             // Clicking the grey lane closes the list only if that list is
             // pinned — same as pressing its X. A hovered list is not closed:

@@ -1,6 +1,4 @@
 {
-  "autoSyncOnNavigation": false,
-  "autoCloseSearchPanel": false,
   "useLocalStepServer": true,
   "globalVersions": [
     "ESV",
@@ -19,6 +17,8 @@
     "Sermons": "#ac4906"
   },
   "noteTypesFolder": "Second Brain/Bible",
+  "autoSyncOnNavigation": false,
+  "autoCloseSearchPanel": false,
   "crosslinkColour": "#3d8fe6",
   "useLocalUrlPrefix": true,
   "enabledVersions": [

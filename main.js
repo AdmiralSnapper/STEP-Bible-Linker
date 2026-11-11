@@ -20,6 +20,8 @@ const DEFAULT_SETTINGS = {
     noteLinesColour: "#17758f",
     typedColours: {},
     noteTypesFolder: "",
+    // Skip the text popout when the verses are already on the STEP page.
+    popoutVisiblePassages: true,
 };
 class FolderSuggest extends AbstractInputSuggest {
     constructor(app, inputEl, onPick) {
@@ -251,6 +253,19 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
         for (const n of typeColourNames) colourRow(n);
 
         // NOTE TYPES SECTION: a live list of type files with edit/delete.
+        // LINK POPOUT SECTION
+        containerEl.createEl("h3", { text: "Link popout" });
+
+        new Setting(containerEl)
+            .setName("Load text popout for visible passages")
+            .setDesc("When a link's verses are already showing in the STEP pane, the popout names that instead of loading the text. Click the label in the popout to load it anyway.")
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.popoutVisiblePassages !== false)
+                .onChange(async (value) => {
+                    this.plugin.settings.popoutVisiblePassages = value;
+                    await this.plugin.saveSettings();
+                }));
+
         containerEl.createEl("h3", { text: "Note types" });
         const folderPath = (this.plugin.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
         const folderObj = folderPath ? this.app.vault.getAbstractFileByPath(folderPath) : null;
@@ -3267,6 +3282,10 @@ class StepInterfaceDOM {
         window.__stepBarState = (state) => window.__stepDOM.barState(state);
         window.__stepLaneOf = (page) => window.__stepDOM.laneOf(page);
         window.__stepBarAt = (x, y) => window.__stepDOM.barAt(x, y);
+        // "Is this passage already in front of me?" The host asks before it
+        // fetches text, so a verse the reader can already see needn't be
+        // re-read from the server.
+        window.__stepVisibleRefs = (refs) => window.__stepDOM.visibleRefs(refs);
         // window.__stepNotifyPage is installed by installPageWatch(), which
         // owns the page key it compares against.
     }
@@ -3870,6 +3889,72 @@ class StepInterfaceDOM {
             ? [{ id: entry.id, page: entry.page || "" }]
             : [];
         this._paintLit();
+    }
+
+    // Which of these references are on screen right now. One visible pixel
+    // counts: the caller only needs to know whether there is text in front of
+    // the reader, not how much of it.
+    visibleRefs(refs) {
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const want = Array.isArray(refs) ? refs : [];
+        const out = {
+            // A verse in a background tab has perfect geometry and nobody can
+            // see it, so the host checks this before trusting any of the rest.
+            paneHidden: document.visibilityState !== "visible",
+            refs: {}
+        };
+
+        // Nearest scroll-clipping ancestor. getBoundingClientRect ignores
+        // ancestor scrolling, so a verse scrolled above its passage panel
+        // still reports a rect sitting inside the viewport. Without capping
+        // the rect against the panel, scrolled-away text reads as visible.
+        const clipOf = (el) => {
+            let p = el.parentElement;
+            while (p && p !== document.body && p !== document.documentElement) {
+                const cs = window.getComputedStyle(p);
+                if (/auto|scroll|hidden|overlay/.test(cs.overflowY || "") ||
+                    /auto|scroll|hidden/.test(cs.overflowX || "")) {
+                    return p.getBoundingClientRect();
+                }
+                p = p.parentElement;
+            }
+            return null;
+        };
+
+        const byCanon = new Map();
+        const verses = window.__stepVerses || [];
+        for (let i = 0; i < verses.length; i++) {
+            const v = verses[i];
+            if (!v || !v.canon || !v.verse) continue;
+            if (!byCanon.has(v.canon)) byCanon.set(v.canon, []);
+            byCanon.get(v.canon).push(v.verse);
+        }
+
+        for (let i = 0; i < want.length; i++) {
+            const ref = want[i];
+            const els = byCanon.get(ref) || [];
+            if (!els.length) {
+                out.refs[ref] = { present: false, visible: false };
+                continue;
+            }
+            let visible = false;
+            for (let j = 0; j < els.length && !visible; j++) {
+                const el = els[j];
+                // display:none / visibility:hidden / opacity:0 ancestors.
+                if (typeof el.checkVisibility === "function" &&
+                    !el.checkVisibility({ visibilityProperty: true, opacityProperty: true })) continue;
+                const r = el.getBoundingClientRect();
+                if (!(r.width > 0) || !(r.height > 0)) continue;
+                const c = clipOf(el);
+                const L = Math.max(r.left, c ? c.left : 0, 0);
+                const R = Math.min(r.right, c ? c.right : vw, vw);
+                const T = Math.max(r.top, c ? c.top : 0, 0);
+                const B = Math.min(r.bottom, c ? c.bottom : vh, vh);
+                if (R > L && B > T) visible = true;
+            }
+            out.refs[ref] = { present: true, visible: visible };
+        }
+        return out;
     }
 
     _paintLit() {
@@ -4915,6 +5000,9 @@ class StepInterfaceObsidian {
             const onListDragMove = (ev) => {
                 if (!listDrag || !body.isConnected) return;
                 if (ev.pointerId !== undefined && listDrag.pid !== undefined && ev.pointerId !== listDrag.pid) return;
+                // Released where we could not see it: end on the next move
+                // rather than drag on a bare pointer.
+                if (ev.buttons === 0) { endListDrag({ type: "cancel" }); return; }
                 const dx = ev.clientX - listDrag.x;
                 const dy = ev.clientY - listDrag.y;
                 if (!dx && !dy) return;
@@ -4936,7 +5024,6 @@ class StepInterfaceObsidian {
                 window.removeEventListener("pointermove", onListDragMove, true);
                 window.removeEventListener("pointerup", endListDrag, true);
                 window.removeEventListener("pointercancel", endListDrag, true);
-                window.removeEventListener("blur", endListDrag, true);
             };
             const startListDrag = (ev) => {
                 if (listDrag) return;
@@ -4958,7 +5045,6 @@ class StepInterfaceObsidian {
                 window.addEventListener("pointermove", onListDragMove, true);
                 window.addEventListener("pointerup", endListDrag, true);
                 window.addEventListener("pointercancel", endListDrag, true);
-                window.addEventListener("blur", endListDrag, true);
             };
             header.addEventListener("pointerdown", startListDrag, true);
             if (listEntry) listEntry.startListDrag = startListDrag;
@@ -5515,6 +5601,121 @@ class StepInterfaceObsidian {
                 btns.addClass("step-bar-popover-buttons-hidden");
             }
 
+            // Set up while the box is already on screen but before the markdown
+            // render below (which is a real await): a press in that window used
+            // to hit a header with no drag listener, so the first drag after
+            // pinning did nothing and had to be repeated.
+            if (pinned) {
+                // Vertical-only resize handle along the bottom edge: drag down
+                // to make the box taller (content scrolls inside).
+                const grip = body.createDiv({ cls: "step-bar-popover-grip" });
+                grip.style.position = "absolute";
+                grip.style.left = "0";
+                grip.style.right = "0";
+                grip.style.bottom = "0";
+                grip.style.height = "9px";
+                grip.style.cursor = "ns-resize";
+                grip.style.zIndex = "10";
+                grip.style.background = "transparent";
+                let vresize = null;
+                grip.addEventListener("pointerdown", (ev) => {
+                    ev.preventDefault();
+                    vresize = { sy: ev.clientY, h: body.offsetHeight };
+                    grip.setPointerCapture(ev.pointerId);
+                });
+                grip.addEventListener("pointermove", (ev) => {
+                    if (!vresize) return;
+                    body.dataset.stepUserH = "1";
+                    body.style.height = Math.max(80, vresize.h + ev.clientY - vresize.sy) + "px";
+                });
+                const endV = () => { vresize = null; };
+                grip.addEventListener("pointerup", endV);
+                grip.addEventListener("pointercancel", endV);
+                entry.hide = () => { try { body.remove(); } catch (e) {} };
+
+                // Drag by the header. Listeners go on document while dragging:
+                // element capture is unreliable here because Obsidian's
+                // HoverPopover owns the element and can re-render it mid-drag.
+                // Drag the box. Deliberately capture-free: element pointer
+                // capture can be lost the moment anything re-renders the
+                // header (which happens on notes whose popover body is rebuilt,
+                // e.g. one referencing its own section), and a spurious
+                // `lostpointercapture` used to end the drag on its first tick.
+                // Everything runs off window-level capture listeners instead.
+                // Deliberately no `blur` listener: the first press on this box
+                // is what moves focus off the STEP <webview>, which fires a
+                // window blur mid-press. Ending the drag on that blur is what
+                // made the first drag after pinning do nothing at all; a
+                // pointermove with no button held ends it instead.
+                let drag = null;
+                let dragRaf = false;
+                const onDragMove = (ev) => {
+                    if (!drag) return;
+                    if (ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
+                    // A move with no button held means the release happened
+                    // somewhere we never saw (outside the window). End here
+                    // rather than let the box follow the bare pointer.
+                    if (ev.buttons === 0) { onDragEnd({ type: "cancel" }); return; }
+                    const dx = ev.clientX - drag.sx;
+                    const dy = ev.clientY - drag.sy;
+                    if (!dx && !dy) return;
+                    drag.moved = true;
+                    body.style.left = Math.max(0, drag.l + dx) + "px";
+                    body.style.top = Math.max(0, drag.t + dy) + "px";
+                };
+                const onDragEnd = (ev) => {
+                    if (!drag) return;
+                    // Ignore a pointerup/cancel that belongs to another pointer.
+                    if (ev && ev.pointerId !== undefined && drag.pid !== undefined &&
+                        ev.pointerId !== drag.pid) return;
+                    // A pointerup while the button is still reported down, or a
+                    // pointercancel we did not ask for, must not kill the drag.
+                    if (ev && ev.type === "pointerup" && ev.buttons) return;
+                    drag = null;
+                    dragRaf = false;
+                    this._barDragging = false;
+                    try { body.style.userSelect = ""; body.style.cursor = ""; } catch (e) {}
+                    window.removeEventListener("pointermove", onDragMove, true);
+                    window.removeEventListener("pointerup", onDragEnd, true);
+                    window.removeEventListener("pointercancel", onDragEnd, true);
+                };
+                header.style.cursor = "move";
+                header.style.touchAction = "none";
+                header.style.userSelect = "none";
+                const startDrag = (ev) => {
+                    if (drag) return;
+                    if (ev.button !== undefined && ev.button !== 0) return;
+                    const t = ev.target;
+                    if (t && t.closest && t.closest("button, a, .step-bar-popover-grip")) return;
+                    const r = body.getBoundingClientRect();
+                    // The box is right-aligned with translateX(-100%); drop the
+                    // transform before dragging or it jumps a full width left.
+                    body.style.transform = "none";
+                    body.style.left = r.left + "px";
+                    body.style.top = r.top + "px";
+                    drag = { sx: ev.clientX, sy: ev.clientY, l: r.left, t: r.top, pid: ev.pointerId, moved: false };
+                    // Stop hover handling for the duration of the drag.
+                    this._barDragging = true;
+                    clearTimeout(this._barOpenTimer);
+                    clearTimeout(this._hoverCloseTimer);
+                    try { body.style.userSelect = "none"; body.style.cursor = "grabbing"; } catch (e) {}
+                    // Nothing else in Obsidian gets to see this press: link
+                    // handling, page preview and the editor all bail out.
+                    try { ev.preventDefault(); } catch (e) {}
+                    try { ev.stopPropagation(); } catch (e) {}
+                    window.addEventListener("pointermove", onDragMove, true);
+                    window.addEventListener("pointerup", onDragEnd, true);
+                    window.addEventListener("pointercancel", onDragEnd, true);
+                };
+                // One entry point only, and it is the header: the markdown
+                // body keeps its own pointer behaviour so text there can be
+                // selected and links clicked, and pressing it never moves the
+                // box. A single capture listener, so a press fires startDrag
+                // exactly once (an old body+header pair fired it twice and the
+                // second pass could clear the drag state).
+                header.addEventListener("pointerdown", startDrag, true);
+            }
+
             const mdEl = body.createDiv({ cls: "step-bar-popover-body" });
             mdEl.style.padding = "8px 14px 10px 14px";
             // The markdown body is its own scroll container: the title block
@@ -5783,106 +5984,6 @@ class StepInterfaceObsidian {
                 body.style.maxHeight = collapsedPopover ? "none" : capH() + "px";
                 if (!collapsedPopover) body.style.height = capH() + "px";
 
-                // Vertical-only resize handle along the bottom edge: drag down
-                // to make the box taller (content scrolls inside).
-                const grip = body.createDiv({ cls: "step-bar-popover-grip" });
-                grip.style.position = "absolute";
-                grip.style.left = "0";
-                grip.style.right = "0";
-                grip.style.bottom = "0";
-                grip.style.height = "9px";
-                grip.style.cursor = "ns-resize";
-                grip.style.zIndex = "10";
-                grip.style.background = "transparent";
-                let vresize = null;
-                grip.addEventListener("pointerdown", (ev) => {
-                    ev.preventDefault();
-                    vresize = { sy: ev.clientY, h: body.offsetHeight };
-                    grip.setPointerCapture(ev.pointerId);
-                });
-                grip.addEventListener("pointermove", (ev) => {
-                    if (!vresize) return;
-                    body.dataset.stepUserH = "1";
-                    body.style.height = Math.max(80, vresize.h + ev.clientY - vresize.sy) + "px";
-                });
-                const endV = () => { vresize = null; };
-                grip.addEventListener("pointerup", endV);
-                grip.addEventListener("pointercancel", endV);
-                entry.hide = () => { try { body.remove(); } catch (e) {} };
-
-                // Drag by the header. Listeners go on document while dragging:
-                // element capture is unreliable here because Obsidian's
-                // HoverPopover owns the element and can re-render it mid-drag.
-                // Drag the box. Deliberately capture-free: element pointer
-                // capture can be lost the moment anything re-renders the
-                // header (which happens on notes whose popover body is rebuilt,
-                // e.g. one referencing its own section), and a spurious
-                // `lostpointercapture` used to end the drag on its first tick.
-                // Everything runs off window-level capture listeners instead.
-                let drag = null;
-                let dragRaf = false;
-                const onDragMove = (ev) => {
-                    if (!drag) return;
-                    if (ev.pointerId !== undefined && drag.pid !== ev.pointerId) return;
-                    const dx = ev.clientX - drag.sx;
-                    const dy = ev.clientY - drag.sy;
-                    if (!dx && !dy) return;
-                    drag.moved = true;
-                    body.style.left = Math.max(0, drag.l + dx) + "px";
-                    body.style.top = Math.max(0, drag.t + dy) + "px";
-                };
-                const onDragEnd = (ev) => {
-                    if (!drag) return;
-                    // Ignore a pointerup/cancel that belongs to another pointer.
-                    if (ev && ev.pointerId !== undefined && drag.pid !== undefined &&
-                        ev.pointerId !== drag.pid && ev.type !== "blur") return;
-                    // A pointerup while the button is still reported down, or a
-                    // pointercancel we did not ask for, must not kill the drag.
-                    if (ev && ev.type === "pointerup" && ev.buttons) return;
-                    drag = null;
-                    dragRaf = false;
-                    this._barDragging = false;
-                    try { body.style.userSelect = ""; body.style.cursor = "move"; } catch (e) {}
-                    window.removeEventListener("pointermove", onDragMove, true);
-                    window.removeEventListener("pointerup", onDragEnd, true);
-                    window.removeEventListener("pointercancel", onDragEnd, true);
-                    window.removeEventListener("blur", onBlur, true);
-                };
-                const onBlur = () => onDragEnd({ type: "blur" });
-                header.style.cursor = "move";
-                header.style.touchAction = "none";
-                header.style.userSelect = "none";
-                body.style.cursor = "move";
-                const startDrag = (ev) => {
-                    if (drag) return;
-                    if (ev.button !== undefined && ev.button !== 0) return;
-                    const t = ev.target;
-                    if (t && t.closest && t.closest("button, a, .step-bar-popover-grip")) return;
-                    const r = body.getBoundingClientRect();
-                    // The box is right-aligned with translateX(-100%); drop the
-                    // transform before dragging or it jumps a full width left.
-                    body.style.transform = "none";
-                    body.style.left = r.left + "px";
-                    body.style.top = r.top + "px";
-                    drag = { sx: ev.clientX, sy: ev.clientY, l: r.left, t: r.top, pid: ev.pointerId, moved: false };
-                    // Stop hover handling for the duration of the drag.
-                    this._barDragging = true;
-                    clearTimeout(this._barOpenTimer);
-                    clearTimeout(this._hoverCloseTimer);
-                    try { body.style.userSelect = "none"; body.style.cursor = "grabbing"; } catch (e) {}
-                    // Nothing else in Obsidian gets to see this press: link
-                    // handling, page preview and the editor all bail out.
-                    try { ev.preventDefault(); } catch (e) {}
-                    try { ev.stopPropagation(); } catch (e) {}
-                    window.addEventListener("pointermove", onDragMove, true);
-                    window.addEventListener("pointerup", onDragEnd, true);
-                    window.addEventListener("pointercancel", onDragEnd, true);
-                    window.addEventListener("blur", onBlur, true);
-                };
-                // One entry point only. A single capture listener, so a press
-                // fires startDrag exactly once (the old body+header pair fired
-                // it twice and the second pass could clear the drag state).
-                body.addEventListener("pointerdown", startDrag, true);
             }
 
             if (collapsedPopover) {
@@ -6036,6 +6137,7 @@ class LinkPopout {
     // "working", not as an empty box. No text: the surface is themed and the
     // animation says it.
     _showLoading(pop) {
+        if (pop) pop.style.width = "460px";
         this._ensureStyles();
         pop.innerHTML =
             '<div style="display:flex;align-items:center;justify-content:center;padding:1px 0">' +
@@ -6062,6 +6164,7 @@ class LinkPopout {
             borderRadius: "var(--radius-m, 8px)",
             padding: "12px 14px",
             width: "460px",
+            maxWidth: "calc(100vw - 24px)",
             maxHeight: "350px",
             overflowY: "auto",
             boxShadow: "0 4px 18px rgba(0,0,0,0.28)",
@@ -6075,12 +6178,40 @@ class LinkPopout {
 
         document.body.appendChild(pop);
 
+        // As far right as the link allows: the box's right edge sits on the
+        // link's right edge, or on the window's edge, whichever comes first —
+        // and never past either. Anchored by `right`, not `left`, so a later
+        // width change (the narrow "Passage visible" label) keeps that edge.
         const rect = pop.getBoundingClientRect();
-        let leftPos = evt.clientX + 15;
-        if (leftPos + rect.width > window.innerWidth) {
-            leftPos = evt.clientX - rect.width - 15;
+        const vw = window.innerWidth;
+        const margin = 12;
+
+        // The element the reference is written in. A whole line is a poor
+        // anchor (it spans the pane), so prefer the link or the reference run.
+        const anchorEl = (evt.target && evt.target.closest)
+            ? (evt.target.closest("a[href], .cm-underline") || evt.target)
+            : null;
+        const aRect = anchorEl && anchorEl.getBoundingClientRect
+            ? anchorEl.getBoundingClientRect()
+            : null;
+        const anchorRight = (aRect && aRect.width > 0) ? aRect.right : evt.clientX;
+
+        const rightEdge = Math.min(anchorRight, vw - margin);
+        const leftIfRightAnchored = rightEdge - rect.width;
+
+        // The base style parks the box off-screen with left/top: -9999px.
+        // A parked left would override the right anchor, so each path drops
+        // the other edge.
+        if (leftIfRightAnchored >= margin) {
+            pop.style.right = `${vw - rightEdge}px`;
+            pop.style.left = "";
+        } else {
+            // The box is wider than the room between the window's left edge
+            // and the link: keep it on screen and let the right edge fall
+            // where it must.
+            pop.style.left = `${margin}px`;
+            pop.style.right = "";
         }
-        pop.style.left = `${leftPos}px`;
         pop.style.top = `${evt.clientY + 15}px`;
 
         this.active = pop;
@@ -6184,6 +6315,86 @@ class LinkPopout {
 
             const verseRefs = this.plugin.urlRef_verseListArray(urlRef);
 
+            // Already in front of the reader? Then there is nothing to fetch,
+            // and the box says so instead of re-reading the passage. One
+            // visible verse is enough: the point is that the text can be
+            // read where it is.
+            if (this.plugin.settings.popoutVisiblePassages !== false) {
+                let onScreen = false;
+                try { onScreen = await this._anyVisible(verseRefs); } catch (e) {}
+                if (this.active !== pop) return;
+                if (onScreen) {
+                    // Not a dead end: the label loads the text on a click.
+                    this._showVisible(pop, () => {
+                        this._renderText(pop, verseRefs, url).catch(() => this._showOffline(pop));
+                    });
+                    return;
+                }
+            }
+
+            await this._renderText(pop, verseRefs, url);
+
+        } catch (err) {
+            // A request failed after the liveness check passed: the server
+            // stopped, or it answered with something that isn't a STEP page.
+            this._showOffline(pop);
+        }
+    }
+
+    // The green label shown when the passage is already on the page. It is a
+    // button, not a notice: clicking it loads the text anyway, so the popout
+    // never leaves the reader without a way to read the passage.
+    _showVisible(pop, loadText) {
+        if (!pop) return;
+        pop.innerHTML = "";
+        const row = document.createElement("div");
+        row.classList.add("step-popover-visible");
+        row.setAttribute("role", "button");
+        row.setAttribute("tabindex", "0");
+        // Stacked, and only as wide as the words: the box was 460px wide for
+        // verse text, which is mostly empty around two short lines.
+        row.style.cssText =
+            "display:flex;flex-direction:column;align-items:flex-start;gap:1px;" +
+            "width:fit-content;max-width:100%;cursor:pointer;";
+        pop.style.width = "fit-content";
+        const label = document.createElement("span");
+        label.style.cssText = "color:#3fb950;font-weight:600;";
+        label.textContent = "Passage visible";
+        const hint = document.createElement("span");
+        hint.style.cssText = "color:var(--text-muted);font-size:11.5px;";
+        hint.textContent = "click to load text";
+        row.appendChild(label);
+        row.appendChild(hint);
+
+        let used = false;
+        const load = (ev) => {
+            if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+            if (used) return;
+            used = true;
+            if (pop !== this.active) return;
+            this._showLoading(pop);
+            loadText();
+        };
+        row.addEventListener("click", load);
+        row.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") load(ev);
+        });
+
+        pop.appendChild(row);
+        this._reveal(pop);
+    }
+
+    // Fetch the verses and fill the box. Shared by the ordinary hover and by
+    // the click on the "Passage visible" label, so both follow the same path.
+    async _renderText(pop, verseRefs, url) {
+        this._showLoading(pop);
+        try {
+            if (!(await this.plugin.isLocalStepRunning())) {
+                if (pop === this.active) this._showOffline(pop);
+                return;
+            }
+            if (pop !== this.active) return;
+
             let combined = "";
             const seen = new Set();
 
@@ -6218,16 +6429,16 @@ class LinkPopout {
                 const [book, chap, verse] = vRef.split(".");
                 combined += `<p><strong>${chap}:${verse}</strong> ${verseText}</p>`;
 
-                this._reveal(pop);
+                if (pop === this.active) this._reveal(pop);
             }
 
+            if (pop !== this.active) return;
             pop.innerHTML = combined || "<p><i>No English text found.</i></p>";
             this._reveal(pop);
-
         } catch (err) {
             // A request failed after the liveness check passed: the server
             // stopped, or it answered with something that isn't a STEP page.
-            this._showOffline(pop);
+            if (pop === this.active) this._showOffline(pop);
         }
     }
 
@@ -6261,14 +6472,41 @@ class LinkPopout {
     }
 
     // Light the matching verses in every STEP webview showing any of them.
+    // Every STEP pane we can talk to. The class has no other way in.
+    _wvEls() {
+        return this.plugin.app.workspace.getLeavesOfType("webviewer")
+            .map(l => l?.view?.webview ?? l?.view?.el?.querySelector?.("webview"))
+            .filter(el => el && typeof el.executeJavaScript === "function");
+    }
+
+    // True when any of these references is already on screen in a STEP pane.
+    // A hidden pane is skipped outright: its verses have perfectly good
+    // geometry and nobody can see them.
+    async _anyVisible(refs) {
+        const want = (refs || []).filter(r => typeof r === "string" && r.includes("."));
+        if (!want.length) return false;
+        const arg = JSON.stringify(want);
+        for (const wvEl of this._wvEls()) {
+            let res = null;
+            try {
+                res = await wvEl.executeJavaScript(
+                    "(window.__stepVisibleRefs ? window.__stepVisibleRefs(" + arg + ") : null)"
+                );
+            } catch (e) { continue; }
+            if (!res || res.paneHidden || !res.refs) continue;
+            for (const ref of want) {
+                const r = res.refs[ref];
+                if (r && r.visible) return true;
+            }
+        }
+        return false;
+    }
+
     async _highlight(urlRef) {
         if (!urlRef.includes(".")) return;
 
         const plugin = this.plugin;
-        const wvLeaves = plugin.app.workspace.getLeavesOfType("webviewer");
-        const wvEls = wvLeaves
-            .map(l => l?.view?.webview ?? l?.view?.el?.querySelector?.("webview"))
-            .filter(el => el && typeof el.executeJavaScript === "function");
+        const wvEls = this._wvEls();
 
         const hoverSet = new Set(plugin.urlRef_verseListArray(urlRef) || []);
         if (!hoverSet.size) return;
@@ -6327,10 +6565,8 @@ class LinkPopout {
 
     // Clear .step-ref-hover highlights in every STEP webview.
     clearHighlights() {
-        const wvLeaves = this.plugin.app.workspace.getLeavesOfType("webviewer");
-        for (const l of wvLeaves) {
-            const wvEl = l?.view?.webview ?? l?.view?.el?.querySelector?.("webview");
-            if (wvEl && typeof wvEl.executeJavaScript === "function") {
+        for (const wvEl of this._wvEls()) {
+            if (wvEl) {
                 wvEl.executeJavaScript(`
                     document.querySelectorAll(".step-ref-hover").forEach(el =>
                         el.classList.remove("step-ref-hover"));

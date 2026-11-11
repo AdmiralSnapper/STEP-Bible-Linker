@@ -16,6 +16,7 @@
     "Sermons": "#ac4906"
   },
   "noteTypesFolder": "Second Brain/Bible",
+  "popoutVisiblePassages": true,
   "autoSyncOnNavigation": false,
   "autoCloseSearchPanel": false,
   "crosslinkColour": "#3d8fe6",
@@ -30,5 +31,5 @@
     "ESV"
   ],
   "lastSyncedServerMode": true,
-  "searchModalSettingsOpen": true
+  "searchModalSettingsOpen": false
 }

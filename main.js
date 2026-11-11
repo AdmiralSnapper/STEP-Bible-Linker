@@ -1,23 +1,26 @@
 const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder, setIcon } = require('obsidian');
 
+//STEP BIBLE LOCAL SERVER =======================================================
+// STEP Bible is only ever read from the user's own local installation. The
+// online site is never fetched: its terms don't cover a third party rendering
+// its pages, and the local install is the copy the user already has.
+const LOCAL_STEP_BASE = "http://localhost:8989/";
+
 //SETTINGS ======================================================================
 /**
  * @typedef {Object} StepBibleLinkerSettings
- * @property {boolean} useLocalStepServer - If true, use local URL prefix
  * @property {string[]} globalVersions - Master list and ordering of versions configured in settings
  * @property {string[]} localVersions - Active versions toggled in search modal and used in links
  */
 
 /** @type {StepBibleLinkerSettings} */
 const DEFAULT_SETTINGS = {
-    useLocalStepServer: true,
     globalVersions: ["ESV", "THOT", "SBLG"],
     localVersions: ["ESV", "THOT", "SBLG"],
     noteLinesColour: "#17758f",
     typedColours: {},
     noteTypesFolder: "",
 };
-
 class FolderSuggest extends AbstractInputSuggest {
     constructor(app, inputEl, onPick) {
         super(app, inputEl);
@@ -41,7 +44,6 @@ class FolderSuggest extends AbstractInputSuggest {
         if (this.onPick) this.onPick(path);
     }
 }
-
 function parseTypedFile(text, fileBasename) {
     const refLine = /^[ \t]*(?:\(\s*)?\[([^\]]+)\]\(([^)]*reference=[^)]*)\)(.*)$/; // optional "(" before the link; link must start the line
     const inlineRef = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
@@ -101,7 +103,6 @@ function parseTypedFile(text, fileBasename) {
     }
     return { entries, crosslinks };
 }
-
 function canonBounds(range) {
     if (!range) return null;
     const point = (s) => {
@@ -125,7 +126,6 @@ function canonBounds(range) {
     };
     return { start: ord(a, false), end: ord(b, true) };
 }
-
 function scopeRelation(sectionCanon, targetCanon) {
     const s = canonBounds(sectionCanon);
     const t = canonBounds(targetCanon);
@@ -136,7 +136,6 @@ function scopeRelation(sectionCanon, targetCanon) {
     if (s.start >= t.start && s.end <= t.end) return "encloses";
     return "external";
 }
-
 class StepBibleLinkerSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
@@ -158,19 +157,20 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
 
         containerEl.createEl("h2", { text: "STEP Bible Linker Settings" });
 
-        new Setting(containerEl)
-            .setName("Use STEP localhost.")
-            .setDesc("Toggle between local STEP localhost and online STEP website. This will need to be installed on your computer and running.")
-            .addToggle(toggle => {
-                toggle
-                    .setValue(this.plugin.settings.useLocalStepServer)
-                    .onChange(async (value) => {
-                        this.plugin.settings.useLocalStepServer = value;
-                        await this.plugin.saveSettings();
-                        await this.plugin.toggleLocaltoOnline();
-                        this.display();
-                    });
-            });
+        const serverStatus = new Setting(containerEl)
+            .setName("STEP Bible localhost")
+            .setDesc("STEP Bible must be installed on this computer and running at http://localhost:8989. It is the only source of Bible text the plugin reads.");
+        serverStatus.settingEl.style.alignItems = "flex-start";
+
+        const statusLine = serverStatus.descEl.createEl("div");
+        statusLine.style.marginTop = "6px";
+        statusLine.style.fontSize = "12px";
+        statusLine.style.fontWeight = "bold";
+        statusLine.setText("Checking…");
+        this.plugin.isLocalStepRunning().then(up => {
+            statusLine.setText(up ? "● Running" : "● Offline — start STEP Bible, then reopen this tab");
+            statusLine.style.color = up ? "#4caf50" : "var(--text-error)";
+        });
 
         containerEl.createEl("h3", { text: "STEP Note bars" });
 
@@ -480,7 +480,6 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
         });
     }
 }
-
 class StepBibleSearchModal extends Modal {
     constructor(app, plugin, prefill = "") {
         super(app);
@@ -491,39 +490,26 @@ class StepBibleSearchModal extends Modal {
 
         // Draft state (only applied when Enter is pressed)
         this._draftLocalVersions = [...(this.plugin.settings.localVersions || [])];
-        this._draftLocalStepServer = this.plugin.settings.useLocalStepServer;
 
         // Track last synced vault states (default to current if not set)
         if (!this.plugin.settings.lastSyncedVersions) {
             this.plugin.settings.lastSyncedVersions = [...(this.plugin.settings.localVersions || [])];
-        }
-        if (this.plugin.settings.lastSyncedServerMode === undefined) {
-            this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
         }
     }
 
     hasAnyDraftChanges() {
         const local = this._draftLocalVersions;
         const currentLocal = this.plugin.settings.localVersions || [];
-        const versionsChanged = local.length !== currentLocal.length || local.some((v, i) => v !== currentLocal[i]);
-        const serverChanged = this._draftLocalStepServer !== this.plugin.settings.useLocalStepServer;
-        return versionsChanged || serverChanged;
+        return local.length !== currentLocal.length || local.some((v, i) => v !== currentLocal[i]);
     }
 
     async openStepUrl(url) {
-        const localUp = await this.plugin.isLocalStepRunning();
-        if (!localUp) {
-            url = this.plugin.localUrl_onlineUrl(url);
-        } else {
-            try {
-                const { requestUrl } = require("obsidian");
-                const res = await requestUrl({ url, method: "GET", throw: false });
-                if (!(res.status >= 200 && res.status < 400)) {
-                    url = this.plugin.localUrl_onlineUrl(url);
-                }
-            } catch {
-                url = this.plugin.localUrl_onlineUrl(url);
-            }
+        // No online fallback any more: without the local server there is no
+        // Bible text to show, so say so instead of opening a broken page.
+        if (!(await this.plugin.isLocalStepRunning())) {
+            new Notice("STEP Bible isn't running. Start it and try again (http://localhost:8989).");
+            if (this._refreshServerStatus) this._refreshServerStatus();
+            return;
         }
 
         // Always open in a fresh tab:
@@ -599,6 +585,28 @@ class StepBibleSearchModal extends Modal {
             input.value = this.prefill.trim();
             input.select();
         }
+
+        // Offline banner: visible without opening the settings drawer, because
+        // nothing the modal does works without the local server.
+        const offlineBanner = contentEl.createEl("div");
+        offlineBanner.style.display = "none";
+        offlineBanner.style.alignItems = "center";
+        offlineBanner.style.gap = "8px";
+        offlineBanner.style.padding = "8px 10px";
+        offlineBanner.style.fontSize = "12px";
+        offlineBanner.style.borderRadius = "4px";
+        offlineBanner.style.border = "1px solid var(--text-error)";
+        offlineBanner.style.color = "var(--text-error)";
+        offlineBanner.style.backgroundColor = "var(--background-secondary)";
+        offlineBanner.setText("STEP Bible isn't running. Start it, then reopen this window. It should be listening on http://localhost:8989.");
+
+        this._refreshServerStatus = async () => {
+            const up = await this.plugin.isLocalStepRunning();
+            this._serverUp = up;
+            offlineBanner.style.display = up ? "none" : "flex";
+            if (this._paintStatus) this._paintStatus(up);
+        };
+        this._refreshServerStatus();
 
         const isCurrentlyOpen = this.plugin.settings.searchModalSettingsOpen;
 
@@ -718,9 +726,6 @@ class StepBibleSearchModal extends Modal {
             return local.some((v, i) => v !== synced[i]);
         };
 
-        const isServerOutOfSync = () => {
-            return this._draftLocalStepServer !== this.plugin.settings.lastSyncedServerMode;
-        };
 
         // =========================================================================
         // SECTION 1: VERSIONS
@@ -811,7 +816,7 @@ class StepBibleSearchModal extends Modal {
         renderVersionPills();
 
         // =========================================================================
-        // SECTION 2: SERVER
+        // SECTION 2: SERVER STATUS (read-only; there is nothing to choose)
         // =========================================================================
         const serverSection = settingsDrawer.createEl("div");
         serverSection.style.display = "flex";
@@ -823,69 +828,20 @@ class StepBibleSearchModal extends Modal {
         serverTitle.style.fontWeight = "bold";
         serverTitle.style.color = "var(--text-muted)";
 
-        const serverRow = serverSection.createEl("div");
-        serverRow.style.display = "flex";
-        serverRow.style.justifyContent = "space-between";
-        serverRow.style.alignItems = "center";
-
-        const serverPillContainer = serverRow.createEl("div");
-
-        const localStatusIndicator = serverRow.createEl("span", { text: "" });
+        const localStatusIndicator = serverSection.createEl("span", { text: "Checking…" });
         localStatusIndicator.style.fontSize = "11px";
         localStatusIndicator.style.fontWeight = "bold";
         localStatusIndicator.style.userSelect = "none";
 
-        const checkLocalServerStatus = async () => {
-            const isRunning = await this.plugin.isLocalStepRunning();
-            if (isRunning) {
-                localStatusIndicator.setText("● Localhost Running");
-                localStatusIndicator.style.color = "#4caf50";
-            } else {
-                localStatusIndicator.setText("● Localhost Offline");
-                localStatusIndicator.style.color = "var(--text-muted)";
-            }
+        this._paintStatus = (up) => {
+            localStatusIndicator.setText(up ? "● Localhost Running" : "● Localhost Offline");
+            localStatusIndicator.style.color = up ? "#4caf50" : "var(--text-error)";
         };
-
-        checkLocalServerStatus();
-
-        const renderServerPill = () => {
-            serverPillContainer.empty();
-
-            const isActive = this._draftLocalStepServer;
-            const btn = serverPillContainer.createEl("button", { text: "Localhost" });
-
-            btn.tabIndex = -1;
-            btn.style.padding = "4px 10px";
-            btn.style.fontSize = "12px";
-            btn.style.fontWeight = "bold";
-            btn.style.borderRadius = "12px";
-            btn.style.cursor = "pointer";
-            btn.style.border = "none";
-            btn.style.userSelect = "none";
-            btn.style.outline = "none";
-            btn.style.transition = "all 0.15s ease-in-out";
-
-            if (isActive) {
-                btn.style.backgroundColor = "var(--interactive-accent)";
-                btn.style.color = "var(--text-on-accent)";
-            } else {
-                btn.style.backgroundColor = "var(--background-modifier-border)";
-                btn.style.color = "var(--text-muted)";
-                btn.style.opacity = "0.7";
-            }
-
-            btn.onmousedown = (e) => e.preventDefault();
-
-            btn.onclick = (e) => {
-                e.preventDefault();
-                this._draftLocalStepServer = !isActive;
-                renderServerPill();
-                updateDrawerBorder();
-                input.focus();
-            };
-        };
-
-        renderServerPill();
+        if (this._serverUp === undefined) {
+            this.plugin.isLocalStepRunning().then(up => { this._serverUp = up; this._paintStatus(up); });
+        } else {
+            this._paintStatus(this._serverUp);
+        }
 
         settingsDrawer.appendChild(helperWrapper);
         updateDrawerBorder();
@@ -894,25 +850,16 @@ class StepBibleSearchModal extends Modal {
             const versionPart = this._draftLocalVersions
                 .map(v => `version=${v}`)
                 .join("@");
-            const prefix = this._draftLocalStepServer
-                ? "http://localhost:8989/"
-                : "https://www.stepbible.org/";
-            return `${prefix}?q=${versionPart}@reference=${urlRef}&options=GNVUH&display=COLUMN&skipwelcome`;
+            return `${LOCAL_STEP_BASE}?q=${versionPart}@reference=${urlRef}&options=GNVUH&display=COLUMN&skipwelcome`;
         };
 
         const commitDraftAndSync = async () => {
             const versionsChanged = isVersionsOutOfSync();
-            const serverChanged = isServerOutOfSync();
 
             // Commit all settings directly to plugin
             this.plugin.settings.localVersions = [...this._draftLocalVersions];
-            this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
             await this.plugin.saveSettings();
 
-            if (serverChanged) {
-                await this.plugin.toggleLocaltoOnline();
-                this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
-            }
             if (versionsChanged) {
                 await this.plugin.rewriteStepLinks();
                 this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
@@ -960,7 +907,6 @@ class StepBibleSearchModal extends Modal {
                         this._changesCommitted = true;
                         updateDrawerBorder();
                         renderVersionPills();
-                        renderServerPill();
                     } finally {
                         resetInputState();
                     }
@@ -989,11 +935,9 @@ class StepBibleSearchModal extends Modal {
 
                 const url = buildUrlWithDraftVersions(urlRef);
                 const versionsChanged = isVersionsOutOfSync();
-                const serverChanged = isServerOutOfSync();
 
                 // --- CRITICAL FIX: COMMIT SETTINGS SYNCHRONOUSLY BEFORE OPENING TAB ---
                 this.plugin.settings.localVersions = [...this._draftLocalVersions];
-                this.plugin.settings.useLocalStepServer = this._draftLocalStepServer;
                 this._changesCommitted = true;
 
                 // 1. Search & Open URL inside Obsidian tab
@@ -1007,12 +951,8 @@ class StepBibleSearchModal extends Modal {
                 // 3. Save settings to disk & update vault in background
                 await this.plugin.saveSettings();
 
-                if (versionsChanged || serverChanged) {
+                if (versionsChanged) {
                     setTimeout(async () => {
-                        if (serverChanged) {
-                            await this.plugin.toggleLocaltoOnline();
-                            this.plugin.settings.lastSyncedServerMode = this.plugin.settings.useLocalStepServer;
-                        }
                         if (versionsChanged) {
                             await this.plugin.rewriteStepLinks();
                             this.plugin.settings.lastSyncedVersions = [...this.plugin.settings.localVersions];
@@ -1040,7 +980,6 @@ class StepBibleSearchModal extends Modal {
         this.contentEl.empty();
     }
 }
-
 module.exports = class StepBibleLinkerPlugin extends Plugin {
     /** @type {StepBibleLinkerSettings} */
     settings;
@@ -1048,7 +987,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     async onload() {
 
         console.log('STEP Bible Linker Loaded.');
-        this.activePopover = null;
 
         // Note-dots state (vault scan derived from the per-file text cache)
         this._noteDotsCache = null;
@@ -1210,279 +1148,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         );
         // HOVERING HANDLER
         //============================================================================
-        this.registerDomEvent(document, "mouseover", async (evt) => {
-            const targetEl = evt.target;
-            if (!targetEl) return;
-
-            let url = "";
-
-            const lineParent = targetEl.closest(".cm-line");
-            if (lineParent) {
-                const m = lineParent.textContent.match(/https?:\/\/[^\s)]+/);
-                if (m) url = m[0];
-            }
-
-            if (!url) {
-                const a = targetEl.closest("a[href]");
-                if (a && a.href.startsWith(this.urlPrefix)) {
-                    url = a.href;
-                }
-            }
-
-            if (!url) {
-                const u = targetEl.closest(".cm-underline");
-                if (u) {
-                    const t = u.textContent.trim();
-                    const refPattern =
-                        /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*(?:\s+\d+(?::\d+)?(?:\s*-\s*\d+(?::\d+)?)?)?$/;
-
-                    if (refPattern.test(t)) {
-                        const urlRef = this.inputRef_urlRef(t);
-                        if (urlRef) {
-                            const builtUrl = this.urlRef_url(urlRef);
-                            if (builtUrl) url = builtUrl;
-                        }
-                    }
-                }
-            }
-
-
-            if (!url || !url.startsWith(this.urlPrefix)) return;
-
-            // Only clear/reprocess when the hovered reference actually changes;
-            // mouseover fires repeatedly on child elements within the same link.
-            const refKey = this.urlRef_url(url);
-            if (this._hoverRefKey === refKey) return;
-            this._hoverRefKey = refKey;
-
-            // Any new reference clears leftover highlights
-            this.clearAllStepHighlights();
-
-            if (this.activePopover) {
-                this.activePopover.remove();
-                this.activePopover = null;
-            }
-
-            const pop = document.createElement("div");
-            pop.classList.add("step-popover");
-            Object.assign(pop.style, {
-                position: "fixed",
-                left: "-9999px",
-                top: "-9999px",
-                visibility: "hidden",
-                backgroundColor: "#2c2c2c",
-                border: "1px solid var(--border-color)",
-                borderRadius: "6px",
-                padding: "14px",
-                width: "460px",
-                maxHeight: "350px",
-                overflowY: "auto",
-                boxShadow: "0 4px 14px rgba(0,0,0,0.25)",
-                // The scripture-text preview is the top layer: it must sit
-                // above every bar, note and Wider References list.
-                zIndex: "1000060",
-                color: "#d6d6d6",
-                fontSize: "13.5px",
-                lineHeight: "1.6",
-                fontFamily: "var(--font-interface)"
-            });
-
-            pop.innerHTML = "<i>Loading STEP Bible\u2026</i>";
-            document.body.appendChild(pop);
-
-            const rect = pop.getBoundingClientRect();
-            let leftPos = evt.clientX + 15;
-            if (leftPos + rect.width > window.innerWidth) {
-                leftPos = evt.clientX - rect.width - 15;
-            }
-
-            pop.style.left = `${leftPos}px`;
-            pop.style.top = `${evt.clientY + 15}px`;
-            pop.style.visibility = "visible";
-
-            this.activePopover = pop;
-
-            let hideTimeout = null;
-            const cancelHide = () => {
-                if (hideTimeout) clearTimeout(hideTimeout);
-                hideTimeout = null;
-            };
-            const scheduleHide = () => {
-                cancelHide();
-                hideTimeout = setTimeout(() => {
-                    pop.remove();
-                    if (this.activePopover === pop) this.activePopover = null;
-                    // Pop is gone: allow the same link to re-trigger a popup
-                    this._hoverRefKey = null;
-                }, 200);
-            };
-
-            requestAnimationFrame(() => {
-                targetEl.addEventListener("mouseleave", scheduleHide, { once: true });
-                pop.addEventListener("mouseenter", cancelHide);
-                pop.addEventListener("mouseleave", () => {
-                    scheduleHide();
-                    // Highlights only clear when the pointer leaves the popout
-                    this._hoverRefKey = null;
-                    this.clearAllStepHighlights();
-                });
-                // Leaving the link without entering the popout also clears highlights
-                targetEl.addEventListener("mouseleave", () => {
-                    setTimeout(() => {
-                        if (!pop.isConnected) {
-                            this._hoverRefKey = null;
-                            this.clearAllStepHighlights();
-                        }
-                    }, 400);
-                }, { once: true });
-            });
-
-            try {
-                if (!(await this.isLocalStepRunning())) {
-                    url = this.localUrl_onlineUrl(url);
-                }
-
-                const urlRef = this.url_urlRef(url);
-                if (!urlRef) return;
-
-                // ---------- WEBVIEW HIGHLIGHT CHECK ----------
-                // Highlight verses in any STEP webviewer tab showing verses
-                // in this reference's range.
-                if (urlRef.includes(".")) {
-                    const wvLeaves = this.app.workspace.getLeavesOfType("webviewer");
-                    const wvEls = wvLeaves
-                        .map(l => l?.view?.webview ?? l?.view?.el?.querySelector?.("webview"))
-                        .filter(el => el && typeof el.executeJavaScript === "function");
-
-                    // Expand the hovered reference into explicit verse refs
-                    // (urlRef_verseListArray already handles ranges/chapters)
-                    const hoverRefs = this.urlRef_verseListArray(urlRef) || [];
-                    const hoverSet = new Set(hoverRefs);
-
-                    for (const wvEl of wvEls) {
-                        // Expand the page's current reference the same way
-                        const pageUrl = wvEl.getURL?.() || "";
-                        const pageUrlRef = this.url_urlRef(pageUrl);
-                        const pageRefs = pageUrlRef ? (this.urlRef_verseListArray(pageUrlRef) || []) : [];
-
-                        // Intersect
-                        const matched = pageRefs.filter(r => hoverSet.has(r));
-                        if (matched.length === 0) continue;
-
-                        await wvEl.executeJavaScript(`
-                            (function() {
-                                document.querySelectorAll(".step-ref-hover").forEach(el =>
-                                    el.classList.remove("step-ref-hover"));
-
-                                const existing = document.getElementById("step-linker-ref-style");
-                                if (existing) existing.remove();
-                                {
-                                    const style = document.createElement("style");
-                                    style.id = "step-linker-ref-style";
-                                    style.textContent = [
-                                        ".verse.step-ref-hover {",
-                                        "  background-color: rgba(190, 190, 163, 0.19) !important;",
-                                        "  outline: 1px solid #cacda600 !important;",
-                                        "  border-radius: 3px;",
-                                        "}"
-                                    ].join("\\n");
-                                    document.head.appendChild(style);
-                                }
-
-                                // Canonical matched set from the plugin
-                                const targetSet = new Set(${JSON.stringify(matched)});
-
-                                // Same conversion the dots use
-                                const bookMap = window.__stepDotBookMap || {};
-                                const toCanon = (ref) => {
-                                    const parts = ref.split(".");
-                                    const full = bookMap[parts[0].toLowerCase()];
-                                    if (!full) return null;
-                                    return [full.replace(/\\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
-                                };
-
-                                document.querySelectorAll("a.verseLink").forEach(a => {
-                                    const canon = toCanon(a.getAttribute("name") || "");
-                                    if (canon && targetSet.has(canon)) {
-                                        const verse = a.closest(".verse");
-                                        if (verse) verse.classList.add("step-ref-hover");
-                                    }
-                                });
-                            })();
-                        `);
-                    }
-                }
-                // ---------------------------------------------
-
-                //If only a book
-                if (!urlRef.includes(".")) {
-                    const info = BibleInformation.getBookOverview(urlRef);
-
-                    if (info) {
-                        pop.innerHTML = `
-                            <b>${info.name}</b><br>
-                            ${info.chapters} chapters<br><br>
-                            <i>Author:</i> ${info.author}<br>
-                            <i>Location:</i> ${info.location}<br>
-                            <i>Date:</i> ${info.date}<br><br>
-                            ${info.synopsis}
-                         `;
-                        return;
-                    }
-
-                    pop.innerHTML = `<b>${urlRef}</b><br>No overview available.`;
-                    return;
-                }
-
-                const verseRefs = this.urlRef_verseListArray(urlRef);
-
-                let combined = "";
-                const seen = new Set();
-
-                for (const vRef of verseRefs) {
-                    const verseUrl = url.includes("reference=")
-                        ? url.replace(/reference=[^&]+/, `reference=${encodeURIComponent(vRef)}`)
-                        : url;
-
-                    const response = await requestUrl({ url: verseUrl });
-                    const html = response.text;
-
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(html, "text/html");
-
-                    const title = doc.querySelector("title")?.textContent || "";
-                    const parts = title.split("|").map(p => p.trim());
-
-                    let verseText = "";
-                    if (parts.length >= 4) verseText = parts[3];
-
-                    verseText = verseText
-                        .replace(/\s+/g, " ")
-                        .replace(/\s+([,;:.!?])/g, "$1")
-                        .replace(/\s+\)/g, ")")
-                        .replace(/\(\s+/g, "(")
-                        .replace(/\s*,\s*$/g, "")
-                        .trim();
-
-                    if (!verseText || seen.has(verseText)) continue;
-                    seen.add(verseText);
-
-                    const [book, chap, verse] = vRef.split(".");
-                    combined += `<p><strong>${chap}:${verse}</strong> ${verseText}</p>`;
-                }
-
-                pop.innerHTML = combined || "<p><i>No English text found.</i></p>";
-
-                requestAnimationFrame(() => {
-                    if (pop.scrollHeight > pop.clientHeight) {
-                        pop.style.paddingBottom = "150px";
-                    }
-                });
-
-            } catch (err) {
-                pop.innerHTML = `<span style="color:var(--text-error)">Failed to load STEP Bible.</span>`;
-            }
-        });
+        // The verse-text preview for a STEP link. One box at a time, in its
+        // own class (see LinkPopout at the bottom of this file).
+        this.linkPopout = new LinkPopout(this);
+        this.linkPopout.mount();
 
         // OPEN SEARCH MODAL
         //============================================================================
@@ -1568,27 +1237,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     }
 
 
-    // Clear .step-ref-hover highlights in every STEP webview
-    clearAllStepHighlights() {
-        const wvLeaves = this.app.workspace.getLeavesOfType("webviewer");
-        for (const l of wvLeaves) {
-            const wvEl = l?.view?.webview ?? l?.view?.el?.querySelector?.("webview");
-            if (wvEl && typeof wvEl.executeJavaScript === "function") {
-                wvEl.executeJavaScript(`
-                    document.querySelectorAll(".step-ref-hover").forEach(el =>
-                        el.classList.remove("step-ref-hover"));
-                `).catch(() => { });
-            }
-        }
-    }
-
     // LOCAL/ONLINE URL HELPERS ===============================================================================
     async isLocalStepRunning() {
         // Cache: repeated hovers shouldn't re-fetch localhost every time.
+        // A "no" is cached only briefly: the user is likely to start STEP and
+        // try again straight away, and a stale "offline" makes the new
+        // indicator look broken. A "yes" is safe to hold for longer.
         const now = Date.now();
-        if (this._localStepRunningCache.value !== null
-            && now - this._localStepRunningCache.time < 10000) {
-            return this._localStepRunningCache.value;
+        const cache = this._localStepRunningCache || (this._localStepRunningCache = { value: null, time: 0 });
+        const ttl = cache.value === true ? 10000 : 1000;
+        if (cache.value !== null && now - cache.time < ttl) {
+            return cache.value;
         }
         try {
             const res = await requestUrl({
@@ -1604,16 +1263,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             return false;
         }
     }
-    localUrl_onlineUrl(localUrl) {
-        const onlineBase = "https://www.stepbible.org/?";
-
-        // Extract the query string after '?q='
-        const match = localUrl.match(/\?q=([^#]+)/);
-        if (!match) return localUrl;
-
-        return `${onlineBase}q=${match[1]}`;
-    }
-
     // CONVERTERS =============================================================================================
     inputRef_urlRef(inputRef) {
 
@@ -2588,39 +2237,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         new Notice("Updated Versions in Links");
     }
-    async toggleLocaltoOnline() {
-        const vault = this.app.vault;
-        const mdFiles = vault.getMarkdownFiles();
-
-        // Determine target prefix based on setting
-        const targetPrefix = this.urlPrefix; // either localhost or online
-
-        // Determine the opposite prefix
-        const onlinePrefix = "https://www.stepbible.org/";
-        const localPrefix = "http://localhost:8989/";
-
-        const sourcePrefix = targetPrefix === localPrefix
-            ? onlinePrefix
-            : localPrefix;
-
-        for (const file of mdFiles) {
-            const text = await vault.read(file);
-
-            // Replace ALL occurrences of the source prefix with the target prefix
-            const replaced = text.replace(
-                new RegExp(sourcePrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-                targetPrefix
-            );
-
-            if (replaced !== text) {
-                await vault.modify(file, replaced);
-            }
-        }
-
-        this.urlPrefix = targetPrefix;
-
-        new Notice("Links Updated to " + (targetPrefix === localPrefix ? "Local" : "Online") + " Server");
-    }
     async loadSettings() {
         const loadedData = await this.loadData() || {};
         if (loadedData.enabledVersions && !loadedData.globalVersions) {
@@ -2629,9 +2245,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             delete loadedData.enabledVersions;
         }
         this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
-        this.urlPrefix = this.settings.useLocalStepServer
-            ? "http://localhost:8989/"
-            : "https://www.stepbible.org/";
+        // Old settings files may still carry useLocalStepServer; it is ignored.
+        delete this.settings.useLocalStepServer;
+        this.urlPrefix = LOCAL_STEP_BASE;
     }
 
     // BAR HOVER POPOVER: the guest page reports bar hovers over Electron's
@@ -2780,21 +2396,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
-        this.urlPrefix = this.settings.useLocalStepServer
-            ? "http://localhost:8989/"
-            : "https://www.stepbible.org/";
+        this.urlPrefix = LOCAL_STEP_BASE;
     }
 
     // PLUGIN UNLOAD
     onunload() {
-        if (this.activePopover && this.activePopover.parentNode) {
-            this.activePopover.parentNode.removeChild(this.activePopover);
-        }
+        if (this.linkPopout) this.linkPopout.destroy();
         if (this._barInterfaces) this.closeBarPopovers();
         console.log('STEP Bible Linker unloaded.');
     }
 }
-
 class BibleInformation {
     // Canonical book order (no spaces), used to compare references.
     static _bookOrder = [
@@ -3609,7 +3220,6 @@ class BibleInformation {
         return BibleInformation._overviews[book] || null;
     }
 }
-
 class StepInterfaceDOM {
     constructor() {
         // Latest layout pass. Mounting always builds a new instance, so these
@@ -3647,7 +3257,11 @@ class StepInterfaceDOM {
     // rebuilt page never runs a stale copy of this code.
     installAliases() {
         window.__stepInjectDots = () => window.__stepDOM.inject();
-        window.__stepHighlight = (id, range, page) => window.__stepDOM.highlight(id, range, page);
+        // The host owns which notes stay underlined; the page can add one of
+        // its own (a plain note bar's mouseenter). Two setters, one painter,
+        // so neither can wipe the other.
+        window.__stepHighlight = (entries) => window.__stepDOM.highlight(entries);
+        window.__stepSetSelfLit = (entry) => window.__stepDOM.setSelfLit(entry);
         window.__stepInLane = (id, page) => window.__stepDOM.inLane(id, page);
         window.__stepHoldBars = (byPage) => window.__stepDOM.holdBars(byPage);
         window.__stepBarState = (state) => window.__stepDOM.barState(state);
@@ -3672,6 +3286,18 @@ class StepInterfaceDOM {
         if (!document.getElementById("step-linker-dot-style")) {
             const style = document.createElement("style");
             style.id = "step-linker-dot-style";
+            // The bar-underline colour: the bar's own colour, semi-transparent.
+            // Built here rather than in CSS so it follows the setting.
+            const barRgba = (() => {
+                const raw = String(window.__stepBarColour || "#17758f").trim().replace("#", "");
+                const hex = raw.length === 3
+                    ? raw.split("").map(c => c + c).join("")
+                    : raw;
+                const n = parseInt(hex, 16);
+                if (isNaN(n) || hex.length !== 6) return "rgba(23,117,143,0.55)";
+                const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+                return "rgba(" + r + "," + g + "," + b + ",0.55)";
+            })();
             style.textContent = [
                 "div.verse { position: relative; }",
                 // NOTE: no padding rule here — the adaptive gutter is set
@@ -3693,8 +3319,15 @@ class StepInterfaceDOM {
                 // the bar stays wide while its popover is open —
                 // including after the pointer moves onto the
                 // popover, or onto another bar.
-                ".step-note-bar[data-typed='1']:hover { width: 6px; opacity: 1; }",
-                ".step-note-bar[data-typed='1'][data-cross='1']:hover { width: 7px; opacity: 1; }",
+                // Widening is armed by the guest's own hit test, not by
+                // CSS :hover. :hover is continuous browser hit testing;
+                // the report that opens a note is sampled at mousemove.
+                // The two disagree at a bar's edge, and that gap is what
+                // let a brushed bar widen with no note and no underline.
+                // data-armed is set on exactly the bar that will be
+                // reported, so the three cannot part company.
+                ".step-note-bar[data-typed='1'][data-armed='1'] { width: 6px; opacity: 1; }",
+                ".step-note-bar[data-typed='1'][data-cross='1'][data-armed='1'] { width: 7px; opacity: 1; }",
                 ".step-note-bar[data-hold='1'] { opacity: 1; width: 6px; }",
                 ".step-note-bar[data-hold='1'][data-cross='1'] { width: 7px; }",
                 // A crosslink widens its section bar on hover, the
@@ -3709,13 +3342,18 @@ class StepInterfaceDOM {
                 // widths as a note bar, so a held lane and a held
                 // note read as the same weight.
                 ".step-note-overflow { width: 4px; opacity: 0.55; }" ,
-                ".step-note-overflow:hover { width: 6px; opacity: 1; }",
+                ".step-note-overflow[data-armed='1'] { width: 6px; opacity: 1; }",
                 ".step-note-overflow[data-hold='1'] { width: 6px; opacity: 1; }",
                 ".step-note-overflow[data-lane-hover='1'] { width: 6px; opacity: 1; }",
-                ".verse.step-ref-hover {",
-                "  background-color: rgba(190, 190, 163, 0.19) !important;",
-                "  outline: 1px solid #cacda600 !important;",
-                "  border-radius: 3px;",
+                // Bar hover/pin: an underline in the bar's own colour.
+                // Distinct from the link preview's background wash (which
+                // lives in its own injected stylesheet) so the two can be
+                // on screen at once without either clearing the other.
+                ".verse.step-bar-lit {",
+                "  text-decoration: underline !important;",
+                "  text-decoration-color: " + barRgba + " !important;",
+                "  text-decoration-thickness: 2px !important;",
+                "  text-underline-offset: 2px !important;",
                 "}",
                 ".step-note-tip {",
                 "  position: fixed; z-index: 1000000;",
@@ -4034,7 +3672,9 @@ class StepInterfaceDOM {
                 // Typed bars show their content in an Obsidian-managed
                 // popover (plugin side), so no in-page tip for them.
                 bar.addEventListener("mouseenter", () => {
-                    window.__stepHighlight(item.nb, "", panel.page);
+                    // This page's own light. Kept separate from the host's
+                    // list: a local hover must never clear a pinned note.
+                    window.__stepSetSelfLit({ id: item.nb, page: panel.page });
                     if (tinfo) {
                         // Widen this crosslink's section bar too.
                         const pid = tinfo.parentId;
@@ -4066,8 +3706,7 @@ class StepInterfaceDOM {
                     bar.__tip = tip;
                 });
                 bar.addEventListener("mouseleave", () => {
-                    // Don't wipe a highlight the popover is holding.
-                    if (!(window.__stepHl && window.__stepHl.hold)) window.__stepHighlight("", "", panel.page);
+                    window.__stepSetSelfLit(null);
                     if (bar.__parentLit) { bar.__parentLit.removeAttribute("data-parent-lit"); bar.__parentLit = null; }
                     if (bar.__tip) { bar.__tip.remove(); bar.__tip = null; }
                 });
@@ -4177,75 +3816,139 @@ class StepInterfaceDOM {
         };
     }
 
-    highlight(id, sourceRange, page) {
-        if (page === undefined) page = "";
+    // The underline is drawn in the bar's own colour, semi-transparent.
+    // A crosslink's colour is its note type's, a plain note's is the
+    // note-lines setting: the same colour its bar is drawn in, so the
+    // underline always matches the bar it came from.
+    litRgba(hex) {
+        // Accepts what a browser actually gives back: style.background reads
+        // as "rgb(23, 117, 143)", not the hex that was assigned.
+        const s = String(hex || window.__stepBarColour || "#17758f").trim();
+        let r, g, b;
+        const m = s.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+        if (m) {
+            r = +m[1]; g = +m[2]; b = +m[3];
+        } else {
+            const raw = s.replace("#", "");
+            const full = raw.length === 3 ? raw.split("").map(c => c + c).join("") : raw;
+            if (full.length !== 6 || /[^0-9a-f]/i.test(full)) return "";
+            const n = parseInt(full, 16);
+            r = (n >> 16) & 255; g = (n >> 8) & 255; b = n & 255;
+        }
+        return "rgba(" + r + "," + g + "," + b + ",0.55)";
+    }
+
+    litColourOf(id) {
+        const td = window.__stepTypedData || {};
+        const own = td.colourOf && td.colourOf[id];
+        if (own) return own;
+        // Not a typed note: read the bar's own inline background, which is
+        // what the user sees in the gutter. A crosslink is transparent, so
+        // it never reaches here (colourOf always has it).
+        let bar = null;
+        try {
+            bar = document.querySelector('.step-note-bar[data-note="' + CSS.escape(String(id)) + '"]');
+        } catch (e) {}
+        const bg = bar && bar.style ? bar.style.background : "";
+        if (bg && bg !== "transparent") return bg;
+        return window.__stepBarColour || "#17758f";
+    }
+
+    // entries: [{id, page}] — every bar the host says should stay underlined.
+    // The host is the authority for hover and pinned notes. Strings are
+    // accepted as ids so an old caller can't silently light nothing.
+    highlight(entries) {
+        window.__stepHostLit = Array.isArray(entries) ? entries : (entries ? [entries] : []);
+        this._paintLit();
+    }
+
+    // The page's own light: a plain note bar under the pointer. Held apart
+    // from the host's list and merged at paint time, so hovering one bar
+    // never clears a pinned note's underline (or a hovered link's wash).
+    setSelfLit(entry) {
+        window.__stepSelfLit = (entry && entry.id)
+            ? [{ id: entry.id, page: entry.page || "" }]
+            : [];
+        this._paintLit();
+    }
+
+    _paintLit() {
         // Clear from the document, not from the last pass's bookkeeping.
         // A page-scoped clear deliberately leaves the other panel lit,
         // but replacing window.__stepHl afterwards used to forget those
         // survivors, so nothing could ever unlight them: the left column
         // stayed lit for good once the right column had been hovered.
         // Scanning the DOM finds orphans as well as tracked elements.
-        // Every lit verse carries __page (stamped in lit() below), so
-        // the scope test is still exact.
-        const clear = (onlyPage) => {
-            document.querySelectorAll(".verse.step-ref-hover").forEach(el => {
-                if (!onlyPage || el.__page === onlyPage) el.classList.remove("step-ref-hover");
+        const clear = () => {
+            document.querySelectorAll(".verse.step-bar-lit").forEach(el => {
+                el.classList.remove("step-bar-lit");
+                // The colour is inline (it follows the bar), so it goes too.
+                if (el.style) el.style.removeProperty("text-decoration-color");
             });
             document.querySelectorAll(".step-note-bar.step-bar-expand").forEach(el => {
-                if (!onlyPage || el.__page === onlyPage) el.classList.remove("step-bar-expand");
+                el.classList.remove("step-bar-expand");
             });
             window.__stepHl = null;
         };
-        // Always clear everything first. Only one note is hovered at a
-        // time — the host sends one id per state — so a highlight left
-        // standing in the other column is a stale highlight: the pointer
-        // is no longer on it. Page scoping still decides which verses
-        // are allowed to light, so the right column can never light the
-        // left one's text.
         clear();
-        if (!id) return;
+        // Merge the two sources, host list first: on a verse covered by both,
+        // the host's note (the one being hovered or pinned) sets the colour.
+        const norm = (e) => typeof e === "string" ? { id: e, page: "" } : e;
+        const list = [].concat(
+            Array.isArray(window.__stepHostLit) ? window.__stepHostLit : [],
+            Array.isArray(window.__stepSelfLit) ? window.__stepSelfLit : []
+        ).map(norm).filter(e => e && e.id);
+        if (!list.length) return;
         const verses = window.__stepVerses || [];
-        const els = [];
-        // With a page given, only that panel's verses can light up.
-        const lit = (v) => {
-            if (!v || !v.verse || els.indexOf(v.verse) !== -1) return;
-            if (page && v.__page !== page) return;
-            // Stamp the page on the element itself. The page key
-            // lives on the {verse, canon} wrapper, but clear()
-            // tests the DOM nodes in window.__stepHl.els — so a
-            // panel-scoped clear used to find __page undefined on
-            // every element and remove nothing, leaving the other
-            // panel's verses lit after the pointer had moved on.
-            v.verse.__page = v.__page || "";
-            v.verse.classList.add("step-ref-hover");
-            els.push(v.verse);
-        };
-        // The same note can have a bar in each panel; light
-        // only the one(s) in the panel being hovered.
-        document.querySelectorAll('.step-note-bar[data-note="' + CSS.escape(id) + '"]').forEach(bar => {
-            if (!bar.__range) return;
-            if (page && bar.__page !== page) return;
-            for (let i = bar.__range.min; i <= bar.__range.max; i++) lit(verses[i]);
-        });
-        // A ref bar lights only what it points at — never the
-        // note text the ref was written in.
-        const range = sourceRange || "";
-        if (range && verses.length) {
-            const parts = (c) => {
-                const a = String(c || "").split(".");
-                return [a[0] || "", parseInt(a[1], 10) || 0, parseInt(a[2], 10) || 0];
+        const allEls = [];
+        list.forEach(entry => {
+            if (!entry || !entry.id) return;
+            const id = entry.id;
+            const page = entry.page || "";
+            const range = entry.range || "";
+            const els = [];
+            // This bar's own colour: the underline must match the bar, not
+            // one global setting (a typed note's bar is its type's colour).
+            const col = this.litRgba(this.litColourOf(id));
+            // With a page given, only that panel's verses can light up.
+            const lit = (v) => {
+                if (!v || !v.verse || els.indexOf(v.verse) !== -1) return;
+                if (page && v.__page !== page) return;
+                v.verse.classList.add("step-bar-lit");
+                // !important, because the stylesheet's own underline rule (the
+                // fallback for a bar whose colour can't be resolved) is also
+                // !important: a plain inline value loses to it, and every
+                // underline came out in the note-lines colour.
+                if (col && v.verse.style) v.verse.style.setProperty("text-decoration-color", col, "important");
+                els.push(v.verse);
             };
-            const halves = range.split("-");
-            const lo = parts(halves[0]);
-            const hi = halves[1] ? parts(halves[1]) : lo;
-            const cmp = (x, y) => (x[0] !== y[0] ? (x[0] < y[0] ? -1 : 1) : (x[1] - y[1]) || (x[2] - y[2]));
-            verses.forEach(v => {
-                const q = parts(v.canon);
-                if (!q[0]) return;
-                if (cmp(q, lo) >= 0 && cmp(q, hi) <= 0) lit(v);
+            // The same note can have a bar in each panel; light
+            // only the one(s) in the panel being hovered.
+            document.querySelectorAll('.step-note-bar[data-note="' + CSS.escape(id) + '"]').forEach(bar => {
+                if (!bar.__range) return;
+                if (page && bar.__page !== page) return;
+                for (let i = bar.__range.min; i <= bar.__range.max; i++) lit(verses[i]);
             });
-        }
-        window.__stepHl = { els: els, bars: [], page: page || "" };
+            // A ref bar lights only what it points at — never the
+            // note text the ref was written in.
+            if (range && verses.length) {
+                const parts = (c) => {
+                    const a = String(c || "").split(".");
+                    return [a[0] || "", parseInt(a[1], 10) || 0, parseInt(a[2], 10) || 0];
+                };
+                const halves = range.split("-");
+                const lo = parts(halves[0]);
+                const hi = halves[1] ? parts(halves[1]) : lo;
+                const cmp = (x, y) => (x[0] !== y[0] ? (x[0] < y[0] ? -1 : 1) : (x[1] - y[1]) || (x[2] - y[2]));
+                verses.forEach(v => {
+                    const q = parts(v.canon);
+                    if (!q[0]) return;
+                    if (cmp(q, lo) >= 0 && cmp(q, hi) <= 0) lit(v);
+                });
+            }
+            for (const el of els) allEls.push(el);
+        });
+        window.__stepHl = { els: allEls, bars: [], page: "" };
     }
 
     inLane(id, page) {
@@ -4312,7 +4015,14 @@ class StepInterfaceDOM {
             && state.seq < window.__stepBarStateSeq) return;
         window.__stepBarStateSeq = state.seq;
         try { if (window.__stepHoldBars) window.__stepHoldBars(state.hold || {}); } catch (e) {}
-        try { if (window.__stepHighlight) window.__stepHighlight(state.id || "", "", state.page || ""); } catch (e) {}
+        try {
+            if (window.__stepHighlight) {
+                const entries = Array.isArray(state.lit)
+                    ? state.lit
+                    : (state.id ? [{ id: state.id, page: state.page || "" }] : []);
+                window.__stepHighlight(entries);
+            }
+        } catch (e) {}
     }
 
     laneOf(page) {
@@ -4364,7 +4074,8 @@ class StepInterfaceDOM {
                 // never a document-wide lookup (two columns
                 // each have one, and the first found belongs
                 // to the other passage).
-                laneEl: b
+                laneEl: b,
+                el: b
             };
         }
         return {
@@ -4372,6 +4083,9 @@ class StepInterfaceDOM {
             ref: b.dataset.ref || "",
             typed: b.dataset.typed === "1",
             page: b.__page || "",
+            // The bar element itself: the hover hooks arm it for
+            // widening, so a widen can only ever accompany a reported hit.
+            el: b,
             // This bar's own panel lane, for lighting when
             // the bar's note lives in that lane.
             ovfEl: window.__stepLaneOf ? window.__stepLaneOf(b.__page || "") : null,
@@ -4398,6 +4112,17 @@ class StepInterfaceDOM {
         document.addEventListener("mousemove", (e) => {
             const hit = window.__stepBarAt
                 ? window.__stepBarAt(e.clientX, e.clientY) : null;
+            // Widening is armed here, from the same hit that is reported to
+            // the host, so a bar can only widen when a note is about to open
+            // for it. CSS :hover used to do this and disagreed with the hit
+            // test at a bar's edges: brush one and it grew with no note.
+            try {
+                const armEl = (hit && (hit.typed || hit.overflow)) ? (hit.el || null) : null;
+                document.querySelectorAll(".step-note-bar[data-armed='1']").forEach(el => {
+                    if (el !== armEl) el.removeAttribute("data-armed");
+                });
+                if (armEl) armEl.setAttribute("data-armed", "1");
+            } catch (e) {}
             // A child of the grey lane widens it locally as
             // well: the host round trip is not needed for a
             // highlight that lives entirely in this page.
@@ -4429,6 +4154,10 @@ class StepInterfaceDOM {
         // Cursor leaving the page entirely never fires a
         // mousemove, so report the exit explicitly.
         const reportLeave = () => {
+            // The pointer has left the page: nothing can still be hovered,
+            // so nothing may stay widened.
+            document.querySelectorAll(".step-note-bar[data-armed='1']").forEach(el =>
+                el.removeAttribute("data-armed"));
             if (!lastHover) return;
             lastHover = null;
             console.log("__STEPBAR__null");
@@ -4567,7 +4296,6 @@ class StepInterfaceDOM {
         }
     }
 }
-
 class StepInterfaceObsidian {
     constructor(plugin, webviewEl) {
         this.plugin = plugin;
@@ -4744,13 +4472,16 @@ class StepInterfaceObsidian {
             // and which passage is lit. Two separate fire-and-forget calls
             // could land out of order after a pin, leaving bars wide or text
             // lit with nothing open.
-            const lit = this._litEntry();
-            this._highlightPage = lit ? lit.page : "";
+            const lit = this._litEntries();
+            this._highlightPage = lit.length ? lit[0].page : "";
             const state = {
                 seq: ++this._barStateSeq,
                 hold: payload,
-                id: lit ? lit.id : "",
-                page: lit ? lit.page : ""
+                // The list the guest underlines. id/page kept as the first
+                // entry for any older reader.
+                lit: lit,
+                id: lit.length ? lit[0].id : "",
+                page: lit.length ? lit[0].page : ""
             };
             try {
                 wv.executeJavaScript(`window.__stepBarState && window.__stepBarState(${JSON.stringify(state)})`).catch(() => {});
@@ -4845,26 +4576,41 @@ class StepInterfaceObsidian {
         };
 
         this._barStateSeq = 0;
-        // What the guest should leave lit: the bar under the pointer, and
-        // nothing else. A pinned note used to light its passage for as long as
-        // it stayed open, which read as a highlight that could not be shaken
-        // off until the pointer happened to land on the popover. Highlighting
-        // is a hover effect: it follows the pointer, so pinned state does not
-        // count, and neither does a pointer resting on one of our popovers.
-        const litBar = (entry) => (entry && !entry.ovf && entry.id)
+        // What the guest should leave underlined. A hovered bar comes first.
+        // A pinned note keeps its passage underlined too — "pinned" means "I
+        // am working on this", so the text stays marked while the pointer
+        // goes elsewhere; that is the one exception to "highlighting follows
+        // the pointer". A hovered bar and a pinned note can both be lit, so
+        // this is a list, deduped by id+page.
+        // A note whose range runs past the page reports ovf:true, but it is
+        // still a note with a bar and verses of its own — so it stays in the
+        // lit list. Only the synthetic lane id is skipped, since it names no
+        // note and would underline nothing.
+        const litBar = (entry) => (entry && entry.id && entry.id !== "__STEPOVF__")
             ? { id: entry.id, page: entry.page || "" }
             : null;
-        this._litEntry = () => {
+        this._litEntries = () => {
+            const out = [];
+            const push = (e) => {
+                if (!e || !e.id) return;
+                const page = e.page || "";
+                if (out.some(x => x.id === e.id && x.page === page)) return;
+                out.push({ id: e.id, page });
+            };
             // A Wider References row is a bar too, and it lives in host chrome,
             // so it is checked before the in-page test below.
             if (this._adjHover && this._adjHover.note) {
-                return { id: this._adjHover.note.id, page: this._adjHover.note.page || this._adjHover.page || "" };
+                push({ id: this._adjHover.note.id, page: this._adjHover.note.page || this._adjHover.page || "" });
             }
             // Over our own chrome (popover, stretched bar) the pointer is no
-            // longer over the page, so nothing is lit even if the bar it left
-            // is still the last one reported.
-            if (!this._inGuestPage) return null;
-            return litBar(this._lastBarHit);
+            // longer over the page, so the bar it left is not lit.
+            if (this._inGuestPage) push(litBar(this._lastBarHit));
+            // Pinned notes stay underlined.
+            push(litBar(this._pinnedPop));
+            if (this._adjPinned && this._adjPinned.note) {
+                push({ id: this._adjPinned.note.id, page: this._adjPinned.note.page || this._adjPinned.page || "" });
+            }
+            return out;
         };
         // Kept for the call sites that only mean "make the page match what is
         // open": widening and highlighting travel together, so this is the
@@ -6184,5 +5930,412 @@ class StepInterfaceObsidian {
     // Close everything this panel owns: the hover note and the pinned note.
     closeAll() {
         try { if (this._closeBarPopover) this._closeBarPopover(); } catch (e) {}
+    }
+}
+class LinkPopout {
+    // The verse-text preview for a STEP link: the box that appears when the
+    // pointer rests on a reference — in a note, in reading view, or inside a
+    // gutter-bar popout. One box at a time, owned entirely by this class.
+    //
+    // It reads nothing but the plugin's reference helpers: urlPrefix,
+    // urlRef_url, urlRef_urlRef, inputRef_urlRef, urlRef_verseListArray,
+    // isLocalStepRunning.
+
+    constructor(plugin) {
+        this.plugin = plugin;
+        // The live box, or null. One at a time.
+        this.active = null;
+        // Canonical reference the box is showing. Keeps mouseover, which fires
+        // repeatedly over child elements, from rebuilding the same box.
+        this._key = null;
+        this._hideTimer = null;
+        // True while the pointer is on the box itself. The box outlives the
+        // link it came from, so leaving the link starts a hide timer that
+        // fires after the pointer has already arrived here; the timer re-checks
+        // this instead of cancelling itself.
+        this._inPreview = false;
+    }
+
+    mount() {
+        this.plugin.registerDomEvent(document, "mouseover", (evt) => this._onMouseOver(evt));
+    }
+
+    destroy() {
+        this.hide();
+    }
+
+    // The reference under the pointer as a STEP URL, or "".
+    _urlUnder(targetEl) {
+        if (!targetEl || !targetEl.closest) return "";
+
+        const lineParent = targetEl.closest(".cm-line");
+        if (lineParent) {
+            const m = lineParent.textContent.match(/https?:\/\/[^\s)]+/);
+            if (m) return m[0];
+        }
+
+        const a = targetEl.closest("a[href]");
+        if (a && a.href.startsWith(this.plugin.urlPrefix)) return a.href;
+
+        // Bare reference text rendered as a link by the editor or by a note's
+        // markdown ("Gen 3:16" with no href yet).
+        const u = targetEl.closest(".cm-underline");
+        if (u) {
+            const t = u.textContent.trim();
+            const refPattern =
+                /^[1-3]?\s*[A-Za-z]+(?:\s+[A-Za-z]+)*(?:\s+\d+(?::\d+)?(?:\s*-\s*\d+(?::\d+)?)?)?$/;
+            if (refPattern.test(t)) {
+                const urlRef = this.plugin.inputRef_urlRef(t);
+                if (urlRef) {
+                    const builtUrl = this.plugin.urlRef_url(urlRef);
+                    if (builtUrl) return builtUrl;
+                }
+            }
+        }
+
+        return "";
+    }
+
+    _onMouseOver(evt) {
+        const url = this._urlUnder(evt.target);
+        if (!url || !url.startsWith(this.plugin.urlPrefix)) return;
+
+        const refKey = this.plugin.urlRef_url(url);
+        if (this._key === refKey) return;
+
+        // Any new reference clears leftover highlights.
+        this.clearHighlights();
+        // hide() clears _key, so set it afterwards or the guard above would
+        // swallow this very hover.
+        this.hide();
+        this._key = refKey;
+
+        this._open(url, evt).catch(() => {});
+    }
+
+    // The spinner stylesheet, injected once. Small and self-contained so it
+    // needs nothing from a theme or from styles.css.
+    _ensureStyles() {
+        if (document.getElementById("step-linker-popout-style")) return;
+        const style = document.createElement("style");
+        style.id = "step-linker-popout-style";
+        style.textContent = [
+            ".step-popover-spinner {",
+            "  width: 15px; height: 15px; box-sizing: border-box;",
+            "  border-radius: 50%;",
+            "  border: 2px solid var(--background-modifier-border);",
+            "  border-top-color: var(--interactive-accent);",
+            "  animation: step-popover-spin 0.7s linear infinite;",
+            "}",
+            "@keyframes step-popover-spin { to { transform: rotate(360deg); } }"
+        ].join("\n");
+        document.head.appendChild(style);
+    }
+
+    // Show the box immediately with a spinner, so a slow reference reads as
+    // "working", not as an empty box. No text: the surface is themed and the
+    // animation says it.
+    _showLoading(pop) {
+        this._ensureStyles();
+        pop.innerHTML =
+            '<div style="display:flex;align-items:center;justify-content:center;padding:1px 0">' +
+            '<span class="step-popover-spinner"></span></div>';
+        if (pop === this.active) pop.style.visibility = "visible";
+    }
+
+    // Build the box empty and hidden, position it, then reveal it once it has
+    // something to show. No loading placeholder: an empty dark box that says
+    // "Loading…" is exactly what this used to get wrong.
+    _build(evt) {
+        const pop = document.createElement("div");
+        pop.classList.add("step-popover");
+        Object.assign(pop.style, {
+            position: "fixed",
+            left: "-9999px",
+            top: "-9999px",
+            visibility: "hidden",
+            // Same surface as the gutter-bar popouts, so the two read as one
+            // family instead of the old hard-coded dark box.
+            background: "var(--background-primary)",
+            color: "var(--text-normal)",
+            border: "1px solid var(--background-modifier-border)",
+            borderRadius: "var(--radius-m, 8px)",
+            padding: "12px 14px",
+            width: "460px",
+            maxHeight: "350px",
+            overflowY: "auto",
+            boxShadow: "0 4px 18px rgba(0,0,0,0.28)",
+            // The scripture-text preview is the top layer: it must sit above
+            // every bar, note and Wider References list.
+            zIndex: "1000060",
+            fontSize: "13.5px",
+            lineHeight: "1.6",
+            fontFamily: "var(--font-interface)"
+        });
+
+        document.body.appendChild(pop);
+
+        const rect = pop.getBoundingClientRect();
+        let leftPos = evt.clientX + 15;
+        if (leftPos + rect.width > window.innerWidth) {
+            leftPos = evt.clientX - rect.width - 15;
+        }
+        pop.style.left = `${leftPos}px`;
+        pop.style.top = `${evt.clientY + 15}px`;
+
+        this.active = pop;
+        return pop;
+    }
+
+    _reveal(pop) {
+        if (pop !== this.active) return;
+        pop.style.visibility = "visible";
+        if (pop.scrollHeight > pop.clientHeight) {
+            pop.style.paddingBottom = "150px";
+        }
+    }
+
+    async _open(url, evt) {
+        const pop = this._build(evt);
+        const targetEl = evt.target;
+
+        const cancelHide = () => {
+            if (this._hideTimer) clearTimeout(this._hideTimer);
+            this._hideTimer = null;
+        };
+        const scheduleHide = () => {
+            cancelHide();
+            this._hideTimer = setTimeout(() => {
+                if (this.active !== pop) return;
+                // The pointer reached the box between leaving the link and this
+                // timer firing: keep it.
+                if (this._inPreview) return;
+                this.hide();
+            }, 200);
+        };
+
+        pop.addEventListener("mouseenter", () => {
+            this._inPreview = true;
+            cancelHide();
+        });
+        pop.addEventListener("mouseleave", () => {
+            this._inPreview = false;
+            scheduleHide();
+            // Highlights only clear when the pointer leaves the preview.
+            this.clearHighlights();
+        });
+
+        // Attached now, not in a later frame: the box is on screen from this
+        // moment, so it needs its leave handler from this moment.
+        if (targetEl && targetEl.addEventListener) {
+            targetEl.addEventListener("mouseleave", () => {
+                // The hover that lit the verses has ended, so the light goes
+                // out on this tick. It used to survive until the box closed —
+                // 200ms later, or for good on a path that never closed it.
+                this.clearHighlights();
+                scheduleHide();
+            }, { once: true });
+        }
+
+        this._showLoading(pop);
+
+        try {
+            if (!(await this.plugin.isLocalStepRunning())) {
+                this._showOffline(pop);
+                return;
+            }
+
+            const urlRef = this.plugin.url_urlRef(url);
+            if (!urlRef) {
+                // The box is already on screen: without this it would spin
+                // forever on a URL that carries no parseable reference.
+                this.hide();
+                return;
+            }
+
+            // A newer hover replaced this one while the request was in
+            // flight: lighting the verses now would light the wrong passage.
+            if (this.active !== pop) return;
+
+            await this._highlight(urlRef);
+
+            if (this.active !== pop) return;
+
+            // Book only: an overview, no verses to fetch.
+            if (!urlRef.includes(".")) {
+                const info = BibleInformation.getBookOverview(urlRef);
+                if (info) {
+                    pop.innerHTML = `
+                        <b>${info.name}</b><br>
+                        ${info.chapters} chapters<br><br>
+                        <i>Author:</i> ${info.author}<br>
+                        <i>Location:</i> ${info.location}<br>
+                        <i>Date:</i> ${info.date}<br><br>
+                        ${info.synopsis}
+                     `;
+                    this._reveal(pop);
+                    return;
+                }
+
+                pop.innerHTML = `<b>${urlRef}</b><br>No overview available.`;
+                this._reveal(pop);
+                return;
+            }
+
+            const verseRefs = this.plugin.urlRef_verseListArray(urlRef);
+
+            let combined = "";
+            const seen = new Set();
+
+            for (const vRef of verseRefs) {
+                const verseUrl = url.includes("reference=")
+                    ? url.replace(/reference=[^&]+/, `reference=${encodeURIComponent(vRef)}`)
+                    : url;
+
+                const response = await requestUrl({ url: verseUrl });
+                const html = response.text;
+
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(html, "text/html");
+
+                const title = doc.querySelector("title")?.textContent || "";
+                const parts = title.split("|").map(p => p.trim());
+
+                let verseText = "";
+                if (parts.length >= 4) verseText = parts[3];
+
+                verseText = verseText
+                    .replace(/\s+/g, " ")
+                    .replace(/\s+([,;:.!?])/g, "$1")
+                    .replace(/\s+\)/g, ")")
+                    .replace(/\(\s+/g, "(")
+                    .replace(/\s*,\s*$/g, "")
+                    .trim();
+
+                if (!verseText || seen.has(verseText)) continue;
+                seen.add(verseText);
+
+                const [book, chap, verse] = vRef.split(".");
+                combined += `<p><strong>${chap}:${verse}</strong> ${verseText}</p>`;
+
+                this._reveal(pop);
+            }
+
+            pop.innerHTML = combined || "<p><i>No English text found.</i></p>";
+            this._reveal(pop);
+
+        } catch (err) {
+            // A request failed after the liveness check passed: the server
+            // stopped, or it answered with something that isn't a STEP page.
+            this._showOffline(pop);
+        }
+    }
+
+    _showOffline(pop) {
+        if (!pop) return;
+        pop.innerHTML = `
+            <div style="font-weight:bold;color:var(--text-error)">STEP Bible isn't running</div>
+            <div style="margin-top:4px;font-size:12px;color:var(--text-muted)">
+                Start STEP Bible and hover again. It should be listening on
+                http://localhost:8989.
+            </div>`;
+        this._reveal(pop);
+    }
+
+    hide() {
+        if (this._hideTimer) clearTimeout(this._hideTimer);
+        this._hideTimer = null;
+        this._inPreview = false;
+        if (this.active) {
+            try { this.active.remove(); } catch (e) {}
+            this.active = null;
+        }
+        // No box means no hovered reference, so nothing in STEP stays lit.
+        // This is the one place every path passes through, including the ones
+        // that never reached the box.
+        this.clearHighlights();
+        // The box is gone, so the reference it was showing is no longer on
+        // screen: drop the guard, or hovering the same link again is ignored
+        // until a different one is hovered.
+        this._key = null;
+    }
+
+    // Light the matching verses in every STEP webview showing any of them.
+    async _highlight(urlRef) {
+        if (!urlRef.includes(".")) return;
+
+        const plugin = this.plugin;
+        const wvLeaves = plugin.app.workspace.getLeavesOfType("webviewer");
+        const wvEls = wvLeaves
+            .map(l => l?.view?.webview ?? l?.view?.el?.querySelector?.("webview"))
+            .filter(el => el && typeof el.executeJavaScript === "function");
+
+        const hoverSet = new Set(plugin.urlRef_verseListArray(urlRef) || []);
+        if (!hoverSet.size) return;
+
+        for (const wvEl of wvEls) {
+            const pageUrl = wvEl.getURL?.() || "";
+            const pageUrlRef = plugin.url_urlRef(pageUrl);
+            const pageRefs = pageUrlRef ? (plugin.urlRef_verseListArray(pageUrlRef) || []) : [];
+
+            const matched = pageRefs.filter(r => hoverSet.has(r));
+            if (matched.length === 0) continue;
+
+            await wvEl.executeJavaScript(`
+                (function() {
+                    document.querySelectorAll(".step-ref-hover").forEach(el =>
+                        el.classList.remove("step-ref-hover"));
+
+                    const existing = document.getElementById("step-linker-ref-style");
+                    if (existing) existing.remove();
+                    {
+                        const style = document.createElement("style");
+                        style.id = "step-linker-ref-style";
+                        style.textContent = [
+                            ".verse.step-ref-hover {",
+                            "  background-color: rgba(190, 190, 163, 0.12) !important;",
+                            "  outline: 1px solid #cacda600 !important;",
+                            "  border-radius: 3px;",
+                            "}"
+                        ].join("\\n");
+                        document.head.appendChild(style);
+                    }
+
+                    // Canonical matched set from the plugin
+                    const targetSet = new Set(${JSON.stringify(matched)});
+
+                    // Same conversion the dots use
+                    const bookMap = window.__stepDotBookMap || {};
+                    const toCanon = (ref) => {
+                        const parts = ref.split(".");
+                        const full = bookMap[parts[0].toLowerCase()];
+                        if (!full) return null;
+                        return [full.replace(/\\s+/g, ""), parts[1], parts[2]].filter(x => x !== undefined).join(".");
+                    };
+
+                    document.querySelectorAll("a.verseLink").forEach(a => {
+                        const canon = toCanon(a.getAttribute("name") || "");
+                        if (canon && targetSet.has(canon)) {
+                            const verse = a.closest(".verse");
+                            if (verse) verse.classList.add("step-ref-hover");
+                        }
+                    });
+                })();
+            `);
+        }
+    }
+
+    // Clear .step-ref-hover highlights in every STEP webview.
+    clearHighlights() {
+        const wvLeaves = this.plugin.app.workspace.getLeavesOfType("webviewer");
+        for (const l of wvLeaves) {
+            const wvEl = l?.view?.webview ?? l?.view?.el?.querySelector?.("webview");
+            if (wvEl && typeof wvEl.executeJavaScript === "function") {
+                wvEl.executeJavaScript(`
+                    document.querySelectorAll(".step-ref-hover").forEach(el =>
+                        el.classList.remove("step-ref-hover"));
+                `).catch(() => { });
+            }
+        }
     }
 }

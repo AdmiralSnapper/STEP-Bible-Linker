@@ -22,6 +22,9 @@ const DEFAULT_SETTINGS = {
     noteTypesFolder: "",
     // Skip the text popout when the verses are already on the STEP page.
     popoutVisiblePassages: true,
+    // Always open a searched reference in a fresh tab. Turned off, an open
+    // STEP pane is reused instead.
+    alwaysOpenNewStepTab: false,
 };
 class FolderSuggest extends AbstractInputSuggest {
     constructor(app, inputEl, onPick) {
@@ -263,6 +266,19 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.popoutVisiblePassages !== false)
                 .onChange(async (value) => {
                     this.plugin.settings.popoutVisiblePassages = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // SEARCH MODAL
+        containerEl.createEl("h3", { text: "Search modal" });
+
+        new Setting(containerEl)
+            .setName("Always open new STEP tab")
+            .setDesc("On, every searched reference opens in a fresh tab. Off, an open STEP pane is reused: the one you are looking at, otherwise one that is on screen, otherwise the first STEP pane open. With no STEP pane open, a new tab is opened either way. The same toggle sits in the modal's settings drawer.")
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.alwaysOpenNewStepTab === true)
+                .onChange(async (value) => {
+                    this.plugin.settings.alwaysOpenNewStepTab = value;
                     await this.plugin.saveSettings();
                 }));
 
@@ -527,8 +543,11 @@ class StepBibleSearchModal extends Modal {
             return;
         }
 
-        // Always open in a fresh tab:
-        let targetLeaf = this.app.workspace.getLeaf("tab");
+        // A fresh tab when asked for one, or when no STEP pane is open at
+        // all. Otherwise the open pane is navigated to the reference.
+        const alwaysNew = this.plugin.settings.alwaysOpenNewStepTab === true;
+        const reuse = alwaysNew ? null : this.plugin.findStepLeaf();
+        let targetLeaf = reuse || this.app.workspace.getLeaf("tab");
         if (targetLeaf && typeof targetLeaf.setViewState === "function") {
             await targetLeaf.setViewState({
                 type: "webviewer",
@@ -831,7 +850,52 @@ class StepBibleSearchModal extends Modal {
         renderVersionPills();
 
         // =========================================================================
-        // SECTION 2: SERVER STATUS (read-only; there is nothing to choose)
+        // SECTION 2: WHERE THE REFERENCE OPENS
+        // A preference about how you read, not a draft to confirm: it saves on
+        // the spot and stays put between opens, like the versions gear.
+        // =========================================================================
+        const openSection = settingsDrawer.createEl("div");
+        openSection.style.display = "flex";
+        openSection.style.flexDirection = "column";
+        openSection.style.gap = "6px";
+
+        const openRow = openSection.createEl("label");
+        openRow.style.cssText =
+            "display:flex;align-items:center;gap:8px;cursor:pointer;" +
+            "font-size:12px;user-select:none;";
+
+        const openToggle = openRow.createEl("input", { type: "checkbox" });
+        openToggle.type = "checkbox";
+        openToggle.style.cssText = "margin:0;cursor:pointer;";
+        // One fixed label, so the checkbox reads the same whatever its state.
+        // Ticked means the open STEP pane is reused, which is the inverse of
+        // the alwaysOpenNewStepTab setting.
+        openToggle.checked = this.plugin.settings.alwaysOpenNewStepTab !== true;
+
+        const openLabel = openRow.createEl("span", {
+            text: "Reuse STEP tab"
+        });
+        openLabel.style.color = "var(--text-normal)";
+
+        openToggle.addEventListener("change", async () => {
+            // Never part of the draft: this one is committed immediately and
+            // does not light up the "uncommitted changes" border.
+            this.plugin.settings.alwaysOpenNewStepTab = !openToggle.checked;
+            await this.plugin.saveSettings();
+            input.focus();
+        });
+        // Clicking the word toggles too, but must not close the drawer.
+        openRow.addEventListener("click", (ev) => {
+            if (ev.target !== openToggle) {
+                ev.preventDefault();
+                openToggle.checked = !openToggle.checked;
+                openToggle.dispatchEvent(new Event("change"));
+            }
+            ev.stopPropagation();
+        });
+
+        // =========================================================================
+        // SECTION 3: SERVER STATUS (read-only; there is nothing to choose)
         // =========================================================================
         const serverSection = settingsDrawer.createEl("div");
         serverSection.style.display = "flex";
@@ -1253,6 +1317,37 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
 
     // LOCAL/ONLINE URL HELPERS ===============================================================================
+    // True for a leaf holding a STEP page of ours (local server or the site
+    // itself), false for any other webviewer tab.
+    isStepLeaf(leaf) {
+        const url = leaf?.view?.url || leaf?.view?.webview?.getURL?.() || "";
+        return typeof url === "string" &&
+            (url.includes("localhost:8989") || url.includes("stepbible.org"));
+    }
+
+    // An open STEP pane to navigate, or null when none is open. The reader
+    // gets the pane in front of them first: the active leaf, then any pane
+    // actually on screen (a tab in the current group, an uncollapsed split),
+    // then whatever is left — a tab in the background is still better than a
+    // second STEP tab beside it.
+    findStepLeaf() {
+        const leaves = this.app.workspace.getLeavesOfType("webviewer").filter(l => this.isStepLeaf(l));
+        if (!leaves.length) return null;
+
+        const active = this.app.workspace.activeLeaf;
+        if (active && leaves.includes(active)) return active;
+
+        const onScreen = leaves.filter(l => {
+            const el = l?.view?.containerEl;
+            if (!el) return false;
+            if (typeof el.checkVisibility === "function") return el.checkVisibility();
+            // jsdom and older Electron: no layout, so offsetParent is the only
+            // signal. Treat an unmeasurable pane as visible rather than skip it.
+            return el.offsetParent !== null || el.offsetParent === undefined;
+        });
+        return onScreen[0] || leaves[0];
+    }
+
     async isLocalStepRunning() {
         // Cache: repeated hovers shouldn't re-fetch localhost every time.
         // A "no" is cached only briefly: the user is likely to start STEP and
@@ -2262,6 +2357,12 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
         // Old settings files may still carry useLocalStepServer; it is ignored.
         delete this.settings.useLocalStepServer;
+        // openReferenceInNewTab meant "fresh tab", which is what
+        // alwaysOpenNewStepTab now says outright.
+        if (loadedData.openReferenceInNewTab !== undefined) {
+            this.settings.alwaysOpenNewStepTab = loadedData.openReferenceInNewTab !== false;
+        }
+        delete this.settings.openReferenceInNewTab;
         this.urlPrefix = LOCAL_STEP_BASE;
     }
 
@@ -6137,7 +6238,7 @@ class LinkPopout {
     // "working", not as an empty box. No text: the surface is themed and the
     // animation says it.
     _showLoading(pop) {
-        if (pop) pop.style.width = "460px";
+        if (pop) { pop.style.width = "460px"; this._position(pop); }
         this._ensureStyles();
         pop.innerHTML =
             '<div style="display:flex;align-items:center;justify-content:center;padding:1px 0">' +
@@ -6178,11 +6279,9 @@ class LinkPopout {
 
         document.body.appendChild(pop);
 
-        // As far right as the link allows: the box's right edge sits on the
-        // link's right edge, or on the window's edge, whichever comes first —
-        // and never past either. Anchored by `right`, not `left`, so a later
-        // width change (the narrow "Passage visible" label) keeps that edge.
-        const rect = pop.getBoundingClientRect();
+        // The anchor is remembered, not the resulting position: the box
+        // changes width after this (the narrow "Passage visible" label, then
+        // the wide text), and each width has its own rightmost position.
         const vw = window.innerWidth;
         const margin = 12;
 
@@ -6196,26 +6295,35 @@ class LinkPopout {
             : null;
         const anchorRight = (aRect && aRect.width > 0) ? aRect.right : evt.clientX;
 
-        const rightEdge = Math.min(anchorRight, vw - margin);
-        const leftIfRightAnchored = rightEdge - rect.width;
-
-        // The base style parks the box off-screen with left/top: -9999px.
-        // A parked left would override the right anchor, so each path drops
-        // the other edge.
-        if (leftIfRightAnchored >= margin) {
-            pop.style.right = `${vw - rightEdge}px`;
-            pop.style.left = "";
-        } else {
-            // The box is wider than the room between the window's left edge
-            // and the link: keep it on screen and let the right edge fall
-            // where it must.
-            pop.style.left = `${margin}px`;
-            pop.style.right = "";
-        }
+        pop._stepAnchorRight = anchorRight;
         pop.style.top = `${evt.clientY + 15}px`;
+        this._position(pop);
 
         this.active = pop;
         return pop;
+    }
+
+    // Flush to the link's right edge, then pull back only as far as the
+    // window forces — as far right as the box can sit while staying wholly on
+    // screen. Measured from the box's *current* width, so the narrow label is
+    // not shoved left by the width its text would have had: an imaginary
+    // 460px box at a right-edge link used to push the label far to the left
+    // of the link it belonged to.
+    _position(pop) {
+        if (!pop) return;
+        const anchorRight = (typeof pop._stepAnchorRight === "number")
+            ? pop._stepAnchorRight
+            : window.innerWidth - 12;
+        const vw = window.innerWidth;
+        const margin = 12;
+        const rect = pop.getBoundingClientRect();
+        const w = rect && rect.width > 0 ? rect.width : 0;
+        const leftPos = Math.max(
+            margin,
+            Math.min(anchorRight, vw - margin - w)
+        );
+        pop.style.left = `${leftPos}px`;
+        pop.style.right = "";
     }
 
     _reveal(pop) {
@@ -6381,6 +6489,9 @@ class LinkPopout {
         });
 
         pop.appendChild(row);
+        // Re-anchor now the box is only as wide as its words, so it sits
+        // beside the link rather than where the wide box would have to go.
+        this._position(pop);
         this._reveal(pop);
     }
 

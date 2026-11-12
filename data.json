@@ -17,6 +17,7 @@
   },
   "noteTypesFolder": "Second Brain/Bible",
   "popoutVisiblePassages": true,
+  "alwaysOpenNewStepTab": false,
   "autoSyncOnNavigation": false,
   "autoCloseSearchPanel": false,
   "crosslinkColour": "#3d8fe6",
@@ -31,5 +32,5 @@
     "ESV"
   ],
   "lastSyncedServerMode": true,
-  "searchModalSettingsOpen": false
+  "searchModalSettingsOpen": true
 }

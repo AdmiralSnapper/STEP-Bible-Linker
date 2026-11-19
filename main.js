@@ -842,9 +842,10 @@ class StepBibleSearchModal extends Modal {
         return local.length !== currentLocal.length || local.some((v, i) => v !== currentLocal[i]);
     }
 
-    // File a note for whatever reference is in the box. The reference is read
-    // from the box (not from whatever the chip handed over), so editing it
-    // before pressing Enter does what it looks like it does.
+    // File a note for whatever reference is in the box, then hand the note
+    // itself to a popout window so the text is written in Obsidian's own
+    // editor: links, embeds and hover all behave normally there. The note is
+    // created first (empty), so Cancel has something concrete to remove.
     async _submitAdd(input) {
         if (this._isSubmitting) return;
         const raw = (input.value || "").trim();
@@ -863,122 +864,20 @@ class StepBibleSearchModal extends Modal {
         }
         if (!canons.length) { new Notice("Not a valid Bible reference."); return; }
 
-        // The note is filed straight from this tab: the box at the bottom is
-        // its text, and the reference above it is settled. Nothing opens, so
-        // the STEP page behind stays exactly where it was.
         this._isSubmitting = true;
         const dest = this._dest;
-        const body = this._noteBox ? this._noteBox.value : "";
+        const track = {};
         try {
-            const path = await this.plugin.addNote(canons, dest, body);
-            if (path) {
-                this._changesCommitted = true;
-                new Notice("Note saved: " + path);
-                this.close();
-            }
+            const path = await this.plugin.addNote(canons, dest, "", { track, ensureLink: true });
+            if (!path) return;
+            this._changesCommitted = true;
+            this.close();
+            await this.plugin.openNoteEditorPopout({ path, undo: track.undo, canons });
         } catch (e) {
             new Notice("Could not save the note: " + (e && e.message ? e.message : e));
         } finally {
             this._isSubmitting = false;
         }
-    }
-
-    // ---- pictures in the note box -------------------------------------------
-    // Only paste and drag-drop: there is no file button, because a note is
-    // written here rather than assembled from a picker.
-    _imageFiles(dt) {
-        if (!dt) return [];
-        const out = [];
-        for (const f of Array.from(dt.files || [])) {
-            if (f && /^image\//.test(f.type || "")) out.push(f);
-        }
-        if (!out.length && dt.items) {
-            for (const it of Array.from(dt.items)) {
-                if (it.kind === "file" && /^image\//.test(it.type || "")) {
-                    const f = it.getAsFile && it.getAsFile();
-                    if (f) out.push(f);
-                }
-            }
-        }
-        return out;
-    }
-
-    // The folder the note will land in: a list always lives in the notes
-    // folder, an ordinary note in its own destination folder.
-    _destNoteDir() {
-        const d = this._dest;
-        if (d && d.kind === "folder") return String(d.path || "");
-        return this.plugin.normaliseFolderPath(this.plugin.settings.noteTypesFolder) || "";
-    }
-
-    // Where Obsidian would put an attachment, as a vault-relative path.
-    _attachmentFolder() {
-        let cfg = "";
-        try {
-            cfg = (this.app.vault.getConfig && this.app.vault.getConfig("attachmentFolderPath")) || "";
-        } catch (e) { cfg = ""; }
-        const noteDir = this._destNoteDir();
-        if (cfg === "/") return noteDir;
-        if (cfg.startsWith("./")) {
-            const rest = cfg.slice(2).replace(/^\/+|\/+$/g, "");
-            return noteDir ? (rest ? noteDir + "/" + rest : noteDir) : rest;
-        }
-        return String(cfg || "").replace(/^\/+|\/+$/g, "");
-    }
-
-    async _ensureFolder(path) {
-        if (!path) return;
-        const parts = path.split("/");
-        let cur = "";
-        for (const part of parts) {
-            cur = cur ? cur + "/" + part : part;
-            const ex = this.app.vault.getAbstractFileByPath(cur);
-            if (!ex && this.app.vault.createFolder) {
-                try { await this.app.vault.createFolder(cur); } catch (e) {}
-            }
-        }
-    }
-
-    async _insertImage(file) {
-        let path = "";
-        try {
-            const folder = this._attachmentFolder();
-            await this._ensureFolder(folder);
-            const ext = (file.name && /\.([A-Za-z0-9]+)$/.exec(file.name) ? /\.([A-Za-z0-9]+)$/.exec(file.name)[1] : null)
-                || (file.type && file.type.split("/")[1]) || "png";
-            const stamp = new Date();
-            const pad = (n) => String(n).padStart(2, "0");
-            const base = "Pasted image "
-                + stamp.getFullYear() + pad(stamp.getMonth() + 1) + pad(stamp.getDate())
-                + pad(stamp.getHours()) + pad(stamp.getMinutes()) + pad(stamp.getSeconds());
-            let name = base + "." + ext;
-            for (let i = 1; i < 1000; i++) {
-                const candidate = folder ? folder + "/" + name : name;
-                if (!this.app.vault.getAbstractFileByPath(candidate)) break;
-                name = base + " " + i + "." + ext;
-            }
-            path = folder ? folder + "/" + name : name;
-            const buf = await file.arrayBuffer();
-            await this.app.vault.createBinary(path, buf);
-        } catch (e) {
-            new Notice("Could not save the image: " + (e && e.message ? e.message : e));
-            return;
-        }
-        this._insertText("![[" + path + "]]");
-    }
-
-    _insertText(text) {
-        const area = this._noteBox;
-        if (!area) return;
-        const start = area.selectionStart == null ? area.value.length : area.selectionStart;
-        const end = area.selectionEnd == null ? area.value.length : area.selectionEnd;
-        const before = area.value.slice(0, start);
-        const after = area.value.slice(end);
-        const pad = before && !/\s$/.test(before) ? " " : "";
-        area.value = before + pad + text + after;
-        const at = start + pad.length + text.length;
-        try { area.setSelectionRange(at, at); } catch (e) {}
-        area.focus();
     }
 
     async openStepUrl(url) {
@@ -1488,49 +1387,6 @@ class StepBibleSearchModal extends Modal {
                 });
                 selectRow(0);
             }
-
-            // The note's text lives here, at the bottom of this tab, exactly
-            // where the note is going. There is no second dialog: Enter files
-            // the note, Shift+Enter is a newline, and pictures paste or drop
-            // straight into the box.
-            const noteBox = contentEl.createEl("textarea");
-            noteBox.className = "step-add-note-text";
-            noteBox.placeholder = "Note text \u2014 Enter saves, Shift+Enter for a new line";
-            noteBox.style.cssText =
-                "width:100%;min-height:88px;max-height:40vh;resize:vertical;padding:8px 10px;" +
-                "font-size:13px;line-height:1.5;font-family:var(--font-text);border-radius:6px;" +
-                "border:1px solid var(--background-modifier-border);" +
-                "background:var(--background-primary);color:var(--text-normal);box-sizing:border-box;";
-            this._noteBox = noteBox;
-
-            noteBox.addEventListener("keydown", (ev) => {
-                if (ev.key !== "Enter") return;
-                if (ev.shiftKey) {
-                    // A newline in the box, and never a save: stop the modal's
-                    // own Enter handler from seeing it at all.
-                    ev.stopPropagation();
-                    return;
-                }
-                ev.preventDefault();
-                ev.stopPropagation();
-                this._submitAdd(input);
-            });
-
-            noteBox.addEventListener("paste", async (ev) => {
-                const imgs = this._imageFiles(ev.clipboardData);
-                if (!imgs.length) return;      // ordinary text paste
-                ev.preventDefault();
-                for (const f of imgs) await this._insertImage(f);
-            });
-            noteBox.addEventListener("dragover", (ev) => ev.preventDefault());
-            noteBox.addEventListener("drop", async (ev) => {
-                const imgs = this._imageFiles(ev.dataTransfer);
-                if (!imgs.length) return;
-                ev.preventDefault();
-                for (const f of imgs) await this._insertImage(f);
-            });
-        } else {
-            this._noteBox = null;
         }
 
         const buildUrlWithDraftVersions = (urlRef) => {
@@ -1682,6 +1538,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // Note-dots state (vault scan derived from the per-file text cache)
         this._noteDotsCache = null;
         this._noteDotsTextCache = {};
+        // Paths whose text must be read from disk, not from Obsidian's read
+        // cache: a file we have just written can still hand back its old
+        // contents through cachedRead, and the bars then reflect the file as
+        // it was before the save.
+        this._noteDotsFreshPaths = new Set();
         this._noteDotsRefreshTimer = null;
         this._localStepRunningCache = { value: null, time: 0 };
         // One StepInterfaceObsidian per webview, created the first time a panel
@@ -1695,6 +1556,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         // Load settings and add settings tab
         await this.loadSettings();
+        this.sweepDraftFiles();
         this.addSettingTab(new StepBibleLinkerSettingTab(this.app, this));
 
         // DETECT AND LINK INPUT REF AT CURSOR 
@@ -1901,20 +1763,31 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // REFRESH STEP BARS
         // ===========================================================================
         this.registerEvent(this.app.vault.on("modify", (f) => {
-            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
+            if (f && f.extension === "md") {
+                // Drop the cached text for the saved file. Waiting for the
+                // mtime to move is not enough: a save can be read back before
+                // the stat updates, which left the bars showing the file as it
+                // was before the note was added.
+                this.forgetNoteText(f.path);
+                this.scheduleNoteDotsRefresh();
+            }
         }));
         this.registerEvent(this.app.vault.on("create", (f) => {
-            if (f && f.extension === "md") this.scheduleNoteDotsRefresh();
+            if (f && f.extension === "md") {
+                this.forgetNoteText(f.path);
+                this.scheduleNoteDotsRefresh();
+            }
         }));
         this.registerEvent(this.app.vault.on("delete", (f) => {
             if (f && f.extension === "md") {
-                if (this._noteDotsTextCache) delete this._noteDotsTextCache[f.path];
+                this.forgetNoteText(f.path);
                 this.scheduleNoteDotsRefresh();
             }
         }));
         this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
             if (f && f.extension === "md") {
-                if (this._noteDotsTextCache && oldPath) delete this._noteDotsTextCache[oldPath];
+                if (oldPath) this.forgetNoteText(oldPath);
+                this.forgetNoteText(f.path);
                 this.scheduleNoteDotsRefresh();
                 return;
             }
@@ -2333,7 +2206,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // folder treats first-line references as its main passage.
     // dest.kind === "list": the reference becomes a new section, inserted
     // between the existing ones in reference order.
-    async addNote(refs, dest, body) {
+    async addNote(refs, dest, body, opts = {}) {
+        const track = opts.track || null;
         const list = (refs || []).filter(Boolean);
         if (!list.length) {
             new Notice("No reference selected.");
@@ -2359,12 +2233,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (!f) { new Notice("That list note no longer exists."); return null; }
                 const text = await this.app.vault.read(f);
                 await this.app.vault.modify(f, insertListSection(text, withBody(firstLine), canon));
+                // Cancel puts the file back exactly as it was: the inserted
+                // section is the only change, so the original bytes undo it.
+                if (track) track.undo = { kind: "list", path: f.path, before: text };
                 return f.path;
             }
             // A new list note: the reference is its first section.
             if (!folder) { new Notice("Pick a Bible notes folder first."); return null; }
             const path = this.uniqueUntitledPath(folder);
             const created = await this.app.vault.create(path, withBody(firstLine) + "\n");
+            if (track) track.undo = { kind: "new", path: created.path };
             return created.path;
         }
 
@@ -2376,10 +2254,342 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (tf) { try { content = await this.app.vault.read(tf); } catch (e) { content = ""; } }
         }
         if (fs.mainPassage) content = applyReferenceToFirstLine(content, firstLine);
+        // Editing a brand-new note: the reference has to be in the file, or
+        // there is no link to scroll to and nothing for a bar to point at.
+        if (opts.ensureLink && !content.includes(firstLine)) {
+            content = (content.trim() ? content.replace(/\s+$/, "") + "\n\n" : "") + firstLine + "\n";
+        }
         if (typed) content = content.replace(/\s+$/, "") + (content.trim() ? "\n\n" : "") + typed + "\n";
         const path = this.uniqueUntitledPath(folderPath);
         const created = await this.app.vault.create(path, content);
+        if (track) track.undo = { kind: "new", path: created.path };
         return created.path;
+    }
+
+    // Split a note into the part above its reference link, the text under
+    // that link (the only part the writer edits), and the rest of the file.
+    // A list note's other sections live after the link, so the split is by
+    // section, not by "everything to the end".
+    noteBodyParts(text, linkMd) {
+        const doc = String(text == null ? "" : text);
+        const lines = doc.split(/\r?\n/);
+        const linkIdx = linkMd ? lines.findIndex(l => l.includes(linkMd)) : -1;
+        if (linkIdx < 0) {
+            const only = doc.split(/\r?\n/);
+            while (only.length && !only[0].trim()) only.shift();
+            while (only.length && !only[only.length - 1].trim()) only.pop();
+            return { lines, linkIdx: -1, endIdx: lines.length, lead: 0, trail: 0, body: only.join("\n") };
+        }
+        let endIdx = lines.length;
+        for (const s of listSectionStarts(doc)) {
+            if (s.line > linkIdx) { endIdx = s.line; break; }
+        }
+        const bodyLines = lines.slice(linkIdx + 1, endIdx);
+        let trail = 0;
+        while (trail < bodyLines.length && !bodyLines[bodyLines.length - 1 - trail].trim()) trail++;
+        const core = bodyLines.slice(0, bodyLines.length - trail);
+        let lead = 0;
+        while (lead < core.length && !core[lead].trim()) lead++;
+        return {
+            lines, linkIdx, endIdx, lead, trail,
+            body: core.slice(lead).join("\n")
+        };
+    }
+
+    // The note again, with the text under the link replaced. Everything else
+    // is written back line for line, so a list note's other sections are not
+    // touched and its separators keep their exact width.
+    noteTextWithBody(parts, body) {
+        if (!parts || parts.linkIdx < 0) return String(body == null ? "" : body);
+        const bodyLines = String(body == null ? "" : body).split(/\r?\n/);
+        while (bodyLines.length && !bodyLines[0].trim()) bodyLines.shift();
+        while (bodyLines.length && !bodyLines[bodyLines.length - 1].trim()) bodyLines.pop();
+        const out = parts.lines.slice(0, parts.linkIdx + 1);
+        // The blank lines the section already had on either side of its text
+        // are put back exactly, so a list note's separators keep their width.
+        for (let i = 0; i < parts.lead; i++) out.push("");
+        if (bodyLines.length) out.push(...bodyLines);
+        for (let i = 0; i < parts.trail; i++) out.push("");
+        out.push(...parts.lines.slice(parts.endIdx));
+        return out.join("\n");
+    }
+
+    // A throwaway note holding just the text being written, so the popout's
+    // editor is Obsidian's own without the link, the frontmatter or the
+    // neighbouring sections sitting in it.
+    async createDraftFile(noteFile, body) {
+        const folder = noteFile && noteFile.parent ? noteFile.parent.path : "";
+        const dir = folder === "/" ? "" : folder;
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+        const at = (name) => (dir ? `${dir}/${name}` : name);
+        let path = at(`Note draft ${stamp}.md`);
+        for (let i = 1; this.app.vault.getAbstractFileByPath(path) && i < 500; i++) {
+            path = at(`Note draft ${stamp} ${i}.md`);
+        }
+        const f = await this.app.vault.create(path, String(body || ""));
+        return f ? f.path : null;
+    }
+
+    // Drafts left behind by a crash or a force-quit would pile up, so they are
+    // cleared at load. The name is specific enough that nothing else matches.
+    sweepDraftFiles() {
+        try {
+            const stale = this.app.vault.getFiles()
+                .filter(f => /^Note draft \d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}( \d+)?\.md$/.test(f.name));
+            for (const f of stale) this.app.vault.delete(f, true).catch(() => {});
+        } catch (e) { /* housekeeping only */ }
+    }
+
+    // Open a popout window holding only the text under the reference: the
+    // passage above it, the editable note beneath it, Cancel / Add note at the
+    // bottom. The editor is a real MarkdownView, so links, embeds, pictures and
+    // hover all behave exactly as they do in a normal note.
+    async openNoteEditorPopout({ path, undo, canons }) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!file) { new Notice("The note could not be opened."); return; }
+
+        const marks = (canons || []).map(c => this.refMarkdown(c));
+        const parts = this.noteBodyParts(await this.app.vault.read(file), marks[0] || "");
+
+        // The real note stays exactly as it is until the note is saved; the
+        // window edits a copy. A list note's link and neighbours are therefore
+        // never at risk, and nothing re-scans mid-edit.
+        const draftPath = await this.createDraftFile(file, parts.body);
+        if (!draftPath) { new Notice("Could not open a draft for the note."); return; }
+        const draftFile = this.app.vault.getAbstractFileByPath(draftPath);
+
+        const leaf = this.app.workspace.openPopoutLeaf
+            ? this.app.workspace.openPopoutLeaf()
+            : this.app.workspace.getLeaf("window");
+        if (!leaf) { await this.removeDraft(draftPath); new Notice("Could not open a popout window."); return; }
+        await leaf.openFile(draftFile);
+
+        const view = leaf.view;
+        const root = view && view.containerEl;
+        if (!root) { await this.removeDraft(draftPath); return; }
+
+        // Editing, not reading: the window is for writing the note.
+        try {
+            if (view.getMode && view.getMode() !== "source" && view.setState) {
+                const state = view.getState ? view.getState() : {};
+                await view.setState(Object.assign({}, state, { file: draftPath, mode: "source", source: false }));
+            }
+        } catch (e) { /* already in edit mode on most setups */ }
+        // A popout has its own document: every element must be made with it.
+        const doc = root.ownerDocument;
+
+        // The draft's own chrome (tab title, file title) is not part of the
+        // note, so it is hidden: passage, text, buttons, nothing else.
+        const chrome = doc.createElement("style");
+        chrome.textContent = ".view-header,.inline-title,.view-content > .markdown-preview-view > .mod-header{display:none!important;}";
+        doc.head.appendChild(chrome);
+
+        root.style.display = "flex";
+        root.style.flexDirection = "column";
+        root.style.height = "100%";
+
+        const content = view.contentEl || root;
+        content.style.flex = "1 1 auto";
+        content.style.minHeight = "0";
+
+        // ---- the passage -------------------------------------------------
+        const head = doc.createElement("div");
+        head.style.cssText = "flex:0 0 auto;padding:10px 14px 9px;box-sizing:border-box;" +
+            "border-bottom:1px solid var(--background-modifier-border);" +
+            "background:var(--background-secondary);max-height:34vh;overflow:auto;";
+        const heading = doc.createElement("div");
+        heading.style.cssText = "font-weight:600;margin-bottom:5px;font-size:13.5px;";
+        heading.textContent = (canons || []).map(c => this.canonToDisplayRef(c)).join(", ");
+        const verseBox = doc.createElement("div");
+        verseBox.style.cssText = "font-size:13px;line-height:1.55;";
+        verseBox.textContent = "Loading passage\u2026";
+        head.appendChild(heading);
+        head.appendChild(verseBox);
+        root.insertBefore(head, content);
+
+        // ---- Cancel / Add note -------------------------------------------
+        const foot = doc.createElement("div");
+        foot.style.cssText = "flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;" +
+            "padding:10px 14px;border-top:1px solid var(--background-modifier-border);" +
+            "background:var(--background-secondary);";
+        const cancelBtn = doc.createElement("button");
+        cancelBtn.textContent = "Cancel";
+        const saveBtn = doc.createElement("button");
+        saveBtn.textContent = "Add note";
+        saveBtn.style.cssText = "font-weight:600;";
+        foot.appendChild(cancelBtn);
+        foot.appendChild(saveBtn);
+        root.appendChild(foot);
+
+        // After a mode switch the view is a new instance, so read the editor
+        // from the leaf rather than the one captured before it.
+        const editor = (leaf.view && leaf.view.editor) || view.editor;
+        let finished = false;
+        let closeWatch = null;
+
+        // The caret starts where the note starts.
+        setTimeout(() => {
+            try {
+                if (!editor) return;
+                editor.setCursor({ line: 0, ch: 0 });
+                editor.scrollIntoView({ from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } }, true);
+                editor.focus();
+            } catch (e) { /* the caret is a convenience, not the job */ }
+        }, 80);
+
+        const undoIt = async () => {
+            if (!undo) return;
+            if (undo.kind === "new") {
+                const f = this.app.vault.getAbstractFileByPath(undo.path);
+                if (f) await this.app.vault.delete(f, true);
+            } else if (undo.kind === "list") {
+                const f = this.app.vault.getAbstractFileByPath(undo.path);
+                if (f) await this.app.vault.modify(f, undo.before);
+            }
+            // The file went back to its earlier contents: the scan must see
+            // that, not a cached copy of the note that was just written.
+            this.forgetNoteText(undo.path);
+        };
+
+        const finish = async (save) => {
+            if (finished) return;
+            finished = true;
+            if (closeWatch) { clearInterval(closeWatch); closeWatch = null; }
+            saveBtn.disabled = true;
+            cancelBtn.disabled = true;
+            try {
+                if (save) {
+                    // Whatever is in the window is the note — even nothing.
+                    const body = editor ? editor.getValue() : await this.app.vault.read(draftFile);
+                    await this.app.vault.modify(file, this.noteTextWithBody(parts, body));
+                    // The scan that follows must read this file, not the text
+                    // it had before the note was added.
+                    this.forgetNoteText(path);
+                    // Detach before deleting: the view must not write to the
+                    // draft on its way out and bring the file back.
+                    try { leaf.detach(); } catch (e) {}
+                    await this.removeDraft(draftPath);
+                    new Notice("Note added: " + path);
+                } else {
+                    // Detach first: the draft must not be read on the way out.
+                    try { leaf.detach(); } catch (e) {}
+                    await this.removeDraft(draftPath);
+                    await undoIt();
+                    new Notice("Note discarded.");
+                }
+                this.refreshNoteDots();
+            } catch (e) {
+                new Notice("Could not finish the note: " + (e && e.message ? e.message : e));
+            }
+        };
+
+        cancelBtn.addEventListener("click", () => { finish(false); });
+        saveBtn.addEventListener("click", () => { finish(true); });
+        // Enter inside the editor is a newline, as it should be; these two are
+        // the shortcuts for the buttons.
+        doc.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+                ev.preventDefault();
+                ev.stopPropagation();
+                finish(true);
+            } else if (ev.key === "Escape") {
+                ev.preventDefault();
+                finish(false);
+            }
+        }, true);
+
+        // Closing the window counts as Cancel, so a stray X never leaves a
+        // half-written note (or a draft) behind. A leaf's "unload" event is not
+        // dependable for a popout, so the window is watched directly: its own
+        // pagehide, and a poll for the view leaving the document.
+        const discard = () => {
+            if (finished) return;
+            finished = true;
+            if (closeWatch) { clearInterval(closeWatch); closeWatch = null; }
+            Promise.resolve()
+                .then(() => this.removeDraft(draftPath))
+                .then(undoIt)
+                .then(() => { new Notice("Note discarded."); this.refreshNoteDots(); })
+                .catch(() => {});
+        };
+        try {
+            const win = doc.defaultView;
+            if (win) {
+                win.addEventListener("pagehide", discard);
+                win.addEventListener("beforeunload", discard);
+            }
+            // The poll covers the case the window API does not: the leaf being
+            // closed or moved out from under the DOM. Fast enough that the
+            // draft never lingers, cheap enough to ignore.
+            closeWatch = setInterval(() => {
+                if (finished) { clearInterval(closeWatch); closeWatch = null; return; }
+                if (!root.isConnected) discard();
+            }, 300);
+        } catch (e) { /* the buttons still work */ }
+
+        // Fill the passage in behind the editor, which is usable immediately.
+        (async () => {
+            try {
+                const html = await this.versePreviewHtml(canons, 60);
+                if (verseBox.isConnected) verseBox.innerHTML = html;
+            } catch (e) {
+                if (verseBox.isConnected) verseBox.textContent = "";
+            }
+        })();
+    }
+
+    async removeDraft(path) {
+        try {
+            const f = this.app.vault.getAbstractFileByPath(path);
+            if (f) await this.app.vault.delete(f, true);
+        } catch (e) { /* already gone */ }
+    }
+
+    // Verse text for the passage header, read from the local STEP server the
+    // same way the hover box reads it.
+    async versePreviewHtml(canons, limit = 60) {
+        const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+        let refs = [];
+        for (const c of canons || []) {
+            let one = [];
+            try { one = this.urlRef_verseListArray(c) || []; } catch (e) { one = [c]; }
+            for (const r of one) if (r && !refs.includes(r)) refs.push(r);
+        }
+        if (!refs.length) return "";
+
+        if (!(await this.isLocalStepRunning())) {
+            return '<span style="color:var(--text-muted)">STEP Bible isn\u2019t running, so the text can\u2019t be shown.</span>';
+        }
+
+        const out = [];
+        const seen = new Set();
+        const shown = refs.slice(0, limit);
+        for (const vRef of shown) {
+            try {
+                const res = await requestUrl({ url: this.urlRef_url(vRef) });
+                const d = new DOMParser().parseFromString(res.text, "text/html");
+                const parts = (d.querySelector("title")?.textContent || "").split("|").map(p => p.trim());
+                let t = parts.length >= 4 ? parts[3] : "";
+                t = t.replace(/\s+/g, " ")
+                    .replace(/\s+([,;:.!?])/g, "$1")
+                    .replace(/\s+\)/g, ")")
+                    .replace(/\(\s+/g, "(")
+                    .replace(/\s*,\s*$/, "")
+                    .trim();
+                if (!t || seen.has(t)) continue;
+                seen.add(t);
+                const bits = vRef.split(".");
+                const label = bits.length >= 3 ? `${bits[1]}:${bits[2]}` : (bits[1] || vRef);
+                out.push(`<p style="margin:0 0 4px 0"><strong>${esc(label)}</strong> ${esc(t)}</p>`);
+            } catch (e) { /* one verse failing shouldn't empty the header */ }
+        }
+        if (refs.length > shown.length) {
+            out.push(`<p style="margin:4px 0 0 0;color:var(--text-muted);font-size:11.5px">` +
+                `${refs.length - shown.length} more verses not shown.</p>`);
+        }
+        return out.join("") || '<span style="color:var(--text-muted)">No text found.</span>';
     }
 
     urlRef_displayRef(urlRef) {
@@ -2625,9 +2835,27 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const hit = this._noteDotsTextCache[file.path];
         const mtime = file.stat && file.stat.mtime ? file.stat.mtime : 0;
         if (hit && hit.mtime === mtime) return hit.text;
-        const text = await this.app.vault.cachedRead(file);
+        // A file this plugin has just written is read straight from disk.
+        // cachedRead is Obsidian's own cache and can still hold the previous
+        // contents at this point, so the scan reproduced the map it already
+        // had: no bar moved and a freshly added note never drew one.
+        const forceFresh = this._noteDotsFreshPaths && this._noteDotsFreshPaths.has(file.path);
+        if (forceFresh) this._noteDotsFreshPaths.delete(file.path);
+        const text = forceFresh
+            ? await this.app.vault.read(file)
+            : await this.app.vault.cachedRead(file);
         this._noteDotsTextCache[file.path] = { mtime, text };
         return text;
+    }
+
+    // Drop every derived thing for one file, and insist its next read comes
+    // from disk rather than from any cache.
+    forgetNoteText(path) {
+        if (path) {
+            if (this._noteDotsTextCache) delete this._noteDotsTextCache[path];
+            if (this._noteDotsFreshPaths) this._noteDotsFreshPaths.add(path);
+        }
+        this._noteDotsCache = null;
     }
 
     // A saved note changes exactly one file, so the derived map is dropped and

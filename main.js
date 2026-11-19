@@ -20,6 +20,10 @@ const DEFAULT_SETTINGS = {
     noteLinesColour: "#17758f",
     typedColours: {},
     noteTypesFolder: "",
+    // Per-folder settings for ordinary notes, keyed by vault folder path.
+    // A note takes the settings of its closest configured ancestor folder.
+    // Each entry: { mainPassage: boolean, colour: string, template: string }.
+    folderSettings: {},
     // Skip the text popout when the verses are already on the STEP page.
     popoutVisiblePassages: true,
     // Always open a searched reference in a fresh tab. Turned off, an open
@@ -49,65 +53,260 @@ class FolderSuggest extends AbstractInputSuggest {
         if (this.onPick) this.onPick(path);
     }
 }
+// Sections inside a list note are separated by BLANK LINES, not by a visible
+// marker: three or more empty lines before a line that begins with a reference
+// link start a new section. Fewer than three are ordinary blank space inside a
+// section, so prose keeps its paragraph breaks. "---" carries no special
+// meaning any more and can be used as an ordinary horizontal rule.
+// The folder a vault path lives in ("" at the vault root).
+function dirOfPath(path) {
+    const p = String(path || "");
+    const i = p.lastIndexOf("/");
+    return i < 0 ? "" : p.slice(0, i);
+}
+
+// A list note is a markdown file directly inside the Bible notes folder.
+// Subfolders of it are ordinary notes: only the folder itself marks lists.
+function isListNotePath(path, notesFolder) {
+    const f = String(notesFolder || "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
+    if (!f) return false;
+    return dirOfPath(String(path || "").replace(/^\/+/, "")) === f;
+}
+
+const SECTION_SEPARATOR_BLANKS = 3;
+
+// Suggests markdown files by path, for picking a folder's template note.
+class FileSuggest extends AbstractInputSuggest {
+    constructor(app, inputEl, onPick) {
+        super(app, inputEl);
+        this.onPick = onPick;
+    }
+
+    getSuggestions(query) {
+        const q = query.toLowerCase();
+        return this.app.vault.getMarkdownFiles()
+            .map(f => f.path)
+            .filter(p => p.toLowerCase().includes(q))
+            .slice(0, 50);
+    }
+
+    renderSuggestion(path, el) {
+        el.setText(path);
+    }
+
+    selectSuggestion(path) {
+        if (this.inputEl) this.inputEl.setValue(path);
+        this.close();
+        if (this.onPick) this.onPick(path);
+    }
+}
 function parseTypedFile(text, fileBasename) {
-    const refLine = /^[ \t]*(?:\(\s*)?\[([^\]]+)\]\(([^)]*reference=[^)]*)\)(.*)$/; // optional "(" before the link; link must start the line
-    const inlineRef = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
+    const linkRe = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
+    // A section starts at a line whose first thing is a reference link,
+    // optionally behind the "(" of the wrapper STEP writes.
+    const startsWithRef = /^[ \t]*(?:\(\s*)?\[[^\]]+\]\([^)]*reference=[^)]*\)/;
+
     const entries = [];
     const crosslinks = [];
-    const byRef = new Map();
     let current = null;
-    let escaped = false; // inside a ~~~ block: line-start refs are content, not section starts
-    let closed = true;   // a --- has closed the previous section (true at file start)
+    let escaped = false;  // inside a ~~~ block: line-start refs are content
+    let blanks = 0;       // blank lines since the last non-blank line
+
+    // Start a section from a line that begins with one or more ref links.
+    // Every link on that first line is a main reference for the section; the
+    // first one is the primary. Whatever text is left on the line is the
+    // section's opening content.
+    const startSection = (line) => {
+        const refs = [];
+        linkRe.lastIndex = 0;
+        let m;
+        while ((m = linkRe.exec(line)) !== null) {
+            refs.push({ refText: (m[1] || "").trim(), refRaw: decodeURIComponent(m[2].trim()) });
+        }
+        if (!refs.length) return false;
+        // The empty "()" left behind by a "([link])" wrapper is not content.
+        const rest = line.replace(linkRe, "").replace(/\(\s*\)/g, "").trim();
+        current = {
+            // Positional identity. Two sections may legitimately share a
+            // reference — merging them would lose one — so an entry is never
+            // looked up by its reference.
+            index: entries.length,
+            refText: refs[0].refText,
+            refRaw: refs[0].refRaw,
+            refs,
+            source: fileBasename,
+            lines: rest ? [rest] : [],
+        };
+        entries.push(current);
+        return true;
+    };
 
     for (const line of text.split(/\r?\n/)) {
-        if (/^[ \t]*-{3,}[ \t]*$/.test(line)) {
-            // --- : hard section break; also closes any open escape block.
-            // Blank separator lines after it belong to no section and are dropped.
-            escaped = false;
-            current = null;
-            closed = true;
-            continue;
-        }
         if (/^[ \t]*~{3,}[ \t]*$/.test(line)) {
             escaped = !escaped; // toggle escape block
+            blanks = 0;
             continue;
         }
-        const m = escaped ? null : line.match(refLine);
-        if (m && closed) {
-            const refText = m[1].trim();
-            const refRaw = decodeURIComponent(m[2].trim());
-            const trailing = m[3] ? m[3].replace(/^[ \t]*\)/, "") : ""; // drop the closing paren of an "([...])" wrapper
-            if (byRef.has(refRaw)) {
-                current = byRef.get(refRaw); // duplicate ref: append content to existing entry
-            } else {
-                current = { refText, refRaw, source: fileBasename, content: "" };
-                byRef.set(refRaw, current);
-                entries.push(current);
-            }
-            closed = false; // next section needs a --- first
-            if (trailing.trim()) current.content += (current.content ? "\n" : "") + trailing.trim();
+        if (!line.trim()) {
+            blanks++;
             continue;
         }
-        if (current) current.content += (current.content ? "\n" : "") + line;
-        // crosslinks: any reference link on a line that did not start a section
+
+        if (!escaped && startsWithRef.test(line)
+            && (current === null || blanks >= SECTION_SEPARATOR_BLANKS)) {
+            startSection(line);
+            blanks = 0;
+            continue;
+        }
+
         if (current) {
-            for (const cm of line.matchAll(inlineRef)) {
+            // Blank lines are content here, but only once a real line follows:
+            // a run long enough to be a separator is dropped when the next
+            // non-blank line starts a section, and trailing blanks are never
+            // appended, so no entry ends on empty lines.
+            for (let i = 0; i < blanks; i++) current.lines.push("");
+            current.lines.push(line);
+            // crosslinks: any reference link on a line that did not start a section
+            for (const cm of line.matchAll(linkRe)) {
                 crosslinks.push({
-                    refText: cm[1].trim(),
+                    refText: (cm[1] || "").trim(),
                     refRaw: decodeURIComponent(cm[2].trim()),
                     source: fileBasename,
                     target: current, // the section this crosslink points to
                 });
             }
         }
+        blanks = 0;
     }
 
-    // trim leading/trailing blank lines from each entry's content
     for (const e of entries) {
-        e.content = e.content.replace(/^\s*\n/, "").replace(/\n\s*$/, "");
+        e.content = e.lines.join("\n").replace(/\s+$/, "");
+        delete e.lines;
     }
     return { entries, crosslinks };
 }
+// How many blank lines separate two sections of a list note. Written this
+// many so that trimming one or two by hand still leaves the 3 needed to keep
+// them apart.
+const LIST_SEPARATOR_WRITE_BLANKS = 5;
+
+// Put a reference at the top of a new note built from a template. If the file
+// opens with frontmatter, the reference goes on the first line after it — a
+// reference appended to the opening "---" would corrupt the properties block.
+// Otherwise it goes on line 1, after whatever the template already has there.
+function applyReferenceToFirstLine(text, refMd) {
+    const doc = String(text == null ? "" : text);
+    const lines = doc.split(/\r?\n/);
+    const fmClose = (() => {
+        if (!lines.length || !/^[-]{3,}[ \t]*$/.test(lines[0])) return -1;
+        for (let i = 1; i < lines.length; i++) {
+            if (/^([-]{3,}|\.\.\.)[ \t]*$/.test(lines[i])) return i;
+        }
+        return -1;
+    })();
+    const at = fmClose >= 0 ? fmClose + 1 : 0;
+    if (at >= lines.length) {
+        // The template is empty (or frontmatter only): the reference is line 1
+        // of the body, with one blank line after the properties block.
+        const out = lines.slice();
+        if (fmClose >= 0) out.push("");
+        out.push(refMd);
+        return out.join("\n");
+    }
+    const first = lines[at];
+    lines[at] = first.trim() ? first.replace(/\s+$/, "") + " " + refMd : refMd;
+    return lines.join("\n");
+}
+
+// Start line indices of every section in a list note, plus each section's
+// canonical start and span. Positional, matching parseTypedFile: a section
+// begins at a line whose first thing is a reference link, and only when 3+
+// blank lines precede it (or it is the first section in the file).
+function listSectionStarts(text) {
+    const lines = String(text == null ? "" : text).split(/\r?\n/);
+    const startsWithRef = /^[ \t]*(?:\(\s*)?\[[^\]]+\]\([^)]*reference=[^)]*\)/;
+    const refRe = /\[[^\]]+\]\([^)]*reference=([^)&]+)[^)]*\)/;
+    const out = [];
+    let escaped = false;
+    let blanks = 0;
+    let started = false;
+    let fmEnd = -1;
+    if (lines.length && /^[-]{3,}[ \t]*$/.test(lines[0])) {
+        for (let i = 1; i < lines.length; i++) {
+            if (/^([-]{3,}|\.\.\.)[ \t]*$/.test(lines[i])) { fmEnd = i; break; }
+        }
+    }
+    for (let i = 0; i < lines.length; i++) {
+        if (i <= fmEnd) continue;
+        const line = lines[i];
+        if (/^[ \t]*~{3,}[ \t]*$/.test(line)) { escaped = !escaped; blanks = 0; continue; }
+        if (!line.trim()) { blanks++; continue; }
+        if (!escaped && startsWithRef.test(line) && (!started || blanks >= 3)) {
+            const m = line.match(refRe);
+            let canon = null;
+            if (m) {
+                let raw = m[1];
+                try { raw = decodeURIComponent(raw); } catch (e) {}
+                const parts = raw.split("-").map(s => s.trim());
+                const left = parts[0];
+                let right = parts[1] || "";
+                const lp = left.split(".");
+                if (right && !right.includes(".")) {
+                    right = lp.length >= 3 ? [lp[0], lp[1], right].join(".") : [lp[0], right].join(".");
+                }
+                const b = canonBounds(right ? left + "-" + right : left);
+                if (b) canon = { start: b.start, span: b.end - b.start };
+            }
+            out.push({ line: i, canon });
+            started = true;
+            blanks = 0;
+            continue;
+        }
+        blanks = 0;
+    }
+    return out;
+}
+
+// Insert a new section into a list note between existing ones. Sections are
+// ordered by where their first reference starts; a longer range that starts in
+// the same place comes after the shorter one, and a duplicate goes after the
+// one already there. Every other line of the file is left exactly as it was.
+function insertListSection(text, sectionMd, canon) {
+    const doc = String(text == null ? "" : text);
+    const lines = doc.split(/\r?\n/);
+    const sections = listSectionStarts(doc);
+    const target = canon || { start: Infinity, span: 0 };
+
+    let cut = lines.length;
+    for (const s of sections) {
+        if (!s.canon) continue;
+        if (s.canon.start > target.start
+            || (s.canon.start === target.start && s.canon.span > target.span)) {
+            cut = s.line;
+            break;
+        }
+    }
+
+    // Drop the blank run immediately before the cut: the separator is written
+    // back below, exactly, so no stray blank lines accumulate on repeat use.
+    let end = cut;
+    while (end > 0 && !lines[end - 1].trim()) end--;
+
+    const before = lines.slice(0, end);
+    const after = lines.slice(cut);
+    const block = sectionMd.split("\n");
+    // n blank lines between two blocks is n+1 newlines.
+    const sep = new Array(LIST_SEPARATOR_WRITE_BLANKS + 2).join("\n");
+
+    const out = [];
+    if (before.length) { out.push(before.join("\n")); out.push(sep); }
+    out.push(block.join("\n"));
+    // The section that follows keeps the separator it had: without it the
+    // plugin would no longer read it as a section at all.
+    if (after.length) { out.push(sep); out.push(after.join("\n")); }
+    return out.join("");
+}
+
 function canonBounds(range) {
     if (!range) return null;
     const point = (s) => {
@@ -130,6 +329,16 @@ function canonBounds(range) {
         return p.bi * 1e9 + p.ch * 1e6 + (p.v == null ? (end ? 999999 : 0) : p.v);
     };
     return { start: ord(a, false), end: ord(b, true) };
+}
+// A bar's data-ref is "<canon of its first verse>..<canon of its last>".
+// canonBounds reads a range from a single "-", so turn the ".." form into
+// one before measuring it.
+function canonBoundsOfBarRef(ref) {
+    const s = String(ref || "").trim();
+    if (!s) return null;
+    const halves = s.split("..").map(x => x.trim()).filter(Boolean);
+    if (!halves.length) return null;
+    return canonBounds(halves.length > 1 ? halves[0] + "-" + halves[halves.length - 1] : halves[0]);
 }
 function scopeRelation(sectionCanon, targetCanon) {
     const s = canonBounds(sectionCanon);
@@ -254,6 +463,99 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
             });
         }
         for (const n of typeColourNames) colourRow(n);
+
+        // FOLDERS SECTION: notes in these folders are scanned for references and
+        // drawn with the folder's settings. The closest parent folder wins; the
+        // Bible notes folder is never listed, because its notes are lists.
+        containerEl.createEl("h3", { text: "Folders" });
+        containerEl.createEl("p", {
+            text: "Notes anywhere in these folders are checked for Bible references. A note in a subfolder uses the settings of its closest parent folder. The Bible notes folder is not listed: notes directly inside it are lists and keep their own per-list colours.",
+            cls: "setting-item-description",
+        });
+
+        const configuredFolders = Object.keys(this.plugin.settings.folderSettings || {}).sort();
+        if (!configuredFolders.length) {
+            containerEl.createEl("p", {
+                text: "No folders added yet.",
+                cls: "setting-item-description",
+            });
+        }
+        for (const folder of configuredFolders) {
+            const fs = this.plugin.settings.folderSettings[folder];
+            const row = new Setting(containerEl)
+                .setName(folder)
+                .setDesc("Toggle: verses on a note's first line are its main passage. Swatch: this folder's bar colour.")
+                .addToggle(toggle => toggle
+                    .setValue(fs.mainPassage === true)
+                    .onChange(async (value) => {
+                        fs.mainPassage = value;
+                        await this.plugin.saveSettings();
+                        this.plugin.refreshNoteDots();
+                    }))
+                .addColorPicker(color => color
+                    .setValue(fs.colour || this.plugin.settings.noteLinesColour)
+                    .onChange(async (value) => {
+                        fs.colour = value;
+                        await this.plugin.saveSettings();
+                        this.plugin.refreshNoteDots();
+                    }))
+                .addExtraButton(btn => btn
+                    .setIcon("trash")
+                    .setTooltip("Remove this folder from the list")
+                    .onClick(async () => {
+                        this.plugin.removeFolderSetting(folder);
+                        await this.plugin.saveSettings();
+                        this.plugin.refreshNoteDots();
+                        this.display();
+                    }));
+            row.settingEl.style.paddingLeft = "24px";
+
+            const tpl = new Setting(containerEl)
+                .setName(`${folder} template`)
+                .setDesc("Note to open when adding a note in this folder. Leave empty for a blank note.")
+                .addText(text => {
+                    text
+                        .setPlaceholder("Templates/Bible note.md")
+                        .setValue(fs.template || "")
+                        .onChange(async (value) => {
+                            fs.template = value.trim();
+                            await this.plugin.saveSettings();
+                        });
+                    new FileSuggest(this.app, text.inputEl, async (path) => {
+                        fs.template = path;
+                        await this.plugin.saveSettings();
+                    });
+                });
+            tpl.settingEl.style.paddingLeft = "48px";
+        }
+
+        const addFolderRow = new Setting(containerEl)
+            .setName("Add folder")
+            .setDesc("Pick an existing vault folder. New folders are made in the file explorer, not here.")
+            .addText(text => {
+                text.inputEl.classList.add("step-add-folder-input");
+                text.setPlaceholder("Folder path");
+                new FolderSuggest(this.app, text.inputEl, async (path) => {
+                    const err = this.plugin.addFolderSetting(path);
+                    if (err) { new Notice(err); return; }
+                    await this.plugin.saveSettings();
+                    this.plugin.refreshNoteDots();
+                    this.display();
+                });
+            })
+            .addExtraButton(btn => btn
+                .setIcon("plus")
+                .setTooltip("Add this folder")
+                .onClick(async () => {
+                    const input = this.containerEl.querySelector(".step-add-folder-input");
+                    const path = input ? input.value.trim() : "";
+                    const err = this.plugin.addFolderSetting(path);
+                    if (err) { new Notice(err); return; }
+                    await this.plugin.saveSettings();
+                    this.plugin.refreshNoteDots();
+                    this.display();
+                }));
+        addFolderRow.settingEl.style.paddingLeft = "24px";
 
         // NOTE TYPES SECTION: a live list of type files with edit/delete.
         // LINK POPOUT SECTION
@@ -512,10 +814,16 @@ class StepBibleLinkerSettingTab extends PluginSettingTab {
     }
 }
 class StepBibleSearchModal extends Modal {
-    constructor(app, plugin, prefill = "") {
+    // mode: "open" searches for a reference and opens it in STEP.
+    //       "add"  files a note for a reference.
+    constructor(app, plugin, prefill = "", mode = "open", refs = null) {
         super(app);
         this.plugin = plugin;
         this.prefill = prefill;
+        this.mode = mode === "add" ? "add" : "open";
+        // Canonical references carried over from the STEP page's chip.
+        this.refs = Array.isArray(refs) ? refs.slice() : null;
+        this._dest = null;
         this._isSubmitting = false;
         this._changesCommitted = false;
 
@@ -532,6 +840,145 @@ class StepBibleSearchModal extends Modal {
         const local = this._draftLocalVersions;
         const currentLocal = this.plugin.settings.localVersions || [];
         return local.length !== currentLocal.length || local.some((v, i) => v !== currentLocal[i]);
+    }
+
+    // File a note for whatever reference is in the box. The reference is read
+    // from the box (not from whatever the chip handed over), so editing it
+    // before pressing Enter does what it looks like it does.
+    async _submitAdd(input) {
+        if (this._isSubmitting) return;
+        const raw = (input.value || "").trim();
+        if (!raw) { new Notice("Enter a reference to file."); return; }
+        if (!this._dest) { new Notice("Choose where the note should go."); return; }
+
+        const re = this.plugin.buildInputRefRegex();
+        const canons = [];
+        for (const piece of raw.split(",")) {
+            const t = piece.trim();
+            if (!t) continue;
+            const m = t.match(re);
+            if (!m || m[0].trim() !== t) continue;
+            const u = this.plugin.inputRef_urlRef(t);
+            if (u) canons.push(u);
+        }
+        if (!canons.length) { new Notice("Not a valid Bible reference."); return; }
+
+        // The note is filed straight from this tab: the box at the bottom is
+        // its text, and the reference above it is settled. Nothing opens, so
+        // the STEP page behind stays exactly where it was.
+        this._isSubmitting = true;
+        const dest = this._dest;
+        const body = this._noteBox ? this._noteBox.value : "";
+        try {
+            const path = await this.plugin.addNote(canons, dest, body);
+            if (path) {
+                this._changesCommitted = true;
+                new Notice("Note saved: " + path);
+                this.close();
+            }
+        } catch (e) {
+            new Notice("Could not save the note: " + (e && e.message ? e.message : e));
+        } finally {
+            this._isSubmitting = false;
+        }
+    }
+
+    // ---- pictures in the note box -------------------------------------------
+    // Only paste and drag-drop: there is no file button, because a note is
+    // written here rather than assembled from a picker.
+    _imageFiles(dt) {
+        if (!dt) return [];
+        const out = [];
+        for (const f of Array.from(dt.files || [])) {
+            if (f && /^image\//.test(f.type || "")) out.push(f);
+        }
+        if (!out.length && dt.items) {
+            for (const it of Array.from(dt.items)) {
+                if (it.kind === "file" && /^image\//.test(it.type || "")) {
+                    const f = it.getAsFile && it.getAsFile();
+                    if (f) out.push(f);
+                }
+            }
+        }
+        return out;
+    }
+
+    // The folder the note will land in: a list always lives in the notes
+    // folder, an ordinary note in its own destination folder.
+    _destNoteDir() {
+        const d = this._dest;
+        if (d && d.kind === "folder") return String(d.path || "");
+        return this.plugin.normaliseFolderPath(this.plugin.settings.noteTypesFolder) || "";
+    }
+
+    // Where Obsidian would put an attachment, as a vault-relative path.
+    _attachmentFolder() {
+        let cfg = "";
+        try {
+            cfg = (this.app.vault.getConfig && this.app.vault.getConfig("attachmentFolderPath")) || "";
+        } catch (e) { cfg = ""; }
+        const noteDir = this._destNoteDir();
+        if (cfg === "/") return noteDir;
+        if (cfg.startsWith("./")) {
+            const rest = cfg.slice(2).replace(/^\/+|\/+$/g, "");
+            return noteDir ? (rest ? noteDir + "/" + rest : noteDir) : rest;
+        }
+        return String(cfg || "").replace(/^\/+|\/+$/g, "");
+    }
+
+    async _ensureFolder(path) {
+        if (!path) return;
+        const parts = path.split("/");
+        let cur = "";
+        for (const part of parts) {
+            cur = cur ? cur + "/" + part : part;
+            const ex = this.app.vault.getAbstractFileByPath(cur);
+            if (!ex && this.app.vault.createFolder) {
+                try { await this.app.vault.createFolder(cur); } catch (e) {}
+            }
+        }
+    }
+
+    async _insertImage(file) {
+        let path = "";
+        try {
+            const folder = this._attachmentFolder();
+            await this._ensureFolder(folder);
+            const ext = (file.name && /\.([A-Za-z0-9]+)$/.exec(file.name) ? /\.([A-Za-z0-9]+)$/.exec(file.name)[1] : null)
+                || (file.type && file.type.split("/")[1]) || "png";
+            const stamp = new Date();
+            const pad = (n) => String(n).padStart(2, "0");
+            const base = "Pasted image "
+                + stamp.getFullYear() + pad(stamp.getMonth() + 1) + pad(stamp.getDate())
+                + pad(stamp.getHours()) + pad(stamp.getMinutes()) + pad(stamp.getSeconds());
+            let name = base + "." + ext;
+            for (let i = 1; i < 1000; i++) {
+                const candidate = folder ? folder + "/" + name : name;
+                if (!this.app.vault.getAbstractFileByPath(candidate)) break;
+                name = base + " " + i + "." + ext;
+            }
+            path = folder ? folder + "/" + name : name;
+            const buf = await file.arrayBuffer();
+            await this.app.vault.createBinary(path, buf);
+        } catch (e) {
+            new Notice("Could not save the image: " + (e && e.message ? e.message : e));
+            return;
+        }
+        this._insertText("![[" + path + "]]");
+    }
+
+    _insertText(text) {
+        const area = this._noteBox;
+        if (!area) return;
+        const start = area.selectionStart == null ? area.value.length : area.selectionStart;
+        const end = area.selectionEnd == null ? area.value.length : area.selectionEnd;
+        const before = area.value.slice(0, start);
+        const after = area.value.slice(end);
+        const pad = before && !/\s$/.test(before) ? " " : "";
+        area.value = before + pad + text + after;
+        const at = start + pad.length + text.length;
+        try { area.setSelectionRange(at, at); } catch (e) {}
+        area.focus();
     }
 
     async openStepUrl(url) {
@@ -596,7 +1043,42 @@ class StepBibleSearchModal extends Modal {
         contentEl.style.gap = "10px";
         contentEl.style.padding = "16px";
 
-        // 1. INPUT & TOGGLE ICON ROW ================================================================
+        const isAdd = this.mode === "add";
+
+        // TAB STRIP ================================================================================
+        // The two things the modal does. Switching re-renders in place; nothing
+        // is remembered between opens, so the command you used decides the tab.
+        const tabStrip = contentEl.createEl("div");
+        tabStrip.style.display = "flex";
+        tabStrip.style.gap = "4px";
+        tabStrip.style.borderBottom = "1px solid var(--background-modifier-border)";
+        tabStrip.style.paddingBottom = "8px";
+
+        const makeTab = (label, mode) => {
+            const b = tabStrip.createEl("button", { text: label });
+            b.tabIndex = -1;
+            b.style.flex = "1";
+            b.style.padding = "6px 10px";
+            b.style.fontSize = "12px";
+            b.style.fontWeight = "bold";
+            b.style.borderRadius = "4px";
+            b.style.cursor = "pointer";
+            b.style.border = "none";
+            b.style.userSelect = "none";
+            const active = this.mode === mode;
+            b.style.backgroundColor = active ? "var(--interactive-accent)" : "var(--background-secondary)";
+            b.style.color = active ? "var(--text-on-accent)" : "var(--text-muted)";
+            b.onmousedown = (e) => e.preventDefault();
+            b.onclick = (e) => {
+                e.preventDefault();
+                if (this.mode === mode) return;
+                this.mode = mode;
+                this.onOpen();
+            };
+            return b;
+        };
+        makeTab("Open reference", "open");
+        makeTab("Add note", "add");
         const inputRow = contentEl.createEl("div");
         inputRow.style.display = "flex";
         inputRow.style.alignItems = "center";
@@ -604,7 +1086,7 @@ class StepBibleSearchModal extends Modal {
 
         const input = inputRow.createEl("input", {
             type: "text",
-            placeholder: "Enter Reference (e.g. John 3.16)"
+            placeholder: isAdd ? "Reference to file (e.g. John 3.16)" : "Enter Reference (e.g. John 3.16)"
         });
 
         input.style.flex = "1";
@@ -925,6 +1407,132 @@ class StepBibleSearchModal extends Modal {
         settingsDrawer.appendChild(helperWrapper);
         updateDrawerBorder();
 
+        // =========================================================================
+        // ADD NOTE: where the note goes. Only the versions/opening drawer belongs
+        // to searching, so in this tab it is hidden and replaced by this list.
+        // =========================================================================
+        if (isAdd) {
+            toggleBtn.style.display = "none";
+            animWrapper.style.display = "none";
+
+            const destSection = contentEl.createEl("div");
+            destSection.style.display = "flex";
+            destSection.style.flexDirection = "column";
+            destSection.style.gap = "6px";
+
+            const destTitle = destSection.createEl("span", { text: "Save to" });
+            destTitle.style.fontSize = "12px";
+            destTitle.style.fontWeight = "bold";
+            destTitle.style.color = "var(--text-muted)";
+
+            // A plain <select> cannot show a colour swatch and clips long
+            // names, so the destinations are drawn as a scrollable list: one
+            // row per place, its bar colour as a dot on the left.
+            const destList = destSection.createEl("div");
+            destList.className = "step-dest-list";
+            destList.style.cssText =
+                "display:flex;flex-direction:column;gap:2px;max-height:168px;overflow-y:auto;" +
+                "border:1px solid var(--background-modifier-border);border-radius:4px;" +
+                "background:var(--background-secondary);padding:4px;";
+
+            const opts = [];
+            Object.keys(this.plugin.settings.folderSettings || {}).sort()
+                .forEach(p => opts.push({ kind: "folder", path: p, label: p }));
+            const listFolder = this.plugin.normaliseFolderPath(this.plugin.settings.noteTypesFolder);
+            if (listFolder) {
+                this.app.vault.getMarkdownFiles()
+                    .filter(f => isListNotePath(f.path, listFolder))
+                    .sort((a, b) => a.path.localeCompare(b.path))
+                    .forEach(f => opts.push({ kind: "list", file: f.path, label: `List: ${f.basename}` }));
+                opts.push({ kind: "list", file: null, label: "List: new note" });
+            }
+            if (!opts.length) {
+                const none = destSection.createEl("div", {
+                    text: "No folders are set up yet. Add one in settings first."
+                });
+                none.style.fontSize = "12px";
+                none.style.color = "var(--text-error)";
+                this._dest = null;
+            } else {
+                const rows = [];
+                const selectRow = (i) => {
+                    this._dest = opts[i] || null;
+                    rows.forEach((r, j) => {
+                        const on = j === i;
+                        r.style.background = on ? "var(--background-modifier-hover)" : "transparent";
+                        r.style.fontWeight = on ? "600" : "400";
+                    });
+                };
+                opts.forEach((o, i) => {
+                    const row = destList.createEl("div");
+                    row.className = "step-dest-row";
+                    row.style.cssText =
+                        "display:flex;align-items:center;gap:8px;padding:5px 7px;" +
+                        "border-radius:4px;cursor:pointer;min-width:0;";
+                    // Wraps rather than truncates: the whole name stays legible
+                    // however long the folder or list is.
+                    const dot = row.createEl("span");
+                    dot.className = "step-dest-dot";
+                    dot.style.cssText =
+                        "flex:0 0 auto;width:10px;height:10px;border-radius:50%;" +
+                        "background:" + this.plugin.destColour(o) + ";";
+                    const label = row.createEl("span");
+                    label.className = "step-dest-label";
+                    label.setText(o.label);
+                    label.style.cssText =
+                        "flex:1 1 auto;min-width:0;font-size:13px;line-height:1.35;" +
+                        "white-space:normal;overflow-wrap:anywhere;";
+                    row.addEventListener("mousedown", (ev) => ev.preventDefault()); // keep the input's focus
+                    row.addEventListener("click", () => { selectRow(i); input.focus(); });
+                    rows.push(row);
+                });
+                selectRow(0);
+            }
+
+            // The note's text lives here, at the bottom of this tab, exactly
+            // where the note is going. There is no second dialog: Enter files
+            // the note, Shift+Enter is a newline, and pictures paste or drop
+            // straight into the box.
+            const noteBox = contentEl.createEl("textarea");
+            noteBox.className = "step-add-note-text";
+            noteBox.placeholder = "Note text \u2014 Enter saves, Shift+Enter for a new line";
+            noteBox.style.cssText =
+                "width:100%;min-height:88px;max-height:40vh;resize:vertical;padding:8px 10px;" +
+                "font-size:13px;line-height:1.5;font-family:var(--font-text);border-radius:6px;" +
+                "border:1px solid var(--background-modifier-border);" +
+                "background:var(--background-primary);color:var(--text-normal);box-sizing:border-box;";
+            this._noteBox = noteBox;
+
+            noteBox.addEventListener("keydown", (ev) => {
+                if (ev.key !== "Enter") return;
+                if (ev.shiftKey) {
+                    // A newline in the box, and never a save: stop the modal's
+                    // own Enter handler from seeing it at all.
+                    ev.stopPropagation();
+                    return;
+                }
+                ev.preventDefault();
+                ev.stopPropagation();
+                this._submitAdd(input);
+            });
+
+            noteBox.addEventListener("paste", async (ev) => {
+                const imgs = this._imageFiles(ev.clipboardData);
+                if (!imgs.length) return;      // ordinary text paste
+                ev.preventDefault();
+                for (const f of imgs) await this._insertImage(f);
+            });
+            noteBox.addEventListener("dragover", (ev) => ev.preventDefault());
+            noteBox.addEventListener("drop", async (ev) => {
+                const imgs = this._imageFiles(ev.dataTransfer);
+                if (!imgs.length) return;
+                ev.preventDefault();
+                for (const f of imgs) await this._insertImage(f);
+            });
+        } else {
+            this._noteBox = null;
+        }
+
         const buildUrlWithDraftVersions = (urlRef) => {
             const versionPart = this._draftLocalVersions
                 .map(v => `version=${v}`)
@@ -963,6 +1571,10 @@ class StepBibleSearchModal extends Modal {
                 evt.stopPropagation();
 
                 if (this._isSubmitting) return;
+
+                // Filing a note is a different job from searching: the input
+                // holds a reference, the select holds the destination.
+                if (this.mode === "add") { await this._submitAdd(input); return; }
 
                 const inputRef = (input.value || "").trim();
 
@@ -1169,6 +1781,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     this.scheduleNoteDotsRefresh();
                     return;
                 }
+                // The versioned prefix first: a chip from an older build
+                // sends the unversioned one, and answering it with the same
+                // Add tab is still correct.
+                const addPrefix = msg.startsWith("__STEPBLADDNOTE2__") ? "__STEPBLADDNOTE2__"
+                    : (msg.startsWith("__STEPADDNOTE__") ? "__STEPADDNOTE__" : null);
+                if (addPrefix) {
+                    // The floating chip in the STEP page: open the Add note tab
+                    // with the verses the reader had selected.
+                    let req = null;
+                    try { req = JSON.parse(msg.slice(addPrefix.length)); } catch (e) { req = null; }
+                    const refs = (req && Array.isArray(req.refs)) ? req.refs : [];
+                    const prefill = refs.map(r => this.canonToDisplayRef(r)).join(", ");
+                    new StepBibleSearchModal(this.app, this, prefill, "add", refs).open();
+                    return;
+                }
                 if (msg.startsWith("__STEPBARCLICK__")) {
                     let click = null;
                     try { click = JSON.parse(msg.slice("__STEPBARCLICK__".length)); } catch (e) { click = null; }
@@ -1236,7 +1863,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         //============================================================================
         this.addCommand({
             id: "step-bible-search",
-            name: "Search Bible Reference…",
+            name: "Open STEP Reference…",
             callback: () => {
                 const { MarkdownView } = require("obsidian");
 
@@ -1254,6 +1881,20 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 }
 
                 new StepBibleSearchModal(this.app, this, prefill).open();
+            }
+        });
+
+        // The second half of the modal: file a note for a reference. It never
+        // reads the STEP page's selection — the chip in the STEP page does that.
+        this.addCommand({
+            id: "step-add-note",
+            name: "Add STEP Note…",
+            callback: () => {
+                const { MarkdownView } = require("obsidian");
+                let prefill = "";
+                const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+                if (activeView?.editor) prefill = activeView.editor.getSelection() || "";
+                new StepBibleSearchModal(this.app, this, prefill, "add").open();
             }
         });
 
@@ -1275,7 +1916,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             if (f && f.extension === "md") {
                 if (this._noteDotsTextCache && oldPath) delete this._noteDotsTextCache[oldPath];
                 this.scheduleNoteDotsRefresh();
+                return;
             }
+            // A folder: keep configured folders pointing at the new path.
+            if (f && f.children && oldPath) this.remapFolderSettings(oldPath, f.path);
         }));
 
     }
@@ -1655,6 +2299,89 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         return `${urlBase}${urlRef}${urlSuffix}`;
     }
+    // "John.3.16" -> "John 3:16", for inserting into a note.
+    canonToDisplayRef(canon) {
+        try { return this.urlRef_displayRef(canon); } catch (e) { return canon; }
+    }
+
+    // Markdown link for a reference, in the form the scan reads back. The
+    // wrapping parentheses match what the Link/Unlink command writes, so a
+    // note made here toggles off with the same command.
+    refMarkdown(canon) {
+        return `([${this.canonToDisplayRef(canon)}](${this.urlRef_url(canon)}))`;
+    }
+
+    // "Untitled.md", "Untitled 1.md", … the same naming Obsidian uses when a
+    // new note is created without a name.
+    uniqueUntitledPath(folderPath) {
+        const dir = (folderPath || "").replace(/\/+$/, "");
+        const exists = (name) => !!this.app.vault.getAbstractFileByPath(dir ? `${dir}/${name}` : name);
+        let name = "Untitled.md";
+        if (!exists(name)) return dir ? `${dir}/${name}` : name;
+        for (let i = 1; i < 10000; i++) {
+            name = `Untitled ${i}.md`;
+            if (!exists(name)) return dir ? `${dir}/${name}` : name;
+        }
+        return dir ? `${dir}/Untitled ${Date.now()}.md` : `Untitled ${Date.now()}.md`;
+    }
+
+    // Add a note for the given canonical references into one of the configured
+    // folders, or into a list note.
+    //
+    // dest.kind === "folder": a new note is created from that folder's
+    // template. Nothing is written except the reference, and only when the
+    // folder treats first-line references as its main passage.
+    // dest.kind === "list": the reference becomes a new section, inserted
+    // between the existing ones in reference order.
+    async addNote(refs, dest, body) {
+        const list = (refs || []).filter(Boolean);
+        if (!list.length) {
+            new Notice("No reference selected.");
+            return null;
+        }
+        const primary = list[0];
+        const firstLine = list.map(r => this.refMarkdown(r)).join(" ");
+        const canon = (() => {
+            const parts = primary.split("-").map(s => s.trim());
+            const b = canonBounds(parts.length > 1 ? parts[0] + "-" + parts[1] : parts[0]);
+            return b ? { start: b.start, span: b.end - b.start } : null;
+        })();
+
+        // Whatever the user typed in the editor, placed after the reference
+        // rather than pushed into the template's own structure.
+        const typed = String(body || "").replace(/\s+$/, "");
+        const withBody = (head) => (typed ? head + "\n\n" + typed : head);
+
+        if (dest && dest.kind === "list") {
+            const folder = this.normaliseFolderPath(this.settings.noteTypesFolder);
+            if (dest.file) {
+                const f = this.app.vault.getAbstractFileByPath(dest.file);
+                if (!f) { new Notice("That list note no longer exists."); return null; }
+                const text = await this.app.vault.read(f);
+                await this.app.vault.modify(f, insertListSection(text, withBody(firstLine), canon));
+                return f.path;
+            }
+            // A new list note: the reference is its first section.
+            if (!folder) { new Notice("Pick a Bible notes folder first."); return null; }
+            const path = this.uniqueUntitledPath(folder);
+            const created = await this.app.vault.create(path, withBody(firstLine) + "\n");
+            return created.path;
+        }
+
+        const folderPath = (dest && dest.path) || "";
+        const fs = this.folderSettingsForDir(folderPath);
+        let content = "";
+        if (fs.template) {
+            const tf = this.app.vault.getAbstractFileByPath(fs.template);
+            if (tf) { try { content = await this.app.vault.read(tf); } catch (e) { content = ""; } }
+        }
+        if (fs.mainPassage) content = applyReferenceToFirstLine(content, firstLine);
+        if (typed) content = content.replace(/\s+$/, "") + (content.trim() ? "\n\n" : "") + typed + "\n";
+        const path = this.uniqueUntitledPath(folderPath);
+        const created = await this.app.vault.create(path, content);
+        return created.path;
+    }
+
     urlRef_displayRef(urlRef) {
         const canonicalToDisplay = (canonical) => {
             return canonical.replace(/^([1-3])([A-Za-z].*)$/, "$1 $2");
@@ -2007,7 +2734,6 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const map = {}; // canonicalVerse -> Set of note basenames
                 const bookRefs = {}; // bookName -> Set of note basenames (whole-book references)
                 const files = this.app.vault.getMarkdownFiles();
-                const typedPrefix = (this.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
                 const linkRegex = /\[([^\]]+)\]\(([^)]*reference=([^)&]+)[^)]*)/g;
                 // Plain markdown links as well as the "([...])"-wrapped form STEP
                 // writes: notes outside the notes folder are hand-written, so they
@@ -2017,10 +2743,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // mention of the reference that drew the bar.
                 const typedData = { colourOf: {}, contentOf: {}, outlineOf: {} };
                 const plainColour = (this.settings && this.settings.noteLinesColour) || "#17758f";
+                // A bar's colour comes from the folder the note lives in. With
+                // no folder settings this resolves to the plain note colour,
+                // so an unconfigured vault looks exactly as it did before.
 
                 for (const file of files) {
-                    // Files in the note-types folder are typed bars, not ordinary green bars.
-                    if (typedPrefix && file.path.startsWith(typedPrefix + "/")) continue;
+                    // Files directly in the note-types folder are list notes,
+                    // not ordinary notes. Subfolders are ordinary notes.
+                    if (isListNotePath(file.path, this.settings.noteTypesFolder)) continue;
                     const text = await this.readNoteText(file);
                     if (!text.includes("reference=")) continue;
 
@@ -2034,6 +2764,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         // Path, not basename: two notes can share a name in
                         // different folders and must not share bars.
                         const id = "N:" + file.path + ":" + (refN++);
+                        const fileSettings = this.folderSettingsFor(file.path);
+                        const barColour = fileSettings.colour || plainColour;
                         const decoded = decodeURIComponent(refRaw.trim());
                         // Ranges are written either in full on both sides
                         // (Numbers.22-Numbers.24) or abbreviated (Numbers.22-24).
@@ -2069,12 +2801,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // puts around its links: "Genesis 3", not "(Genesis 3)".
                             refText: linkText.trim().replace(/^[\[(]+/, "").replace(/[\])]+$/, "").trim(),
                             refRaw: left + (right ? "-" + right : ""),
+                            // The range this bar is actually drawn over. The
+                            // popover titles from it, so a stale link label can
+                            // never title a bar with a reference it isn't on.
+                            ownCanon: refKey,
                             text: text,
                             path: file.path,
-                            colour: plainColour,
+                            colour: barColour,
+                            // A plain note's bar opens the whole file, scrolled
+                            // to this reference. A list note's bar opens only
+                            // its own section, so this flag stays off there.
                             wholeNote: true,
+                            mainPassage: !!fileSettings.mainPassage,
                             searchRef: left + (right ? "-" + right : ""),
                         };
+                        // The bar is drawn in the folder's colour.
+                        typedData.colourOf[id] = barColour;
 
                         const maxV = (c) => BibleInformation.getMaxVerse(bookL, parseInt(c, 10)) || 0;
                         const fill = (c, firstV, lastV) => {
@@ -2116,11 +2858,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 // (refs inside content) become bars in the crosslink colour
                 // pointing at the section they live in.
                 // (typedData is declared above: ordinary notes fill it too.)
-                const entryIdOf = {}; // raw section ref -> its typed entry id
+                // Section index -> its typed entry id. Positional, because two
+                // sections in one list note may share a reference and must stay
+                // separate bars.
+                const entryIdOf = {};
                 const folderPath = (this.settings.noteTypesFolder || "").trim();
                 if (folderPath) {
-                    const prefix = folderPath.replace(/\/+$/, "") + "/";
-                    const typeFiles = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(prefix));
+                    const prefix = folderPath.replace(/\/+$/, "");
+                    // Direct children only: a subfolder of the list folder holds
+                    // ordinary notes, handled by the plain-note scan above.
+                    const typeFiles = this.app.vault.getMarkdownFiles()
+                        .filter(f => isListNotePath(f.path, prefix));
                     const palette = ["#c05761", "#8a6db1", "#3f7fae", "#b8860b", "#7a9a3f", "#a352cc", "#c87f3f"];
                     this.settings.typedColours = this.settings.typedColours || {};
                     let coloursDirty = false;
@@ -2187,13 +2935,38 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         };
                         parsed.entries.forEach((e, i) => {
                             const id = "T:" + base + ":" + i;
-                            const rp = refPart(e.refRaw);
-                            if (rp) addTypedRef(rp, id);
-                            entryIdOf[e.refRaw] = id;
-                            typedData.colourOf[id] = colour;
-                            // A note's own bar never marks or scrolls the note's
-                            // markdown: highlighting belongs to crosslinks only.
-                            typedData.contentOf[id] = { label: base, refText: e.refText, refRaw: e.refRaw, text: e.content, colour: colour, noMentions: true, ownCanon: canonRange(e.refRaw) };
+                            // Every main reference on the section's first line
+                            // draws its own bar and gets its own record, so each
+                            // bar is titled with ITS reference. Sharing one
+                            // record titled every bar with the section's first
+                            // reference — a section starting from 22:1 and 22:4
+                            // showed "Numbers 22:1" on both bars.
+                            const mainRefs = (e.refs && e.refs.length ? e.refs : [{ refRaw: e.refRaw, refText: e.refText }]);
+                            mainRefs.forEach((r, ri) => {
+                                // Single-reference sections keep the plain id;
+                                // extra references get a suffix.
+                                const refId = ri === 0 ? id : id + ":" + ri;
+                                const rpMain = refPart(r.refRaw);
+                                if (rpMain) addTypedRef(rpMain, refId);
+                                typedData.colourOf[refId] = colour;
+                                // A note's own bar never marks or scrolls the
+                                // note's markdown: highlighting belongs to
+                                // crosslinks only.
+                                typedData.contentOf[refId] = {
+                                    label: base,
+                                    refText: (r.refText || e.refText || ""),
+                                    refRaw: r.refRaw,
+                                    text: e.content,
+                                    colour: colour,
+                                    noMentions: true,
+                                    ownCanon: canonRange(r.refRaw),
+                                    // Every bar of this section shows the same
+                                    // section text, so stepping must not treat
+                                    // them as three separate notes.
+                                    sectionId: id,
+                                };
+                            });
+                            entryIdOf[e.index] = id;
                         });
                         // A reference repeated inside the same note (the text
                         // between one section's --- markers) draws a single bar,
@@ -2203,7 +2976,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         parsed.crosslinks.forEach((c, i) => {
                             const id = "X:" + base + ":" + i;
                             const rp = refPart(c.refRaw);
-                            const parentId = entryIdOf[c.target.refRaw] || null;
+                            const parentId = entryIdOf[c.target.index] || null;
                             const canon = canonRange(c.refRaw) || rp || "?" + i;
                             const dedupeKey = (parentId || "-") + "\u0000" + canon;
                             if (seenCross.has(dedupeKey)) return;
@@ -2355,6 +3128,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             delete loadedData.enabledVersions;
         }
         this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
+        // The folder map must always exist and hold objects, whatever an older
+        // or hand-edited data.json says.
+        if (!this.settings.folderSettings || typeof this.settings.folderSettings !== "object") {
+            this.settings.folderSettings = {};
+        }
         // Old settings files may still carry useLocalStepServer; it is ignored.
         delete this.settings.useLocalStepServer;
         // openReferenceInNewTab meant "fresh tab", which is what
@@ -2513,6 +3291,141 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     async saveSettings() {
         await this.saveData(this.settings);
         this.urlPrefix = LOCAL_STEP_BASE;
+    }
+
+    // FOLDER SETTINGS ==========================================================
+    // A vault path with no leading or trailing slash. "" is the vault root,
+    // which is never a usable entry.
+    normaliseFolderPath(p) {
+        return String(p || "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
+    }
+
+    // Add an existing vault folder to the list. Returns "" on success, or the
+    // reason it was refused (shown to the user as a Notice).
+    addFolderSetting(path) {
+        const p = this.normaliseFolderPath(path);
+        if (!p) return "Pick a folder first.";
+        const notes = this.normaliseFolderPath(this.settings.noteTypesFolder);
+        if (notes && p === notes) {
+            return "That is the Bible notes folder. Notes directly inside it are lists and keep their own settings.";
+        }
+        if (this.settings.folderSettings[p]) return `"${p}" is already in the list.`;
+        const f = this.app.vault.getAbstractFileByPath(p);
+        if (!f || !f.children) return `No vault folder "${p}".`;
+        this.settings.folderSettings[p] = {
+            mainPassage: false,
+            colour: this.settings.noteLinesColour || "#17758f",
+            template: "",
+        };
+        return "";
+    }
+
+    removeFolderSetting(path) {
+        const p = this.normaliseFolderPath(path);
+        if (this.settings.folderSettings) delete this.settings.folderSettings[p];
+    }
+
+    // The deepest configured ancestor folder of a note path, or null.
+    // Deepest wins: a note in "A/B/C" takes A/B/C's settings over A/B's.
+    // The bar colour a destination would give a new note, so the Add tab can
+    // show it beside the folder's name before anything is written.
+    destColour(dest) {
+        const plainColour = this.settings.noteLinesColour || "#17758f";
+        if (!dest) return plainColour;
+        if (dest.kind === "list") {
+            // A list keeps its own colour; a note that does not exist yet has
+            // no name to look one up by, so it starts plain.
+            if (!dest.file) return plainColour;
+            return this.folderSettingsFor(dest.file).colour || plainColour;
+        }
+        return this.folderSettingsForDir(dest.path).colour || plainColour;
+    }
+
+    // Settings for a folder used as a destination, rather than for a file that
+    // already lives somewhere. Resolves the folder itself, not its parent.
+    folderSettingsForDir(dirPath) {
+        const dir = String(dirPath || "").replace(/^\/+|\/+$/g, "");
+        const plainColour = this.settings.noteLinesColour || "#17758f";
+        if (!dir) return { mainPassage: false, colour: plainColour, template: "" };
+        // Pretend a file sits directly inside it: the closest-parent walk then
+        // starts at this folder instead of at its parent.
+        const hit = this.closestFolderSetting(dir + "/_");
+        return {
+            folder: hit ? hit.folder : "",
+            mainPassage: hit ? hit.mainPassage === true : false,
+            colour: (hit && hit.colour) || plainColour,
+            template: (hit && hit.template) || "",
+        };
+    }
+
+    closestFolderSetting(filePath) {
+        const all = this.settings.folderSettings || {};
+        const dir = dirOfPath(String(filePath || "").replace(/^\/+/, ""));
+        if (!dir) return null;
+        const parts = dir.split("/").filter(Boolean);
+        for (let i = parts.length; i > 0; i--) {
+            const cand = parts.slice(0, i).join("/");
+            if (all[cand]) return Object.assign({ folder: cand }, all[cand]);
+        }
+        return null;
+    }
+
+    // What applies to the note at `filePath`.
+    //
+    // Lists — markdown files directly inside the Bible notes folder — inherit
+    // nothing: they keep their own per-list colour, their first line is always
+    // the passage, and they are the only notes where blank lines split
+    // sections. Everything else takes its closest configured ancestor folder,
+    // falling back to the plain note colour.
+    folderSettingsFor(filePath) {
+        const path = String(filePath || "");
+        const plainColour = this.settings.noteLinesColour || "#17758f";
+        if (isListNotePath(path, this.settings.noteTypesFolder)) {
+            const base = path.split("/").pop().replace(/\.md$/i, "");
+            return {
+                isList: true,
+                folder: this.normaliseFolderPath(this.settings.noteTypesFolder),
+                mainPassage: true,
+                colour: (this.settings.typedColours || {})[base] || plainColour,
+                template: "",
+            };
+        }
+        const hit = this.closestFolderSetting(path);
+        return {
+            isList: false,
+            folder: hit ? hit.folder : "",
+            mainPassage: hit ? hit.mainPassage === true : false,
+            colour: (hit && hit.colour) || plainColour,
+            template: (hit && hit.template) || "",
+        };
+    }
+
+    // A renamed folder moves every configured folder underneath it, and the
+    // Bible notes folder itself, so settings follow the folder instead of being
+    // silently orphaned.
+    remapFolderSettings(oldPath, newPath) {
+        const from = this.normaliseFolderPath(oldPath);
+        const to = this.normaliseFolderPath(newPath);
+        if (!from || !to || from === to) return;
+        let changed = false;
+        const notes = this.normaliseFolderPath(this.settings.noteTypesFolder);
+        if (notes && (notes === from || notes.startsWith(from + "/"))) {
+            this.settings.noteTypesFolder = to + notes.slice(from.length);
+            changed = true;
+        }
+        const map = this.settings.folderSettings || {};
+        for (const key of Object.keys(map)) {
+            if (key !== from && !key.startsWith(from + "/")) continue;
+            const next = to + key.slice(from.length);
+            if (next === key) continue;
+            map[next] = map[key];
+            delete map[key];
+            changed = true;
+        }
+        if (changed) {
+            this.saveSettings();
+            this.refreshNoteDots();
+        }
     }
 
     // PLUGIN UNLOAD
@@ -3360,6 +4273,7 @@ class StepInterfaceDOM {
                 if (window.__stepDotObserve) window.__stepDotObserve();
             }
             this.installPageWatch();
+            this.mountAddChip();
             window.__stepLastInjectError = null;
             return res;
         } catch (e) {
@@ -3389,6 +4303,78 @@ class StepInterfaceDOM {
         window.__stepVisibleRefs = (refs) => window.__stepDOM.visibleRefs(refs);
         // window.__stepNotifyPage is installed by installPageWatch(), which
         // owns the page key it compares against.
+    }
+
+    // A small floating button in the STEP page. With verses selected, it opens
+    // the plugin's Add note tab with those verses filled in. STEP's own toolbar
+    // is collapsed by the plugin, so this sits on its own in the top right.
+    mountAddChip() {
+        const CHIP_VERSION = "2";
+        let chip = document.getElementById("step-linker-addnote");
+        // A chip left behind by an older build speaks an older message that an
+        // older listener answers by opening an older dialog. The stamp makes
+        // this build replace it rather than reuse it, so there is only ever
+        // one chip and it always speaks the message the host now understands.
+        if (chip && chip.dataset && chip.dataset.stepChip !== CHIP_VERSION) {
+            chip.remove();
+            chip = null;
+        }
+        if (!chip) {
+            chip = document.createElement("div");
+            chip.id = "step-linker-addnote";
+            chip.dataset.stepChip = CHIP_VERSION;
+            chip.textContent = "+ Add note";
+            chip.title = "Add a step note for the verses you have selected";
+            chip.style.cssText = "position:fixed;top:8px;right:12px;z-index:2147483646;"
+                + "background:rgba(20,20,20,0.82);color:#fff;font:12px/1.4 sans-serif;"
+                + "padding:5px 10px;border-radius:4px;cursor:pointer;user-select:none;"
+                + "border:1px solid rgba(255,255,255,0.25);";
+            // Selection is captured on press: the click itself can clear it.
+            chip.addEventListener("pointerdown", (e) => {
+                e.stopPropagation();
+                const r = this.selectedRefs();
+                if (r.length) window.__stepAddNoteRefs = r;
+            });
+            chip.addEventListener("click", (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                const refs = (window.__stepAddNoteRefs && window.__stepAddNoteRefs.length)
+                    ? window.__stepAddNoteRefs
+                    : this.selectedRefs();
+                window.__stepAddNoteRefs = null;
+                console.log("__STEPBLADDNOTE2__" + JSON.stringify({ refs: refs || [] }));
+            });
+            document.body.appendChild(chip);
+        }
+        // Keep the last selection that had verses in it, so a press that has
+        // already cleared the selection still has something to work with.
+        if (!window.__stepSelHook) {
+            window.__stepSelHook = true;
+            document.addEventListener("selectionchange", () => {
+                const r = window.__stepDOM ? window.__stepDOM.selectedRefs() : [];
+                if (r && r.length) window.__stepAddNoteRefs = r;
+            });
+        }
+    }
+
+    // Canonical references of the verses the selection covers, in reading
+    // order, panel by panel. A partly selected verse counts as selected.
+    selectedRefs() {
+        const refs = [];
+        try {
+            const sel = window.getSelection();
+            if (!sel || !sel.rangeCount || sel.isCollapsed) return refs;
+            const seen = new Set();
+            (window.__stepVerses || []).forEach(v => {
+                if (!v.el || !v.canon || seen.has(v.canon)) return;
+                let hit = false;
+                for (let i = 0; i < sel.rangeCount && !hit; i++) {
+                    try { hit = sel.getRangeAt(i).intersectsNode(v.el); } catch (e) { hit = false; }
+                }
+                if (hit) { seen.add(v.canon); refs.push(v.canon); }
+            });
+        } catch (e) {}
+        return refs;
     }
 
     // One layout pass. Idempotent: bars are duplicate-guarded per note and
@@ -3707,6 +4693,51 @@ class StepInterfaceDOM {
         noteList.length = 0;
         drawnList.forEach(it => noteList.push(it));
 
+        // Bars covering exactly the same verses collapse to one bar when they
+        // come from the same source: a list note can hold several sections on
+        // one passage, and they are one note to the reader, stepped through by
+        // clicking. Bars from different notes stay side by side — the slot
+        // assignment below already puts identical ranges in separate lanes.
+        const sourceOf = (id) => {
+            const a = id.indexOf(":");
+            const b = a < 0 ? -1 : id.indexOf(":", a + 1);
+            return b < 0 ? id : id.slice(0, b);
+        };
+        const stackOf = {};
+        const stackedAway = new Set();
+        const byRange = {};
+        noteList.forEach(it => {
+            const k = it.e.min + ".." + it.e.max;
+            (byRange[k] = byRange[k] || []).push(it.nb);
+        });
+        Object.keys(byRange).forEach(k => {
+            const ids = byRange[k];
+            if (ids.length < 2) return;
+            const sources = new Set(ids.map(sourceOf));
+            if (sources.size !== 1) return;   // different notes: side by side
+            stackOf[ids[0]] = ids.slice();
+            ids.slice(1).forEach(id => stackedAway.add(id));
+        });
+        // At most four bars for one passage. Bars from different notes sit
+        // side by side up to that count; a fifth note on exactly the same
+        // verses would push the gutter across the text, so it folds into the
+        // fourth bar instead, which steps through the rest on click (the same
+        // mechanism a list note's own sections use).
+        const MAX_LANE_BARS = 4;
+        Object.keys(byRange).forEach(k => {
+            const ids = byRange[k].filter(id => !stackedAway.has(id));
+            if (ids.length <= MAX_LANE_BARS) return;
+            const head = ids[MAX_LANE_BARS - 1];
+            const extra = ids.slice(MAX_LANE_BARS);
+            stackOf[head] = (stackOf[head] || [head]).concat(extra);
+            extra.forEach(id => stackedAway.add(id));
+        });
+        if (stackedAway.size) {
+            for (let i = noteList.length - 1; i >= 0; i--) {
+                if (stackedAway.has(noteList[i].nb)) noteList.splice(i, 1);
+            }
+        }
+
         const slotEnds = [];   // slot -> max verse index used
         const slotOf = {};
         noteList.forEach(item => {
@@ -3715,6 +4746,33 @@ class StepInterfaceDOM {
             slotOf[item.nb] = s;
             slotEnds[s] = item.e.max;
         });
+
+        // Belt and braces: two bars in one lane must never share a verse. The
+        // greedy pass above already guarantees it, but this runs on every
+        // layout (resize, reflow, font load) and is cheap, so it is asserted
+        // rather than assumed: an overlapping pair is pushed to a new lane and
+        // the gutter widens to fit.
+        (function enforceNoOverlap() {
+            const perSlot = {};
+            noteList.forEach(it => { (perSlot[slotOf[it.nb]] = perSlot[slotOf[it.nb]] || []).push(it); });
+            let extra = 0;
+            Object.keys(perSlot).forEach(k => {
+                const items = perSlot[k].slice().sort((a, b) => a.e.min - b.e.min);
+                let worst = -Infinity;
+                items.forEach(it => {
+                    if (it.e.min <= worst) {
+                        // Overlaps something already in this lane: move it out.
+                        let s = slotEnds.length;
+                        slotOf[it.nb] = s;
+                        slotEnds[s] = it.e.max;
+                        extra++;
+                    } else {
+                        worst = it.e.max;
+                    }
+                });
+            });
+            if (extra) slotEnds.__widened = true;
+        })();
 
         const dbg = [];
         let maxSlot = 0;
@@ -3731,9 +4789,29 @@ class StepInterfaceDOM {
                 const firstV = verses[item.e.min].verse;
                 const lastV = verses[item.e.max].verse;
 
-                // Idempotency: one bar per note per page
+                // Idempotency, but only for a bar that still means the
+                // same thing: one bar per note per page, at the right range.
+                // A typed section's id is positional ("T:base:2"), so adding
+                // a section above it re-points every later id — the section
+                // that was "T:base:2" becomes "T:base:3". The page keeps its
+                // old bars across a re-injection, so a bar left where the
+                // previous owner of its id sat would open that id's NEW note:
+                // a bar on Numbers 25 titled "Numbers 22:3". The signature is
+                // the id plus the range it is drawn over, so a bar whose
+                // meaning moved is rebuilt in place and one that did not is
+                // left untouched (no flicker, no duplicated listeners).
+                const refStr = verses[item.e.min].canon + ".." + verses[item.e.max].canon;
+                const sig = item.nb + "|" + refStr + "|" + slot
+                    + "|" + JSON.stringify(stackOf[item.nb] || null);
                 const existing = cont.querySelector('.step-note-bar[data-note="' + item.nb.replace(/"/g, "") + '"]');
-                if (existing) return;
+                if (existing) {
+                    if (existing.dataset.sig === sig) return;
+                    // It moved or changed meaning: drop it and draw it again
+                    // below, in the place and with the content it has now.
+                    if (existing.__tip) { existing.__tip.remove(); existing.__tip = null; }
+                    if (existing.__parentLit) { existing.__parentLit.removeAttribute("data-parent-lit"); existing.__parentLit = null; }
+                    existing.remove();
+                }
 
                 // Slots sit to the right of the overflow lane,
                 // which is always 12px wide.
@@ -3745,10 +4823,19 @@ class StepInterfaceDOM {
                 const bar = document.createElement("div");
                 bar.className = "step-note-bar";
                 bar.dataset.note = item.nb;
+                // What this bar means, so a later injection can tell whether
+                // it still belongs where it was drawn.
+                bar.dataset.sig = sig;
                 // Metadata for the plugin-side hover popover: the
                 // verse range and whether this is a typed/crosslink bar.
-                bar.dataset.ref = verses[item.e.min].canon + ".." + verses[item.e.max].canon;
+                bar.dataset.ref = refStr;
                 if (tinfo) bar.dataset.typed = "1";
+                if (stackOf[item.nb] && stackOf[item.nb].length > 1) {
+                    // Several sections of one note on one passage: one bar,
+                    // clicking steps through them.
+                    bar.dataset.stack = JSON.stringify(stackOf[item.nb]);
+                    bar.dataset.stackCount = String(stackOf[item.nb].length);
+                }
                 if (tinfo && window.__stepTypedData.colourOf[item.nb]) {
                     const typeCol = window.__stepTypedData.colourOf[item.nb];
                     bar.style.background = typeCol;
@@ -4268,6 +5355,9 @@ class StepInterfaceDOM {
             id: b.dataset.note || "",
             ref: b.dataset.ref || "",
             typed: b.dataset.typed === "1",
+            // Several sections of one note sharing these verses: the host
+            // steps through them on click instead of opening a second bar.
+            stack: b.dataset.stack ? JSON.parse(b.dataset.stack) : null,
             page: b.__page || "",
             // The bar element itself: the hover hooks arm it for
             // widening, so a widen can only ever accompany a reported hit.
@@ -4822,7 +5912,38 @@ class StepInterfaceObsidian {
         // Called from the webview's ipc-message listener. A null hit means the
         // pointer is over no bar: close any open popover. A typed hit opens a
         // popover after a short hover delay (later messages cancel the timer).
+        // A bar can stand for several sections of one note on the same
+        // verses. Hover and click both resolve through the same remembered
+        // position, so the popover doesn't flicker back to the first section
+        // as soon as the pointer moves.
+        this._resolveStack = (hit) => {
+            if (!hit || !Array.isArray(hit.stack) || hit.stack.length < 2) return hit;
+            const key = hit.stack.join("|");
+            this._stackIdx = this._stackIdx || {};
+            const i = this._stackIdx[key] || 0;
+            return Object.assign({}, hit, {
+                id: hit.stack[i] || hit.id,
+                stackPos: i,
+                stackCount: hit.stack.length,
+                stackKey: key
+            });
+        };
+
+        // Advance to the next section sharing this bar's verses.
+        this._cycleStack = (hit) => {
+            if (!hit || !hit.stackKey || !hit.stack) return hit;
+            this._stackIdx = this._stackIdx || {};
+            const i = ((this._stackIdx[hit.stackKey] || 0) + 1) % hit.stack.length;
+            this._stackIdx[hit.stackKey] = i;
+            return Object.assign({}, hit, {
+                id: hit.stack[i],
+                stackPos: i,
+                stackCount: hit.stack.length
+            });
+        };
+
         this.handleBarHoverMessage = (webviewEl, hit) => {
+            hit = this._resolveStack(hit);
             this._barWebview = webviewEl;
             // Any report at all came from inside the webview, so the pointer is
             // over the page and not over one of our popovers.
@@ -4909,6 +6030,33 @@ class StepInterfaceObsidian {
 
         // Click on a bar: pin the popover (stays put, movable, resizable)
         this.handleBarClickMessage = (webviewEl, hit) => {
+            // A bar standing for several sections of one note steps to the
+            // next section when clicked, rather than opening the same one.
+            const stacked = this._resolveStack(hit);
+            if (stacked && stacked.stackKey) {
+                const before = stacked.id;
+                // First click opens the section shown; further clicks on the
+                // same bar step to the next one.
+                const alreadyOpen = this._pinnedPop && this._pinnedPop.stackKey === stacked.stackKey;
+                if (alreadyOpen) {
+                    // Step through every section sharing these verses, then a
+                    // final click closes the note like a second click on any
+                    // ordinary bar would.
+                    const i = this._stackIdx[stacked.stackKey] || 0;
+                    if (i + 1 >= stacked.stack.length) {
+                        this._stackIdx[stacked.stackKey] = 0;
+                        closePinned();
+                        closeHover();
+                        return;
+                    }
+                }
+                hit = alreadyOpen ? this._cycleStack(stacked) : stacked;
+                hit = Object.assign({}, hit, { stackKey: stacked.stackKey });
+                if (hit && hit.id !== before) {
+                    closeHover();
+                    if (this._pinnedPop && this._pinnedPop.id === before) closePinned();
+                }
+            }
             clearTimeout(this._barOpenTimer);
             // The hit is deliberately NOT cleared here. The pointer is still on
             // the bar at the moment of the click, so the text stays lit while
@@ -4995,7 +6143,7 @@ class StepInterfaceObsidian {
             body.style.maxHeight = "45vh";
             body.style.overflow = "hidden";
 
-            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "" };
+            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, page: hit.page || "", stackKey: hit.stackKey || null };
             if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
             else this._hoverPop = entry;
             this._barWebview = webviewEl;
@@ -5440,6 +6588,37 @@ class StepInterfaceObsidian {
             });
         };
 
+        // The record a bar should show. A typed id is positional
+        // ("T:note:3"), so inserting a section above it re-points every later
+        // id: the section that was 3 becomes 4. The bar, though, carries the
+        // passage it is drawn over, and a bar drawn on Numbers 22:22 must open
+        // the section that starts at 22:22 — not whatever now holds that
+        // index (a bar on 22:22 opening the note on Numbers 25). So the id is
+        // only trusted when its record covers the bar's own passage; otherwise
+        // the section of the same note that does own it is used.
+        this._infoForHit = (hit, td) => {
+            const contentOf = (td && td.contentOf) || {};
+            const direct = contentOf[hit && hit.id] || null;
+            const want = canonBoundsOfBarRef(hit && hit.ref);
+            if (!want) return direct;
+            const matches = (info) => {
+                if (!info || !info.ownCanon) return false;
+                const b = canonBounds(info.ownCanon);
+                return !!b && b.start === want.start && b.end === want.end;
+            };
+            if (matches(direct)) return direct;
+            const id = String((hit && hit.id) || "");
+            if (id.indexOf("X:") === 0) return direct;  // crosslink: no own ref
+            const cut = id.lastIndexOf(":");
+            if (cut < 0) return direct;
+            const prefix = id.slice(0, cut + 1);
+            for (const other of Object.keys(contentOf)) {
+                if (other.indexOf(prefix) !== 0) continue;
+                if (matches(contentOf[other])) return contentOf[other];
+            }
+            return direct;
+        };
+
         // Create the popover for one bar hit. Pinned popovers get a header
         // toolbar (open-in-Obsidian button), are draggable by the header and
         // resizable from the corner.
@@ -5458,7 +6637,7 @@ class StepInterfaceObsidian {
 
             // Content from the cached typed scan (same ids the page uses)
             const td = this.plugin._noteDotsCache && this.plugin._noteDotsCache.typedData;
-            const info = td && td.contentOf && td.contentOf[hit.id];
+            const info = this._infoForHit(hit, td);
             if (!info) { this._syncBarHold(); return; }
             const base = hit.id.split(":")[1];
             const folder = (this.plugin.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
@@ -5616,15 +6795,26 @@ class StepInterfaceObsidian {
             header.style.flex = "0 0 auto";
             header.style.padding = "8px 44px 6px 12px";
             const titleEl = header.createDiv({ cls: "step-bar-popover-title" });
-            // The title is always the note's own reference — the same title for
-            // every bar that file or section draws.
-            const titleText = info.refText || "";
+            // The title is the reference THIS bar is placed by, rendered from
+            // that reference rather than from the link's own text. A note whose
+            // link text says "Numbers 22:1" while pointing at Numbers 22.4 is
+            // bar'd on 22:4 and must be titled 22:4. A section whose first
+            // line names several references draws a bar each, each titled with
+            // its own — never the section's first one.
+            const showRef = (r) => {
+                if (!r) return "";
+                try { return this.plugin.urlRef_displayRef(String(r)) || ""; } catch (e) { return ""; }
+            };
+            const titleText = showRef(info.ownCanon) || showRef(info.refRaw) || info.refText || "";
             titleEl.setText(titleText);
             titleEl.style.fontWeight = "700";
             titleEl.style.fontSize = "15px";
             titleEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
             const refEl = header.createDiv({ cls: "step-bar-popover-ref" });
-            refEl.setText(info.label || "");
+            // A bar standing for several notes (or several sections of one
+            // list) says so: "1 of 3". Clicking the bar steps through them.
+            refEl.setText((info.label || "")
+                + (hit.stackCount > 1 ? "   \u00b7   " + ((hit.stackPos || 0) + 1) + " of " + hit.stackCount : ""));
             refEl.style.fontSize = "12px";
             refEl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
             const btns = header.createDiv({ cls: "step-bar-popover-buttons" });

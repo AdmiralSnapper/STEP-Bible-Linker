@@ -16,6 +16,7 @@
     "Sermons": "#ac4906"
   },
   "noteTypesFolder": "Second Brain/Bible",
+  "folderSettings": {},
   "popoutVisiblePassages": true,
   "alwaysOpenNewStepTab": false,
   "autoSyncOnNavigation": false,
@@ -32,5 +33,5 @@
     "ESV"
   ],
   "lastSyncedServerMode": true,
-  "searchModalSettingsOpen": true
+  "searchModalSettingsOpen": false
 }

@@ -73,6 +73,14 @@ function isListNotePath(path, notesFolder) {
     return dirOfPath(String(path || "").replace(/^\/+/, "")) === f;
 }
 
+// A throwaway file written by the note editor's popout. Transient by design:
+// it is never a list, never a destination, and never scanned for bars.
+const DRAFT_FILE_RE = /^Note draft \d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}( \d+)?\.md$/;
+function isDraftFilePath(path) {
+    const p = String(path || "");
+    return DRAFT_FILE_RE.test(p.slice(p.lastIndexOf("/") + 1));
+}
+
 const SECTION_SEPARATOR_BLANKS = 3;
 
 // Suggests markdown files by path, for picking a folder's template note.
@@ -1357,7 +1365,7 @@ class StepBibleSearchModal extends Modal {
             const listFolder = this.plugin.normaliseFolderPath(this.plugin.settings.noteTypesFolder);
             if (listFolder) {
                 this.app.vault.getMarkdownFiles()
-                    .filter(f => isListNotePath(f.path, listFolder))
+                    .filter(f => isListNotePath(f.path, listFolder) && !isDraftFilePath(f.path))
                     .sort((a, b) => a.path.localeCompare(b.path))
                     .forEach(f => opts.push({ kind: "list", file: f.path, label: `List: ${f.basename}` }));
                 opts.push({ kind: "list", file: null, label: "List: new note" });
@@ -2416,8 +2424,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // cleared at load. The name is specific enough that nothing else matches.
     sweepDraftFiles() {
         try {
-            const stale = this.app.vault.getFiles()
-                .filter(f => /^Note draft \d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}( \d+)?\.md$/.test(f.name));
+            const stale = this.app.vault.getFiles().filter(f => isDraftFilePath(f.path));
             for (const f of stale) this.app.vault.delete(f, true).catch(() => {});
         } catch (e) { /* housekeeping only */ }
     }
@@ -2519,10 +2526,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         content.style.minHeight = "0";
 
         // ---- the passage -------------------------------------------------
+        // The colour of this note's own bar: the same value the scan puts on
+        // the bar (folderSettingsFor(path).colour, else the plain note
+        // colour) and the same one the Add note tab paints its destination
+        // dot with. Bars are drawn solid, so this is solid too.
+        const barColour = this.folderSettingsFor(path).colour ||
+            (this.settings && this.settings.noteLinesColour) || "#17758f";
+
         const head = doc.createElement("div");
-        head.style.cssText = "flex:0 0 auto;padding:10px 14px 9px;box-sizing:border-box;" +
-            "border-bottom:1px solid var(--background-modifier-border);" +
-            "background:var(--background-secondary);max-height:34vh;overflow:auto;";
+        // The passage keeps the note's own surface, outlined in the bar
+        // colour so it reads as part of the note. Text colour is picked for
+        // contrast once the surface is resolved, below.
+        head.style.cssText = "flex:0 0 auto;padding:9px 12px;box-sizing:border-box;" +
+            "border:1px solid " + barColour + ";border-radius:4px;" +
+            "margin:8px 10px 0;" +
+            "background:var(--background-primary);" +
+            "color:var(--text-normal);max-height:34vh;overflow:auto;";
         const heading = doc.createElement("div");
         heading.style.cssText = "font-weight:600;margin-bottom:5px;font-size:13.5px;";
         heading.textContent = (canons || []).map(c => this.canonToDisplayRef(c)).join(", ");
@@ -2533,11 +2552,39 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         head.appendChild(verseBox);
         root.insertBefore(head, content);
 
+        // Pure black or pure white, whichever the surface can carry better.
+        // The theme's own text colour is usually right, but a themed surface
+        // with low-contrast body text is exactly what this is fixing.
+        const setContrast = () => {
+            try {
+                const bg = getComputedStyle(head).backgroundColor || "";
+                const m = bg.match(/rgba?\(([^)]+)\)/);
+                if (!m) return;
+                const p = m[1].split(",").map(Number);
+                if (p.length < 3 || p.some(n => !isFinite(n))) return;
+                // sRGB relative luminance, the WCAG weighting.
+                const lin = (c) => {
+                    c = c / 255;
+                    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+                };
+                const L = 0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2]);
+                const ink = L > 0.45 ? "#000000" : "#ffffff";
+                head.style.color = ink;
+                verseBox.style.color = ink;
+            } catch (e) { /* keep the theme colour */ }
+        };
+        setContrast();
+        // The popout's theme classes settle a frame or two after the window
+        // opens, so resolve again once it has.
+        setTimeout(setContrast, 120);
+
         // ---- Cancel / Add note -------------------------------------------
         const foot = doc.createElement("div");
+        // The same solid colour as the note's bar. The buttons keep their own
+        // theme backgrounds on top of it.
         foot.style.cssText = "flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;" +
-            "padding:10px 14px;border-top:1px solid var(--background-modifier-border);" +
-            "background:var(--background-secondary);";
+            "padding:10px 14px;border-top:1px solid " + barColour + ";" +
+            "background:" + barColour + ";";
         const cancelBtn = doc.createElement("button");
         cancelBtn.textContent = "Cancel";
         const saveBtn = doc.createElement("button");
@@ -2695,7 +2742,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         if (!refs.length) return "";
 
         if (!(await this.isLocalStepRunning())) {
-            return '<span style="color:var(--text-muted)">STEP Bible isn\u2019t running, so the text can\u2019t be shown.</span>';
+            return '<span style="color:inherit;opacity:.7">STEP Bible isn\u2019t running, so the text can\u2019t be shown.</span>';
         }
 
         const out = [];
@@ -2721,10 +2768,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             } catch (e) { /* one verse failing shouldn't empty the header */ }
         }
         if (refs.length > shown.length) {
-            out.push(`<p style="margin:4px 0 0 0;color:var(--text-muted);font-size:11.5px">` +
+            out.push(`<p style="margin:4px 0 0 0;color:inherit;opacity:.65;font-size:11.5px">` +
                 `${refs.length - shown.length} more verses not shown.</p>`);
         }
-        return out.join("") || '<span style="color:var(--text-muted)">No text found.</span>';
+        return out.join("") || '<span style="color:inherit;opacity:.7">No text found.</span>';
     }
 
     urlRef_displayRef(urlRef) {
@@ -3113,6 +3160,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 for (const file of files) {
                     // Files directly in the note-types folder are list notes,
                     // not ordinary notes. Subfolders are ordinary notes.
+                    if (isDraftFilePath(file.path)) continue;
                     if (isListNotePath(file.path, this.settings.noteTypesFolder)) continue;
                     const text = await this.readNoteText(file);
                     if (!text.includes("reference=")) continue;
@@ -3231,7 +3279,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     // Direct children only: a subfolder of the list folder holds
                     // ordinary notes, handled by the plain-note scan above.
                     const typeFiles = this.app.vault.getMarkdownFiles()
-                        .filter(f => isListNotePath(f.path, prefix));
+                        .filter(f => isListNotePath(f.path, prefix) && !isDraftFilePath(f.path));
                     const palette = ["#c05761", "#8a6db1", "#3f7fae", "#b8860b", "#7a9a3f", "#a352cc", "#c87f3f"];
                     this.settings.typedColours = this.settings.typedColours || {};
                     let coloursDirty = false;
@@ -7898,7 +7946,36 @@ class LinkPopout {
     }
 
     mount() {
-        this.plugin.registerDomEvent(document, "mouseover", (evt) => this._onMouseOver(evt));
+        // Popouts are separate windows with their own document: a listener on
+        // the main document never sees a mouseover inside one. Every document
+        // the reference can be written in gets its own listener.
+        this._docs = new WeakSet();
+        this._mountDoc(document);
+        try {
+            this.plugin.app.workspace.iterateAllLeaves((leaf) => {
+                const d = leaf && leaf.view && leaf.view.containerEl
+                    ? leaf.view.containerEl.ownerDocument : null;
+                if (d) this._mountDoc(d);
+            });
+        } catch (e) { /* older API: main window only */ }
+        this.plugin.registerEvent(this.plugin.app.workspace.on("window-open", (win) => {
+            const d = win && (win.doc || win.document);
+            if (d) this._mountDoc(d);
+        }));
+    }
+
+    _mountDoc(doc) {
+        if (!doc || this._docs.has(doc)) return;
+        this._docs.add(doc);
+        this.plugin.registerDomEvent(doc, "mouseover", (evt) => this._onMouseOver(evt));
+        // The box belongs to the window it was opened in; leaving that window
+        // strands it, since no mouseleave on the link will fire.
+        const win = doc.defaultView;
+        if (win) {
+            this.plugin.registerDomEvent(win, "mouseout", (evt) => {
+                if (!evt.relatedTarget && !this._inPreview) this.hide();
+            });
+        }
     }
 
     destroy() {
@@ -7956,9 +8033,10 @@ class LinkPopout {
 
     // The spinner stylesheet, injected once. Small and self-contained so it
     // needs nothing from a theme or from styles.css.
-    _ensureStyles() {
-        if (document.getElementById("step-linker-popout-style")) return;
-        const style = document.createElement("style");
+    _ensureStyles(doc) {
+        const d = doc || document;
+        if (d.getElementById("step-linker-popout-style")) return;
+        const style = d.createElement("style");
         style.id = "step-linker-popout-style";
         style.textContent = [
             ".step-popover-spinner {",
@@ -7970,7 +8048,7 @@ class LinkPopout {
             "}",
             "@keyframes step-popover-spin { to { transform: rotate(360deg); } }"
         ].join("\n");
-        document.head.appendChild(style);
+        d.head.appendChild(style);
     }
 
     // Show the box immediately with a spinner, so a slow reference reads as
@@ -7978,7 +8056,7 @@ class LinkPopout {
     // animation says it.
     _showLoading(pop) {
         if (pop) { pop.style.width = "460px"; this._position(pop); }
-        this._ensureStyles();
+        this._ensureStyles(pop && pop.ownerDocument);
         pop.innerHTML =
             '<div style="display:flex;align-items:center;justify-content:center;padding:1px 0">' +
             '<span class="step-popover-spinner"></span></div>';
@@ -7989,7 +8067,13 @@ class LinkPopout {
     // something to show. No loading placeholder: an empty dark box that says
     // "Loading…" is exactly what this used to get wrong.
     _build(evt) {
-        const pop = document.createElement("div");
+        // Built in the document that raised the event, so it renders in the
+        // same window as the link — a box appended to the main document is
+        // invisible inside a popout.
+        const doc = (evt.target && evt.target.ownerDocument) || document;
+        const win = doc.defaultView || window;
+        this._ensureStyles(doc);
+        const pop = doc.createElement("div");
         pop.classList.add("step-popover");
         Object.assign(pop.style, {
             position: "fixed",
@@ -8016,12 +8100,12 @@ class LinkPopout {
             fontFamily: "var(--font-interface)"
         });
 
-        document.body.appendChild(pop);
+        doc.body.appendChild(pop);
 
         // The anchor is remembered, not the resulting position: the box
         // changes width after this (the narrow "Passage visible" label, then
         // the wide text), and each width has its own rightmost position.
-        const vw = window.innerWidth;
+        const vw = win.innerWidth;
         const margin = 12;
 
         // The element the reference is written in. A whole line is a poor
@@ -8050,10 +8134,11 @@ class LinkPopout {
     // of the link it belonged to.
     _position(pop) {
         if (!pop) return;
+        const win = (pop.ownerDocument && pop.ownerDocument.defaultView) || window;
         const anchorRight = (typeof pop._stepAnchorRight === "number")
             ? pop._stepAnchorRight
-            : window.innerWidth - 12;
-        const vw = window.innerWidth;
+            : win.innerWidth - 12;
+        const vw = win.innerWidth;
         const margin = 12;
         const rect = pop.getBoundingClientRect();
         const w = rect && rect.width > 0 ? rect.width : 0;
@@ -8194,7 +8279,8 @@ class LinkPopout {
     _showVisible(pop, loadText) {
         if (!pop) return;
         pop.innerHTML = "";
-        const row = document.createElement("div");
+        const doc = (pop.ownerDocument) || document;
+        const row = doc.createElement("div");
         row.classList.add("step-popover-visible");
         row.setAttribute("role", "button");
         row.setAttribute("tabindex", "0");
@@ -8204,10 +8290,10 @@ class LinkPopout {
             "display:flex;flex-direction:column;align-items:flex-start;gap:1px;" +
             "width:fit-content;max-width:100%;cursor:pointer;";
         pop.style.width = "fit-content";
-        const label = document.createElement("span");
+        const label = doc.createElement("span");
         label.style.cssText = "color:#3fb950;font-weight:600;";
         label.textContent = "Passage visible";
-        const hint = document.createElement("span");
+        const hint = doc.createElement("span");
         hint.style.cssText = "color:var(--text-muted);font-size:11.5px;";
         hint.textContent = "click to load text";
         row.appendChild(label);

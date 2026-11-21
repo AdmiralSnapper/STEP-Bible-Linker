@@ -30,6 +30,22 @@ const DEFAULT_SETTINGS = {
     // STEP pane is reused instead.
     alwaysOpenNewStepTab: false,
 };
+// Ink for text placed on a coloured bar: pure black or pure white, whichever
+// the bar can carry better. A list colour is user-chosen, so it may be light.
+function barInk(hex) {
+    const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(hex || "").trim());
+    if (!m) return "#ffffff";
+    let h = m[1];
+    if (h.length === 3) h = h.split("").map(c => c + c).join("");
+    const p = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16));
+    const lin = (c) => {
+        c = c / 255;
+        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    };
+    const L = 0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2]);
+    return L > 0.45 ? "#000000" : "#ffffff";
+}
+
 class FolderSuggest extends AbstractInputSuggest {
     constructor(app, inputEl, onPick) {
         super(app, inputEl);
@@ -2588,8 +2604,18 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const cancelBtn = doc.createElement("button");
         cancelBtn.textContent = "Cancel";
         const saveBtn = doc.createElement("button");
-        saveBtn.textContent = editing ? "Save changes" : "Add note";
+        saveBtn.textContent = "Save";
         saveBtn.style.cssText = "font-weight:600;";
+
+        // The hint sits at the far end of the bar from the buttons. Its ink is
+        // read off the bar colour, since a chosen list colour can be light.
+        const hintEl = doc.createElement("span");
+        hintEl.textContent = "ctrl + enter to save";
+        hintEl.style.cssText = "margin-right:auto;align-self:center;font-size:11.5px;" +
+            "letter-spacing:0.01em;opacity:0.9;user-select:none;color:" +
+            barInk(barColour) + ";";
+
+        foot.appendChild(hintEl);
         foot.appendChild(cancelBtn);
         foot.appendChild(saveBtn);
         root.appendChild(foot);
@@ -2658,9 +2684,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         cancelBtn.addEventListener("click", () => { finish(false); });
         saveBtn.addEventListener("click", () => { finish(true); });
-        // Enter files the note; Shift+Enter is the newline. The listener is on
-        // the document in the capture phase so it runs before CodeMirror's own
-        // Enter binding and can stop it inserting a line break.
+        // Ctrl/Cmd+Enter files the note. Plain Enter is left alone, so it
+        // behaves like any other line break in the editor.
+        // The listener is on the document in the capture phase so it runs
+        // before CodeMirror's own binding and can stop it acting on the key.
         const editorArea = view.contentEl || content;
         doc.addEventListener("keydown", (ev) => {
             if (ev.key === "Escape") {
@@ -2670,14 +2697,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 return;
             }
             if (ev.key !== "Enter") return;
-            const plain = !ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
-            const withMod = (ev.ctrlKey || ev.metaKey) && !ev.shiftKey;
-            if ((plain || withMod) && editorArea && ev.target && editorArea.contains(ev.target)) {
+            const withMod = (ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey;
+            if (withMod && editorArea && ev.target && editorArea.contains(ev.target)) {
                 ev.preventDefault();
                 ev.stopPropagation();
                 finish(true);
             }
-            // Shift+Enter falls through to the editor as a newline.
+            // Every other Enter (and Shift+Enter) falls through as a newline.
         }, true);
 
         // Closing the window counts as Cancel, so a stray X never leaves a

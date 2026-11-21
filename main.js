@@ -69,11 +69,87 @@ class FolderSuggest extends AbstractInputSuggest {
         if (this.onPick) this.onPick(path);
     }
 }
-// Sections inside a list note are separated by BLANK LINES, not by a visible
-// marker: three or more empty lines before a line that begins with a reference
-// link start a new section. Fewer than three are ordinary blank space inside a
-// section, so prose keeps its paragraph breaks. "---" carries no special
-// meaning any more and can be used as an ordinary horizontal rule.
+// Sections inside a list note are marked by a level-1 heading: the largest
+// Obsidian heading, "# ". Nothing else splits a note — a deeper heading is
+// ordinary content inside its section, and blank lines mean nothing.
+//
+// The heading carries the section's reference and, optionally, its title and
+// source:
+//   # ([Numbers 22-24](url))
+//   # ([Numbers 22-24](url)) Test title. | [[EV Numbers]]
+//   # A section with no verse | [[Somewhere]]
+// Text after the link is the title; text after a "|" in it is the source.
+// A heading with no reference is a section with no verse, which sorts to the
+// end of the file.
+const SECTION_HEADING_RE = /^#[ \t]+\S/;
+
+// A heading line, broken into its reference links, title and source.
+function parseSectionHeading(line) {
+    const text = String(line == null ? "" : line).replace(/^#[ \t]+/, "").trim();
+    const linkRe = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
+    const refs = [];
+    let m;
+    while ((m = linkRe.exec(text)) !== null) {
+        let raw = m[2].trim();
+        try { raw = decodeURIComponent(raw); } catch (e) { /* keep as written */ }
+        refs.push({ refText: (m[1] || "").trim(), refRaw: raw });
+    }
+    // The empty "()" left behind by a "([link])" wrapper is not content.
+    const rest = text.replace(linkRe, "").replace(/\(\s*\)/g, "").trim();
+    let title = rest;
+    let source = "";
+    const bar = rest.indexOf("|");
+    if (bar >= 0) {
+        title = rest.slice(0, bar).trim();
+        source = rest.slice(bar + 1).trim();
+    }
+    return {
+        refs, title, source, hasRef: refs.length > 0,
+        refText: refs.length ? refs[0].refText : "",
+        refRaw: refs.length ? refs[0].refRaw : "",
+    };
+}
+
+// The heading line for a section: the reference links, then the title, then
+// "| source". With no reference the heading is just the title, which is how a
+// section not attached to a verse is written.
+function sectionHeadingLine(links, title, source) {
+    const t = String(title == null ? "" : title).trim();
+    const s = String(source == null ? "" : source).trim();
+    const head = (links || []).filter(Boolean).join(" ");
+    let out = "#";
+    if (head) out += " " + head;
+    if (t) out += " " + t;
+    if (s) out += " | " + s;
+    // A heading needs text after the "#"; an empty section still needs one.
+    return out.trim() === "#" ? "# " : out;
+}
+
+// The reference a link target carries, e.g. "Numbers.22.22" from
+// "...&reference=Numbers.22.22&options=...". Null when the link has none.
+function refFromLinkTarget(target) {
+    const at = String(target || "").indexOf("reference=");
+    if (at < 0) return null;
+    let raw = String(target).slice(at + "reference=".length).split("&")[0].trim();
+    try { raw = decodeURIComponent(raw); } catch (e) { /* as written */ }
+    return raw || null;
+}
+
+// The canonical range a raw reference covers ("Numbers.22.22",
+// "Numbers.22-Numbers.24"), or null when it can't be read.
+function canonSpanOfRef(raw) {
+    if (!raw) return null;
+    const parts = String(raw).split("-").map(s => s.trim());
+    const left = parts[0];
+    let right = parts[1] || "";
+    const lp = left.split(".");
+    if (right && !right.includes(".")) {
+        right = lp.length >= 3 ? [lp[0], lp[1], right].join(".") : [lp[0], right].join(".");
+    }
+    const b = canonBounds(right ? left + "-" + right : left);
+    return b ? { start: b.start, span: b.end - b.start } : null;
+}
+
 // The folder a vault path lives in ("" at the vault root).
 function dirOfPath(path) {
     const p = String(path || "");
@@ -97,7 +173,6 @@ function isDraftFilePath(path) {
     return DRAFT_FILE_RE.test(p.slice(p.lastIndexOf("/") + 1));
 }
 
-const SECTION_SEPARATOR_BLANKS = 3;
 
 // Suggests markdown files by path, for picking a folder's template note.
 class FileSuggest extends AbstractInputSuggest {
@@ -126,93 +201,69 @@ class FileSuggest extends AbstractInputSuggest {
 }
 function parseTypedFile(text, fileBasename) {
     const linkRe = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
-    // A section starts at a line whose first thing is a reference link,
-    // optionally behind the "(" of the wrapper STEP writes.
-    const startsWithRef = /^[ \t]*(?:\(\s*)?\[[^\]]+\]\([^)]*reference=[^)]*\)/;
 
     const entries = [];
     const crosslinks = [];
     let current = null;
-    let escaped = false;  // inside a ~~~ block: line-start refs are content
-    let blanks = 0;       // blank lines since the last non-blank line
+    let escaped = false;  // inside a ~~~ block: headings are content
 
-    // Start a section from a line that begins with one or more ref links.
-    // Every link on that first line is a main reference for the section; the
-    // first one is the primary. Whatever text is left on the line is the
-    // section's opening content.
+    // A section starts at a level-1 heading and nowhere else. Its heading line
+    // carries the reference, the title and the source; the text under it is the
+    // section's content. A heading with no reference is a section with no verse.
     const startSection = (line) => {
-        const refs = [];
-        linkRe.lastIndex = 0;
-        let m;
-        while ((m = linkRe.exec(line)) !== null) {
-            refs.push({ refText: (m[1] || "").trim(), refRaw: decodeURIComponent(m[2].trim()) });
-        }
-        if (!refs.length) return false;
-        // The empty "()" left behind by a "([link])" wrapper is not content.
-        const rest = line.replace(linkRe, "").replace(/\(\s*\)/g, "").trim();
+        const h = parseSectionHeading(line);
         current = {
             // Positional identity. Two sections may legitimately share a
             // reference — merging them would lose one — so an entry is never
             // looked up by its reference.
             index: entries.length,
-            refText: refs[0].refText,
-            refRaw: refs[0].refRaw,
-            refs,
+            refText: h.refText,
+            refRaw: h.refRaw,
+            refs: h.refs,
+            title: h.title,
+            sourceHeading: h.source,
             source: fileBasename,
-            lines: rest ? [rest] : [],
+            heading: line,
+            hasRef: h.hasRef,
+            lines: [],
         };
         entries.push(current);
-        return true;
     };
 
     for (const line of text.split(/\r?\n/)) {
         if (/^[ \t]*~{3,}[ \t]*$/.test(line)) {
             escaped = !escaped; // toggle escape block
-            blanks = 0;
             continue;
         }
-        if (!line.trim()) {
-            blanks++;
-            continue;
-        }
-
-        if (!escaped && startsWithRef.test(line)
-            && (current === null || blanks >= SECTION_SEPARATOR_BLANKS)) {
+        if (!escaped && SECTION_HEADING_RE.test(line)) {
             startSection(line);
-            blanks = 0;
             continue;
         }
-
         if (current) {
-            // Blank lines are content here, but only once a real line follows:
-            // a run long enough to be a separator is dropped when the next
-            // non-blank line starts a section, and trailing blanks are never
-            // appended, so no entry ends on empty lines.
-            for (let i = 0; i < blanks; i++) current.lines.push("");
             current.lines.push(line);
-            // crosslinks: any reference link on a line that did not start a section
+            // crosslinks: any reference link inside a section's text
             for (const cm of line.matchAll(linkRe)) {
+                let raw = cm[2].trim();
+                try { raw = decodeURIComponent(raw); } catch (e) { /* as written */ }
                 crosslinks.push({
                     refText: (cm[1] || "").trim(),
-                    refRaw: decodeURIComponent(cm[2].trim()),
+                    refRaw: raw,
                     source: fileBasename,
                     target: current, // the section this crosslink points to
                 });
             }
         }
-        blanks = 0;
     }
 
     for (const e of entries) {
-        e.content = e.lines.join("\n").replace(/\s+$/, "");
+        e.content = e.lines.join("\n").replace(/^\s*\n/, "").replace(/\s+$/, "");
         delete e.lines;
     }
     return { entries, crosslinks };
 }
-// How many blank lines separate two sections of a list note. Written this
-// many so that trimming one or two by hand still leaves the 3 needed to keep
-// them apart.
-const LIST_SEPARATOR_WRITE_BLANKS = 5;
+// How many blank lines are written between two sections of a list note. Only
+// for reading: the heading is what separates them, so one blank line is enough.
+const LIST_SEPARATOR_WRITE_BLANKS = 1;
 
 // Put a reference at the top of a new note built from a template. If the file
 // opens with frontmatter, the reference goes on the first line after it — a
@@ -242,18 +293,13 @@ function applyReferenceToFirstLine(text, refMd) {
     return lines.join("\n");
 }
 
-// Start line indices of every section in a list note, plus each section's
-// canonical start and span. Positional, matching parseTypedFile: a section
-// begins at a line whose first thing is a reference link, and only when 3+
-// blank lines precede it (or it is the first section in the file).
+// Every section in a list note: its heading line, the reference it carries,
+// and its title and source. Positional, matching parseTypedFile: a section
+// begins at a level-1 heading and nowhere else.
 function listSectionStarts(text) {
     const lines = String(text == null ? "" : text).split(/\r?\n/);
-    const startsWithRef = /^[ \t]*(?:\(\s*)?\[[^\]]+\]\([^)]*reference=[^)]*\)/;
-    const refRe = /\[[^\]]+\]\([^)]*reference=([^)&]+)[^)]*\)/;
     const out = [];
     let escaped = false;
-    let blanks = 0;
-    let started = false;
     let fmEnd = -1;
     if (lines.length && /^[-]{3,}[ \t]*$/.test(lines[0])) {
         for (let i = 1; i < lines.length; i++) {
@@ -263,30 +309,15 @@ function listSectionStarts(text) {
     for (let i = 0; i < lines.length; i++) {
         if (i <= fmEnd) continue;
         const line = lines[i];
-        if (/^[ \t]*~{3,}[ \t]*$/.test(line)) { escaped = !escaped; blanks = 0; continue; }
-        if (!line.trim()) { blanks++; continue; }
-        if (!escaped && startsWithRef.test(line) && (!started || blanks >= 3)) {
-            const m = line.match(refRe);
-            let canon = null;
-            if (m) {
-                let raw = m[1];
-                try { raw = decodeURIComponent(raw); } catch (e) {}
-                const parts = raw.split("-").map(s => s.trim());
-                const left = parts[0];
-                let right = parts[1] || "";
-                const lp = left.split(".");
-                if (right && !right.includes(".")) {
-                    right = lp.length >= 3 ? [lp[0], lp[1], right].join(".") : [lp[0], right].join(".");
-                }
-                const b = canonBounds(right ? left + "-" + right : left);
-                if (b) canon = { start: b.start, span: b.end - b.start };
-            }
-            out.push({ line: i, canon });
-            started = true;
-            blanks = 0;
-            continue;
-        }
-        blanks = 0;
+        if (/^[ \t]*~{3,}[ \t]*$/.test(line)) { escaped = !escaped; continue; }
+        if (escaped || !SECTION_HEADING_RE.test(line)) continue;
+        const h = parseSectionHeading(line);
+        out.push({
+            line: i, heading: line,
+            canon: h.hasRef ? canonSpanOfRef(refFromLinkTarget(h.refRaw)) : null,
+            title: h.title, source: h.source,
+            refText: h.refText, refRaw: h.refRaw, refs: h.refs, hasRef: h.hasRef,
+        });
     }
     return out;
 }
@@ -294,20 +325,23 @@ function listSectionStarts(text) {
 // Insert a new section into a list note between existing ones. Sections are
 // ordered by where their first reference starts; a longer range that starts in
 // the same place comes after the shorter one, and a duplicate goes after the
-// one already there. Every other line of the file is left exactly as it was.
+// one already there. A section with no verse has no place in that order, so it
+// goes at the end of the file. Every other line is left exactly as it was.
 function insertListSection(text, sectionMd, canon) {
     const doc = String(text == null ? "" : text);
     const lines = doc.split(/\r?\n/);
     const sections = listSectionStarts(doc);
-    const target = canon || { start: Infinity, span: 0 };
+    const target = canon || null;
 
     let cut = lines.length;
-    for (const s of sections) {
-        if (!s.canon) continue;
-        if (s.canon.start > target.start
-            || (s.canon.start === target.start && s.canon.span > target.span)) {
-            cut = s.line;
-            break;
+    if (target) {
+        for (const s of sections) {
+            if (!s.canon) continue;
+            if (s.canon.start > target.start
+                || (s.canon.start === target.start && s.canon.span > target.span)) {
+                cut = s.line;
+                break;
+            }
         }
     }
 
@@ -325,23 +359,19 @@ function insertListSection(text, sectionMd, canon) {
     const out = [];
     if (before.length) { out.push(before.join("\n")); out.push(sep); }
     out.push(block.join("\n"));
-    // The section that follows keeps the separator it had: without it the
-    // plugin would no longer read it as a section at all.
     if (after.length) { out.push(sep); out.push(after.join("\n")); }
     return out.join("");
 }
 
-// Remove one section from a list note, link line and all: the section's
-// reference, its text and the separator that followed it. Everything else —
-// frontmatter, the other sections — is written back line for line.
+// Remove one section from a list note, heading and all: the section's
+// reference, title, source and text. Everything else — frontmatter, the other
+// sections — is written back line for line.
 function removeListSection(text, index) {
     const doc = String(text == null ? "" : text);
     const lines = doc.split(/\r?\n/);
     const sections = listSectionStarts(doc);
     if (index < 0 || index >= sections.length) return null;
     const start = sections[index].line;
-    // Sections are cut from their link line to the next one, so each block keeps
-    // the separator that precedes it and the file stays readable as a list.
     const end = index + 1 < sections.length ? sections[index + 1].line : lines.length;
     const out = lines.slice(0, start).concat(lines.slice(end));
     while (out.length && !out[out.length - 1].trim()) out.pop();
@@ -2250,20 +2280,23 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     async addNote(refs, dest, body, opts = {}) {
         const track = opts.track || null;
         const list = (refs || []).filter(Boolean);
-        if (!list.length) {
+        const title = String(opts.title == null ? "" : opts.title).trim();
+        const sourceText = String(opts.source == null ? "" : opts.source).trim();
+        // A section with no verse is legal: it needs a title to be a heading.
+        if (!list.length && !title && !sourceText) {
             new Notice("No reference selected.");
             return null;
         }
-        const primary = list[0];
-        const firstLine = list.map(r => this.refMarkdown(r)).join(" ");
-        const canon = (() => {
-            const parts = primary.split("-").map(s => s.trim());
-            const b = canonBounds(parts.length > 1 ? parts[0] + "-" + parts[1] : parts[0]);
-            return b ? { start: b.start, span: b.end - b.start } : null;
-        })();
+        const primary = list[0] || "";
+        const links = list.map(r => this.refMarkdown(r));
+        const firstLine = links.join(" ");
+        // A list section is a level-1 heading: its reference(s), then its
+        // title, then "| source".
+        const heading = sectionHeadingLine(links, title, sourceText);
+        const canon = primary ? canonSpanOfRef(primary) : null;
 
-        // Whatever the user typed in the editor, placed after the reference
-        // rather than pushed into the template's own structure.
+        // Whatever the user typed in the editor, placed after the heading
+        // rather than pushed into the heading itself.
         const typed = String(body || "").replace(/\s+$/, "");
         const withBody = (head) => (typed ? head + "\n\n" + typed : head);
 
@@ -2273,16 +2306,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const f = this.app.vault.getAbstractFileByPath(dest.file);
                 if (!f) { new Notice("That list note no longer exists."); return null; }
                 const text = await this.app.vault.read(f);
-                await this.app.vault.modify(f, insertListSection(text, withBody(firstLine), canon));
+                await this.app.vault.modify(f, insertListSection(text, withBody(heading), canon));
                 // Cancel puts the file back exactly as it was: the inserted
                 // section is the only change, so the original bytes undo it.
                 if (track) track.undo = { kind: "list", path: f.path, before: text };
                 return f.path;
             }
-            // A new list note: the reference is its first section.
+            // A new list note: the section is its first section.
             if (!folder) { new Notice("Pick a Bible notes folder first."); return null; }
             const path = this.uniqueUntitledPath(folder);
-            const created = await this.app.vault.create(path, withBody(firstLine) + "\n");
+            const created = await this.app.vault.create(path, withBody(heading) + "\n");
             if (track) track.undo = { kind: "new", path: created.path };
             return created.path;
         }
@@ -2333,10 +2366,20 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             const at = mark ? lines.findIndex(l => l.includes(mark)) : -1;
             if (at >= 0) idx = sections.findIndex(s => s.line === at);
         }
+        // A section with no verse has no reference to find it by, so it is
+        // addressed by its title instead.
+        if (idx < 0 && canon) {
+            const want = String(canon).trim();
+            idx = sections.findIndex(s => !s.hasRef && s.title === want);
+        }
         if (idx < 0) return null;
-        const linkIdx = sections[idx].line;
+        const section = sections[idx];
+        const linkIdx = section.line;
         const endIdx = idx + 1 < sections.length ? sections[idx + 1].line : lines.length;
-        return { index: idx, count: sections.length, parts: this.bodyPartsAt(lines, linkIdx, endIdx) };
+        return {
+            index: idx, count: sections.length, section,
+            parts: this.bodyPartsAt(lines, linkIdx, endIdx),
+        };
     }
 
     // The text under one line, up to the next section: blank lines either side
@@ -2405,12 +2448,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // The note again, with the text under the link replaced. Everything else
     // is written back line for line, so a list note's other sections are not
     // touched and its separators keep their exact width.
-    noteTextWithBody(parts, body) {
+    noteTextWithBody(parts, body, headingLine) {
         if (!parts || parts.linkIdx < 0) return String(body == null ? "" : body);
         const bodyLines = String(body == null ? "" : body).split(/\r?\n/);
         while (bodyLines.length && !bodyLines[0].trim()) bodyLines.shift();
         while (bodyLines.length && !bodyLines[bodyLines.length - 1].trim()) bodyLines.pop();
         const out = parts.lines.slice(0, parts.linkIdx + 1);
+        // The heading carries the title and source, so a save may rewrite it.
+        if (headingLine != null) out[out.length - 1] = String(headingLine);
         // The blank lines the section already had on either side of its text
         // are put back exactly, so a list note's separators keep their width.
         for (let i = 0; i < parts.lead; i++) out.push("");
@@ -2449,25 +2494,35 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // passage above it, the editable note beneath it, Cancel / Add note at the
     // bottom. The editor is a real MarkdownView, so links, embeds, pictures and
     // hover all behave exactly as they do in a normal note.
-    async openNoteEditorPopout({ path, undo, canons, mode }) {
+    async openNoteEditorPopout({ path, undo, canons, mode, sectionTitle }) {
         const file = this.app.vault.getAbstractFileByPath(path);
         if (!file) { new Notice("The note could not be opened."); return; }
         // Editing an existing note writes over its text; adding one starts
-        // from an empty draft. Only the button wording and the notice differ.
+        // from an empty draft. Only the notice differs.
         const editing = mode === "edit";
 
+        // A section with no verse is addressed by its title, not a reference.
         const canon = (canons || [])[0] || "";
+        const address = canon || sectionTitle || "";
         const text = await this.app.vault.read(file);
         // The section this reference belongs to — for a list note, only its own
         // text. If the file holds sections but none is this reference's, the
         // window refuses to open rather than editing the whole file: writing
         // the draft back over the lot would take the other notes with it.
-        const found = canon ? this.noteSectionParts(text, canon) : null;
+        const found = address ? this.noteSectionParts(text, address) : null;
         const parts = found ? found.parts : this.noteBodyParts(text, "");
-        if (canon && !found && listSectionStarts(text).length) {
+        const section = found ? found.section : null;
+        if (address && !found && listSectionStarts(text).length) {
             new Notice("Could not find that note's section in " + path + ".");
             return;
         }
+        // The heading's own title and source, to start the fields with.
+        const startTitle = section ? section.title : "";
+        const startSource = section ? section.source : "";
+        // The links the heading carries, as markdown, ready to be rebuilt.
+        const headingLinks = section && section.refs && section.refs.length
+            ? section.refs.map(r => `([${r.refText}](${r.refRaw}))`)
+            : (canons || []).map(c => this.refMarkdown(c));
 
         // The real note stays exactly as it is until the note is saved; the
         // window edits a copy. A list note's link and neighbours are therefore
@@ -2490,7 +2545,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // The window's own name is the reference in readable form — "Numbers
         // 22:22", not the link it was built from. Obsidian renames the window
         // when the view settles, so the title is re-applied a beat later.
-        const winTitle = (canons || []).map(c => this.canonToDisplayRef(c)).filter(Boolean).join(", ");
+        const winTitle = (canons || []).map(c => this.canonToDisplayRef(c)).filter(Boolean).join(", ")
+            || String(sectionTitle || "").trim();
         const setWindowTitle = () => {
             try {
                 const win = root.ownerDocument.defaultView;
@@ -2560,13 +2616,38 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             "color:var(--text-normal);max-height:34vh;overflow:auto;";
         const heading = doc.createElement("div");
         heading.style.cssText = "font-weight:600;margin-bottom:5px;font-size:13.5px;";
-        heading.textContent = (canons || []).map(c => this.canonToDisplayRef(c)).join(", ");
+        heading.textContent = (canons || []).map(c => this.canonToDisplayRef(c)).join(", ")
+            || String(startTitle || "").trim();
         const verseBox = doc.createElement("div");
         verseBox.style.cssText = "font-size:13px;line-height:1.55;";
         verseBox.textContent = "Loading passage\u2026";
         head.appendChild(heading);
         head.appendChild(verseBox);
         root.insertBefore(head, content);
+
+        // ---- title and source --------------------------------------------
+        // Two plain text fields. Whatever they hold is written back into the
+        // section's heading as "# (ref) Title | source", so the file keeps the
+        // one format the scan reads.
+        const meta = doc.createElement("div");
+        meta.style.cssText = "flex:0 0 auto;display:flex;gap:8px;padding:8px 10px 0;box-sizing:border-box;";
+        const fieldStyle = "flex:1 1 0;min-width:0;box-sizing:border-box;padding:6px 8px;" +
+            "font:inherit;font-size:12.5px;color:var(--text-normal);" +
+            "background:var(--background-primary);" +
+            "border:1px solid var(--background-modifier-border);border-radius:4px;";
+        const titleInput = doc.createElement("input");
+        titleInput.type = "text";
+        titleInput.placeholder = "Title";
+        titleInput.value = startTitle;
+        titleInput.style.cssText = fieldStyle + "flex:2 1 0;";
+        const sourceInput = doc.createElement("input");
+        sourceInput.type = "text";
+        sourceInput.placeholder = "Source";
+        sourceInput.value = startSource;
+        sourceInput.style.cssText = fieldStyle;
+        meta.appendChild(titleInput);
+        meta.appendChild(sourceInput);
+        root.insertBefore(meta, content);
 
         // Pure black or pure white, whichever the surface can carry better.
         // The theme's own text colour is usually right, but a themed surface
@@ -2660,7 +2741,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 if (save) {
                     // Whatever is in the window is the note — even nothing.
                     const body = editor ? editor.getValue() : await this.app.vault.read(draftFile);
-                    await this.app.vault.modify(file, this.noteTextWithBody(parts, body));
+                    // The heading carries the title and source, so it is rebuilt
+                    // from the fields on every save. A note with no heading
+                    // section keeps its own first line untouched.
+                    const newHeading = section
+                        ? sectionHeadingLine(headingLinks, titleInput.value, sourceInput.value)
+                        : null;
+                    await this.app.vault.modify(file, this.noteTextWithBody(parts, body, newHeading));
                     // The scan that follows must read this file, not the text
                     // it had before the note was added.
                     this.forgetNoteText(path);
@@ -2737,6 +2824,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
 
         // Fill the passage in behind the editor, which is usable immediately.
         (async () => {
+            // A section with no verse has no passage to show.
+            if (!(canons || []).length) {
+                if (head.isConnected) head.style.display = "none";
+                return;
+            }
             try {
                 const html = await this.versePreviewHtml(canons, 60);
                 if (verseBox.isConnected) verseBox.innerHTML = html;

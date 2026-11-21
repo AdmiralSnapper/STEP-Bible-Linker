@@ -174,6 +174,63 @@ function isDraftFilePath(path) {
 }
 
 
+// Renders the bottom meta line of a bar/row: "Type (Source)". The source is
+// the text after the "|" in a section heading, which is usually a wiki link
+// ([[EV Numbers]]) or a markdown link, so it is drawn as a real, clickable
+// link rather than as inert text. Anything that is not a link stays text.
+function renderMetaLine(el, typeText, sourceText, app, sourcePath, fallback) {
+    const type = typeText && String(typeText).trim() ? String(typeText).trim() : "";
+    const source = sourceText && String(sourceText).trim() ? String(sourceText).trim() : "";
+    if (!source) {
+        el.setText(type || fallback || "");
+        return;
+    }
+    const doc = el.ownerDocument || (el.doc || document);
+    if (type) el.appendText(type + " (");
+    else el.appendText("(");
+    const linkRe = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]|\[([^\]]+)\]\(([^)]+)\)/g;
+    let last = 0;
+    let m;
+    const addLink = (label, onclick) => {
+        const a = doc.createElement("a");
+        a.textContent = label;
+        a.style.color = "inherit";
+        a.style.textDecoration = "underline";
+        a.style.cursor = "pointer";
+        a.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            onclick();
+        });
+        el.appendChild(a);
+    };
+    while ((m = linkRe.exec(source)) !== null) {
+        if (m.index > last) el.appendText(source.slice(last, m.index));
+        if (m[1] !== undefined) {
+            const target = m[1].trim();
+            const label = (m[2] || target).trim();
+            addLink(label, () => {
+                if (!app) return;
+                const file = app.metadataCache.getFirstLinkpathDest(target, sourcePath || "");
+                if (file) app.workspace.getLeaf(false).openFile(file);
+                else app.workspace.openLinkText(target, sourcePath || "", false);
+            });
+        } else {
+            const label = (m[3] || "").trim();
+            const href = (m[4] || "").trim();
+            addLink(label, () => {
+                if (!app) return;
+                const file = app.metadataCache.getFirstLinkpathDest(href, sourcePath || "");
+                if (file) app.workspace.getLeaf(false).openFile(file);
+                else window.open(href, "_blank");
+            });
+        }
+        last = linkRe.lastIndex;
+    }
+    if (last < source.length) el.appendText(source.slice(last));
+    el.appendText(")");
+}
+
 // Suggests markdown files by path, for picking a folder's template note.
 class FileSuggest extends AbstractInputSuggest {
     constructor(app, inputEl, onPick) {
@@ -221,8 +278,11 @@ function parseTypedFile(text, fileBasename) {
             refRaw: h.refRaw,
             refs: h.refs,
             title: h.title,
-            sourceHeading: h.source,
-            source: fileBasename,
+            // The heading's source: text after "|" in the title. The file
+            // basename is the note's type, kept separately so the two can
+            // never be confused.
+            source: h.source,
+            file: fileBasename,
             heading: line,
             hasRef: h.hasRef,
             lines: [],
@@ -3483,6 +3543,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                 // crosslinks only.
                                 typedData.contentOf[refId] = {
                                     label: base,
+                                    // The list a note belongs to is its type;
+                                    // title and source come from its heading.
+                                    type: base,
+                                    title: e.title || "",
+                                    source: e.source || "",
                                     refText: (r.refText || e.refText || ""),
                                     refRaw: r.refRaw,
                                     text: e.content,
@@ -7180,6 +7245,12 @@ class StepInterfaceObsidian {
             // list, however the list is closed.
             entry.adjChild = () => { killAdj("pinned"); killAdj("hover"); };
 
+            // Render a canonical reference the way the plugin displays it.
+            const showRefSafe = (r) => {
+                if (!r) return "";
+                try { return this.plugin.urlRef_displayRef(String(r)) || ""; } catch (e) { return ""; }
+            };
+
             ids.forEach(id => {
                 const info = contentOf[id];
                 const isCross = id.indexOf("X:") === 0;
@@ -7202,13 +7273,18 @@ class StepInterfaceObsidian {
                 const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
                 const darkText = !isCross && lum > 0.6;
                 const nameEl = row.createDiv();
-                nameEl.setText(info.refText || "");
+                const rowRef = showRefSafe(info.ownCanon) || showRefSafe(info.refRaw) || info.refText || "";
+                const rowTop = [rowRef, info.title].filter(v => v && String(v).trim()).join(" - ");
+                nameEl.setText(rowTop || info.label || "");
                 nameEl.style.fontWeight = "700";
                 nameEl.style.fontSize = "13px";
                 nameEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
-                if (info.label) {
+                const rowType = info.type && String(info.type).trim() ? String(info.type).trim() : "";
+                const rowSource = info.source && String(info.source).trim() ? String(info.source).trim() : "";
+                const rowBottom = rowSource ? (rowType ? rowType + " (" + rowSource + ")" : "(" + rowSource + ")") : rowType;
+                if (rowBottom) {
                     const lbl = row.createDiv();
-                    lbl.setText(info.label);
+                    renderMetaLine(lbl, rowType, rowSource, this.plugin.app, info.path || "", "");
                     lbl.style.fontSize = "11px";
                     lbl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
                 }
@@ -7451,16 +7527,31 @@ class StepInterfaceObsidian {
                 if (!r) return "";
                 try { return this.plugin.urlRef_displayRef(String(r)) || ""; } catch (e) { return ""; }
             };
-            const titleText = showRef(info.ownCanon) || showRef(info.refRaw) || info.refText || "";
-            titleEl.setText(titleText);
+            // Two-line title. Top: "Type - Title", bottom:
+            // "Reference (Source)". Any part that is absent is not shown, and
+            // if the whole top line is empty the reference takes its place so
+            // the header never goes blank.
+            const refLabelText = showRef(info.ownCanon) || showRef(info.refRaw) || info.refText || "";
+            // Top: "Reference - Title". Bottom: "Type (Source)".
+            const topParts = [refLabelText, info.title].filter(v => v && String(v).trim());
+            const topText = topParts.join(" - ");
+            const bottomType = info.type && String(info.type).trim() ? String(info.type).trim() : "";
+            const bottomSource = info.source && String(info.source).trim() ? String(info.source).trim() : "";
+            const bottomText = bottomSource ? (bottomType ? bottomType + " (" + bottomSource + ")" : "(" + bottomSource + ")") : bottomType;
+            titleEl.setText(topText || bottomText || info.label || "");
             titleEl.style.fontWeight = "700";
             titleEl.style.fontSize = "15px";
             titleEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
             const refEl = header.createDiv({ cls: "step-bar-popover-ref" });
             // A bar standing for several notes (or several sections of one
             // list) says so: "1 of 3". Clicking the bar steps through them.
-            refEl.setText((info.label || "")
-                + (hit.stackCount > 1 ? "   \u00b7   " + ((hit.stackPos || 0) + 1) + " of " + hit.stackCount : ""));
+            // The bottom line is "Type (Source)". If the top line is empty the
+            // type is already shown there, so only the source is repeated here.
+            renderMetaLine(refEl, topText ? bottomType : "", bottomSource,
+                this.plugin.app, info.path || "", topText ? "" : (info.label || ""));
+            if (hit.stackCount > 1) {
+                refEl.appendText("   \u00b7   " + ((hit.stackPos || 0) + 1) + " of " + hit.stackCount);
+            }
             refEl.style.fontSize = "12px";
             refEl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
             const btns = header.createDiv({ cls: "step-bar-popover-buttons" });

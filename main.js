@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder, setIcon } = require('obsidian');
+const { Plugin, PluginSettingTab, Modal, MarkdownRenderer, Setting, requestUrl, Notice, AbstractInputSuggest, TFolder, setIcon, EditorSuggest } = require('obsidian');
 
 //STEP BIBLE LOCAL SERVER =======================================================
 // STEP Bible is only ever read from the user's own local installation. The
@@ -231,6 +231,191 @@ function renderMetaLine(el, typeText, sourceText, app, sourcePath, fallback) {
     el.appendText(")");
 }
 
+// Completes "[[..." into a real wiki link while typing in a note draft.
+// Obsidian's own link suggest doesn't fire in the draft popout, so drafts get
+// their own. It only reacts inside a draft, so ordinary editing is untouched.
+class DraftLinkSuggest extends EditorSuggest {
+    constructor(plugin) {
+        super(plugin.app);
+        this.plugin = plugin;
+    }
+    onTrigger(cursor, editor, file) {
+        try {
+            if (!file || !isDraftFilePath(file.path)) return null;
+            const before = editor.getLine(cursor.line).slice(0, cursor.ch);
+            const m = /\[\[([^\[\]]*)$/.exec(before);
+            if (!m) return null;
+            return {
+                start: { line: cursor.line, ch: m.index },
+                end: cursor,
+                query: m[1],
+            };
+        } catch (e) { return null; }
+    }
+    getSuggestions(context) {
+        const q = String(context.query || "").toLowerCase().trim();
+        const scored = [];
+        for (const f of this.app.vault.getMarkdownFiles()) {
+            if (isDraftFilePath(f.path)) continue;
+            const base = f.basename.toLowerCase();
+            const full = f.path.toLowerCase();
+            const i = base.indexOf(q);
+            const j = full.indexOf(q);
+            if (q && i < 0 && j < 0) continue;
+            // A name that starts with the query first, then any name that
+            // contains it, then a folder path that contains it.
+            const rank = !q ? 3 : (i === 0 ? 0 : (i > 0 ? 1 : 2));
+            scored.push({ f, rank, name: base });
+        }
+        scored.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+        return scored.slice(0, 50).map(x => x.f);
+    }
+    renderSuggestion(file, el) {
+        const name = el.createDiv({ text: file.basename });
+        name.style.fontSize = "13px";
+        const parent = file.parent && file.parent.path && file.parent.path !== "/" ? file.parent.path : "";
+        if (parent) {
+            const sub = el.createDiv({ text: parent });
+            sub.style.fontSize = "11px";
+            sub.style.opacity = "0.65";
+        }
+    }
+    selectSuggestion(file) {
+        const ctx = this.context;
+        if (!ctx) return;
+        let linktext = file.basename;
+        try {
+            // The shortest link that still resolves — no folder unless needed.
+            linktext = this.app.metadataCache.fileToLinktext(file, ctx.file && ctx.file.path, true) || file.basename;
+        } catch (e) { /* fall back to the name alone */ }
+        const insert = "[[" + linktext + "]]";
+        ctx.editor.replaceRange(insert, ctx.start, ctx.end);
+        try {
+            ctx.editor.setCursor({ line: ctx.start.line, ch: ctx.start.ch + insert.length });
+        } catch (e) { /* the caret is a convenience */ }
+    }
+}
+
+// "[[..." completion for a plain text field. The Title and Source fields are
+// ordinary <input>s, which Obsidian's EditorSuggest never sees, so they get
+// their own popup. Same ranking as the draft editor's suggest.
+function attachInputLinkSuggest(input, app, sourcePath) {
+    const doc = input.ownerDocument;
+    let popup = null;
+    let rows = [];
+    let index = 0;
+    let matchStart = -1;
+
+    const close = () => {
+        if (popup && popup.parentNode) popup.parentNode.removeChild(popup);
+        popup = null;
+        rows = [];
+        matchStart = -1;
+    };
+
+    const apply = (file) => {
+        if (!file || matchStart < 0) return;
+        let linktext = file.basename;
+        try {
+            linktext = app.metadataCache.fileToLinktext(file, sourcePath, true) || file.basename;
+        } catch (e) { /* name alone still works */ }
+        const insert = "[[" + linktext + "]]";
+        const caret = input.selectionStart == null ? input.value.length : input.selectionStart;
+        input.value = input.value.slice(0, matchStart) + insert + input.value.slice(caret);
+        const pos = matchStart + insert.length;
+        close();
+        try {
+            input.focus();
+            input.setSelectionRange(pos, pos);
+        } catch (e) { /* caret is a convenience */ }
+        input.dispatchEvent(new input.ownerDocument.defaultView.Event("input", { bubbles: true }));
+    };
+
+    const paint = () => {
+        if (!popup) return;
+        Array.prototype.forEach.call(popup.children, (el, i) => {
+            el.style.background = i === index ? "var(--background-modifier-hover)" : "transparent";
+        });
+        const active = popup.children[index];
+        if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
+    };
+
+    const refresh = () => {
+        const caret = input.selectionStart == null ? input.value.length : input.selectionStart;
+        const m = /\[\[([^\[\]]*)$/.exec(input.value.slice(0, caret));
+        if (!m) return close();
+        matchStart = m.index;
+        const q = m[1].toLowerCase().trim();
+        const scored = [];
+        for (const f of app.vault.getMarkdownFiles()) {
+            if (isDraftFilePath(f.path)) continue;
+            const base = f.basename.toLowerCase();
+            const full = f.path.toLowerCase();
+            const i = base.indexOf(q);
+            const j = full.indexOf(q);
+            if (q && i < 0 && j < 0) continue;
+            const rank = !q ? 3 : (i === 0 ? 0 : (i > 0 ? 1 : 2));
+            scored.push({ f, rank, name: base });
+        }
+        scored.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+        rows = scored.slice(0, 30).map(x => x.f);
+        if (!rows.length) return close();
+        index = 0;
+
+        if (!popup) {
+            popup = doc.createElement("div");
+            popup.style.cssText = "position:fixed;z-index:10000;max-height:210px;overflow:auto;" +
+                "background:var(--background-primary);border:1px solid var(--background-modifier-border);" +
+                "border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,0.28);padding:3px;box-sizing:border-box;";
+            doc.body.appendChild(popup);
+        }
+        popup.textContent = "";
+        const r = input.getBoundingClientRect();
+        popup.style.left = Math.max(4, r.left) + "px";
+        popup.style.top = (r.bottom + 4) + "px";
+        popup.style.width = Math.max(220, r.width) + "px";
+        popup.style.bottom = "auto";
+
+        rows.forEach((f, i) => {
+            const row = doc.createElement("div");
+            row.style.cssText = "padding:5px 8px;border-radius:4px;cursor:pointer;font-size:12.5px;" +
+                "color:var(--text-normal);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+            row.textContent = f.basename;
+            const parent = f.parent && f.parent.path && f.parent.path !== "/" ? f.parent.path : "";
+            if (parent) {
+                const sub = doc.createElement("span");
+                sub.textContent = "  " + parent;
+                sub.style.fontSize = "11px";
+                sub.style.opacity = "0.6";
+                row.appendChild(sub);
+            }
+            row.addEventListener("mouseenter", () => { index = i; paint(); });
+            row.addEventListener("mousedown", (ev) => { ev.preventDefault(); apply(f); });
+            popup.appendChild(row);
+        });
+        paint();
+    };
+
+    input.addEventListener("input", refresh);
+    input.addEventListener("click", () => { if (popup) refresh(); });
+    input.addEventListener("blur", () => setTimeout(close, 120));
+    input.addEventListener("keydown", (ev) => {
+        // Ctrl/Cmd+Enter is the window's save shortcut, not a completion.
+        if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) return;
+        if (!popup) return;
+        if (ev.key === "ArrowDown") {
+            ev.preventDefault(); index = Math.min(index + 1, rows.length - 1); paint();
+        } else if (ev.key === "ArrowUp") {
+            ev.preventDefault(); index = Math.max(index - 1, 0); paint();
+        } else if (ev.key === "Enter" || ev.key === "Tab") {
+            ev.preventDefault(); ev.stopPropagation();
+            apply(rows[index]);
+        } else if (ev.key === "Escape") {
+            ev.preventDefault(); ev.stopPropagation(); close();
+        }
+    });
+}
+
 // Suggests markdown files by path, for picking a folder's template note.
 class FileSuggest extends AbstractInputSuggest {
     constructor(app, inputEl, onPick) {
@@ -256,6 +441,25 @@ class FileSuggest extends AbstractInputSuggest {
         if (this.onPick) this.onPick(path);
     }
 }
+// The first line that carries a Bible reference link, skipping frontmatter
+// and anything inside a ~~~ block. -1 when there is none.
+function firstReferenceLine(lines) {
+    let escaped = false;
+    let fmEnd = -1;
+    if (lines.length && /^[-]{3,}[ \t]*$/.test(lines[0])) {
+        for (let i = 1; i < lines.length; i++) {
+            if (/^([-]{3,}|\.\.\.)[ \t]*$/.test(lines[i])) { fmEnd = i; break; }
+        }
+    }
+    for (let i = fmEnd + 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^[ \t]*~{3,}[ \t]*$/.test(line)) { escaped = !escaped; continue; }
+        if (escaped) continue;
+        if (/\[[^\]]+\]\([^)]*reference=[^)]*\)/.test(line)) return i;
+    }
+    return -1;
+}
+
 function parseTypedFile(text, fileBasename) {
     const linkRe = /\[([^\]]+)\]\(([^)]*reference=[^)]*)\)/g;
 
@@ -290,12 +494,14 @@ function parseTypedFile(text, fileBasename) {
         entries.push(current);
     };
 
+    let sawHeading = false;
     for (const line of text.split(/\r?\n/)) {
         if (/^[ \t]*~{3,}[ \t]*$/.test(line)) {
             escaped = !escaped; // toggle escape block
             continue;
         }
         if (!escaped && SECTION_HEADING_RE.test(line)) {
+            sawHeading = true;
             startSection(line);
             continue;
         }
@@ -311,6 +517,35 @@ function parseTypedFile(text, fileBasename) {
                     source: fileBasename,
                     target: current, // the section this crosslink points to
                 });
+            }
+        }
+    }
+
+    // A file with no level-1 heading at all — an older note, or an ordinary
+    // note that happens to sit in the lists folder — is one section, its
+    // reference on the line that carries it. Without this the file holds a
+    // note but draws no bar.
+    if (!sawHeading && !entries.length) {
+        const lines = text.split(/\r?\n/);
+        const at = firstReferenceLine(lines);
+        if (at >= 0) {
+            startSection(lines[at]);
+            // The line is prose that happens to carry a link, not a heading:
+            // its remaining words are the note, not a title or a source.
+            current.title = "";
+            current.source = "";
+            for (let i = at + 1; i < lines.length; i++) {
+                current.lines.push(lines[i]);
+                for (const cm of lines[i].matchAll(linkRe)) {
+                    let raw = cm[2].trim();
+                    try { raw = decodeURIComponent(raw); } catch (e) { /* as written */ }
+                    crosslinks.push({
+                        refText: (cm[1] || "").trim(),
+                        refRaw: raw,
+                        source: fileBasename,
+                        target: current,
+                    });
+                }
             }
         }
     }
@@ -378,6 +613,21 @@ function listSectionStarts(text) {
             title: h.title, source: h.source,
             refText: h.refText, refRaw: h.refRaw, refs: h.refs, hasRef: h.hasRef,
         });
+    }
+    // No level-1 heading: the file is one section, its reference on the line
+    // that carries it. Matches parseTypedFile, so the section a bar points at
+    // is the section the editor opens and the delete button removes.
+    if (!out.length) {
+        const at = firstReferenceLine(lines);
+        if (at >= 0) {
+            const h = parseSectionHeading(lines[at]);
+            out.push({
+                line: at, heading: lines[at],
+                canon: h.hasRef ? canonSpanOfRef(refFromLinkTarget(h.refRaw)) : null,
+                title: "", source: "",
+                refText: h.refText, refRaw: h.refRaw, refs: h.refs, hasRef: h.hasRef,
+            });
+        }
     }
     return out;
 }
@@ -1663,6 +1913,8 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     settings;
 
     async onload() {
+        // "[[" in a note draft completes to a vault file.
+        this.registerEditorSuggest(new DraftLinkSuggest(this));
 
         console.log('STEP Bible Linker Loaded.');
 
@@ -2674,15 +2926,44 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             "margin:8px 10px 0;" +
             "background:var(--background-primary);" +
             "color:var(--text-normal);max-height:34vh;overflow:auto;";
+        const headRow = doc.createElement("div");
+        headRow.style.cssText = "display:flex;align-items:center;gap:8px;";
         const heading = doc.createElement("div");
-        heading.style.cssText = "font-weight:600;margin-bottom:5px;font-size:13.5px;";
+        heading.style.cssText = "font-weight:600;margin-bottom:5px;font-size:13.5px;flex:1 1 auto;min-width:0;";
         heading.textContent = (canons || []).map(c => this.canonToDisplayRef(c)).join(", ")
             || String(startTitle || "").trim();
         const verseBox = doc.createElement("div");
         verseBox.style.cssText = "font-size:13px;line-height:1.55;";
         verseBox.textContent = "Loading passage\u2026";
-        head.appendChild(heading);
+
+        // Collapse the passage to its reference alone, leaving the editor more
+        // room. The choice is remembered for the next note in this session.
+        const collapseBtn = doc.createElement("button");
+        collapseBtn.type = "button";
+        collapseBtn.style.cssText = "flex:0 0 auto;margin-bottom:5px;padding:0 6px;height:20px;" +
+            "font-size:11px;line-height:18px;cursor:pointer;border-radius:4px;" +
+            "border:1px solid var(--background-modifier-border);" +
+            "background:var(--background-primary);color:var(--text-muted);";
+        let collapsed = !!this.noteEditorVerseCollapsed;
+        const applyCollapsed = () => {
+            verseBox.style.display = collapsed ? "none" : "";
+            head.style.maxHeight = collapsed ? "none" : "34vh";
+            head.style.overflow = collapsed ? "visible" : "auto";
+            collapseBtn.textContent = collapsed ? "show passage" : "minimise";
+            collapseBtn.title = collapsed ? "Show the passage text" : "Show only the reference";
+        };
+        collapseBtn.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            collapsed = !collapsed;
+            this.noteEditorVerseCollapsed = collapsed;
+            applyCollapsed();
+        });
+
+        headRow.appendChild(heading);
+        headRow.appendChild(collapseBtn);
+        head.appendChild(headRow);
         head.appendChild(verseBox);
+        applyCollapsed();
         root.insertBefore(head, content);
 
         // ---- title and source --------------------------------------------
@@ -2707,6 +2988,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         sourceInput.style.cssText = fieldStyle;
         meta.appendChild(titleInput);
         meta.appendChild(sourceInput);
+        // "[[" completes to a vault file here too.
+        attachInputLinkSuggest(titleInput, this.app, path);
+        attachInputLinkSuggest(sourceInput, this.app, path);
         root.insertBefore(meta, content);
 
         // Pure black or pure white, whichever the surface can carry better.
@@ -2835,7 +3119,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // behaves like any other line break in the editor.
         // The listener is on the document in the capture phase so it runs
         // before CodeMirror's own binding and can stop it acting on the key.
-        const editorArea = view.contentEl || content;
+        // Ctrl+Enter saves from anywhere in the window, text fields included,
+        // so the fields count as part of the editor area for that purpose.
+        const editorArea = root;
         doc.addEventListener("keydown", (ev) => {
             if (ev.key === "Escape") {
                 ev.preventDefault();
@@ -3522,8 +3808,22 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             const cr = r ? toCanonical(r) : null;
                             return cr ? cl + "-" + cr : cl;
                         };
+                        // A typed id is derived from what the section IS — its
+                        // reference — not from its position in the file.
+                        // Positional ids re-pointed every later section the
+                        // moment one was inserted above it, so a bar already
+                        // drawn kept its id and opened whatever section had
+                        // taken that number: the note after the one you added.
+                        // Duplicate references get an ordinal suffix so two
+                        // sections on the same passage stay separate bars.
+                        const usedIds = Object.create(null);
+                        const stableId = (refStr, fallback) => {
+                            const core = "T:" + base + ":" + (refStr || fallback);
+                            const n = (usedIds[core] = (usedIds[core] || 0) + 1);
+                            return n === 1 ? core : core + "#" + n;
+                        };
                         parsed.entries.forEach((e, i) => {
-                            const id = "T:" + base + ":" + i;
+                            const id = stableId(canonRange(e.refRaw), "noref-" + i);
                             // Every main reference on the section's first line
                             // draws its own bar and gets its own record, so each
                             // bar is titled with ITS reference. Sharing one
@@ -3567,10 +3867,17 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                         // keyed on the resolved range so "Genesis.1.1" and
                         // "Genesis.1.1-1.1" collapse to one.
                         const seenCross = new Map();
+                        const usedCrossIds = Object.create(null);
                         parsed.crosslinks.forEach((c, i) => {
-                            const id = "X:" + base + ":" + i;
                             const rp = refPart(c.refRaw);
                             const parentId = entryIdOf[c.target.index] || null;
+                            // Keyed on the section it sits in and the range it
+                            // points at, so a crosslink bar keeps its meaning
+                            // when sections are added elsewhere.
+                            const crossCore = "X:" + base + ":" + (parentId || "-") + ":" +
+                                (canonRange(c.refRaw) || rp || "unknown");
+                            const cN = (usedCrossIds[crossCore] = (usedCrossIds[crossCore] || 0) + 1);
+                            const id = cN === 1 ? crossCore : crossCore + "#" + cN;
                             const canon = canonRange(c.refRaw) || rp || "?" + i;
                             const dedupeKey = (parentId || "-") + "\u0000" + canon;
                             if (seenCross.has(dedupeKey)) return;
@@ -3606,6 +3913,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     }
                     if (coloursDirty) this.saveSettings();
                 }
+                // A typed section whose reference resolved to no verse at all
+                // can never draw a bar. Say which one and why, instead of
+                // leaving a note that is in the file but invisible on the page.
+                try {
+                    const placed = new Set();
+                    for (const k of Object.keys(map)) map[k].forEach(id => placed.add(id));
+                    const orphan = Object.keys(typedData.contentOf).filter(id =>
+                        id.indexOf("X:") !== 0 && !placed.has(id));
+                    if (orphan.length) {
+                        console.warn("STEP Plugin: sections with no verses (no bar possible):",
+                            orphan.map(id => id + " ref=" + (typedData.contentOf[id].refRaw || "?"))
+                        );
+                    }
+                } catch (e) {}
+
                 // serialise the complete map (untyped + typed) for the page
                 const serialised = {};
                 for (const k of Object.keys(map)) serialised[k] = Array.from(map[k]);
@@ -5295,6 +5617,11 @@ class StepInterfaceDOM {
         // previous occupant doesn't overlap its range. This makes
         // overlapping bars sit in separate columns and makes the
         // gutter width adapt to how many overlap at once.
+        // Notes that map onto this page's verses: everything here should end
+        // up as a bar (or in the overflow lane). Anything left over means the
+        // bar pass dropped it, which is what "the note is in the file but no
+        // bar appears" looks like, so it is reported rather than guessed at.
+        panel.__mapped = Object.keys(noteIdx);
         const noteList = Object.keys(noteIdx)
             .map(nb => ({ nb, e: noteIdx[nb] }))
             // Longer spans first so the longest bar lands in the
@@ -5339,8 +5666,11 @@ class StepInterfaceDOM {
             // starts inside the page keeps its bar too.
             const coversPage = b && pageStart !== null
                 && b.start <= pageStart && b.end >= pageEnd;
-            const overflowOne =
-                b.start < pageStart || b.end > pageEnd;
+            // No measured extent (shouldn't happen, but a missing entry used to
+            // throw here and abort every bar after it on the page): draw it.
+            const overflowOne = b && (
+                (pageStart !== null && b.start < pageStart)
+                || (pageEnd !== null && b.end > pageEnd));
             if (coversPage && overflowOne) {
                 overflowList.push(item);
             } else {
@@ -5375,20 +5705,10 @@ class StepInterfaceDOM {
             stackOf[ids[0]] = ids.slice();
             ids.slice(1).forEach(id => stackedAway.add(id));
         });
-        // At most four bars for one passage. Bars from different notes sit
-        // side by side up to that count; a fifth note on exactly the same
-        // verses would push the gutter across the text, so it folds into the
-        // fourth bar instead, which steps through the rest on click (the same
-        // mechanism a list note's own sections use).
-        const MAX_LANE_BARS = 4;
-        Object.keys(byRange).forEach(k => {
-            const ids = byRange[k].filter(id => !stackedAway.has(id));
-            if (ids.length <= MAX_LANE_BARS) return;
-            const head = ids[MAX_LANE_BARS - 1];
-            const extra = ids.slice(MAX_LANE_BARS);
-            stackOf[head] = (stackOf[head] || [head]).concat(extra);
-            extra.forEach(id => stackedAway.add(id));
-        });
+        // There is no cap on bars per passage. Every note gets its own bar,
+        // and the gutter widens to fit however many overlap — the slot pass
+        // below is what makes room. Folding extra notes into the lane used to
+        // be how a note ended up in the file with no bar of its own.
         if (stackedAway.size) {
             for (let i = noteList.length - 1; i >= 0; i--) {
                 if (stackedAway.has(noteList[i].nb)) noteList.splice(i, 1);
@@ -5663,6 +5983,19 @@ class StepInterfaceDOM {
         if (dbg.length) {
             // debug info goes to the console log in the plugin; no title edit
         }
+        try {
+            // A note is explained if it drew a bar, was folded into one (its
+            // own note's sections only), or lives in the lane. Anything left
+            // has no representation at all: report it, never drop it quietly.
+            const explained = new Set(noteList.map(it => it.nb));
+            (panel.list || []).forEach(id => explained.add(id));
+            Object.keys(stackOf).forEach(h => stackOf[h].forEach(id => explained.add(id)));
+            if (cont) cont.querySelectorAll('.step-note-bar').forEach(b => {
+                explained.add(b.getAttribute('data-note') || '');
+            });
+            const missing = (panel.__mapped || []).filter(id => !explained.has(id));
+            if (missing.length) allDbg.push("NO-BAR: " + missing.join(", "));
+        } catch (e) {}
         totalAdded += added;
         allDbg.push(dbg.join(" | "));
         });
@@ -7323,11 +7656,21 @@ class StepInterfaceObsidian {
                 return !!b && b.start === want.start && b.end === want.end;
             };
             if (matches(direct)) return direct;
+            // A chapter reference's own bounds start at verse 0, so they never
+            // equal a bar's "-.1" start even though the bar is that section's.
+            // Any overlap means the record really is this bar's section; only
+            // a record that misses it entirely — a stale id — may be replaced.
+            if (direct && direct.ownCanon) {
+                const db = canonBounds(direct.ownCanon);
+                if (db && db.start <= want.end && db.end >= want.start) return direct;
+            }
             const id = String((hit && hit.id) || "");
             if (id.indexOf("X:") === 0) return direct;  // crosslink: no own ref
-            const cut = id.lastIndexOf(":");
-            if (cut < 0) return direct;
-            const prefix = id.slice(0, cut + 1);
+            // The source prefix is "T:<note>:", the fixed part of a typed id.
+            const a = id.indexOf(":");
+            const b = a < 0 ? -1 : id.indexOf(":", a + 1);
+            if (b < 0) return direct;
+            const prefix = id.slice(0, b + 1);
             for (const other of Object.keys(contentOf)) {
                 if (other.indexOf(prefix) !== 0) continue;
                 if (matches(contentOf[other])) return contentOf[other];

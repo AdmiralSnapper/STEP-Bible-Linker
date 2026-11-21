@@ -637,7 +637,7 @@ function listSectionStarts(text) {
 // the same place comes after the shorter one, and a duplicate goes after the
 // one already there. A section with no verse has no place in that order, so it
 // goes at the end of the file. Every other line is left exactly as it was.
-function insertListSection(text, sectionMd, canon) {
+function insertListSection(text, sectionMd, canon, report) {
     const doc = String(text == null ? "" : text);
     const lines = doc.split(/\r?\n/);
     const sections = listSectionStarts(doc);
@@ -659,6 +659,10 @@ function insertListSection(text, sectionMd, canon) {
     // back below, exactly, so no stray blank lines accumulate on repeat use.
     let end = cut;
     while (end > 0 && !lines[end - 1].trim()) end--;
+
+    // Where the new section lands, so the caller can open exactly it even
+    // when another section already carries the same reference.
+    if (report) report.index = sections.filter(s => s.line < cut).length;
 
     const before = lines.slice(0, end);
     const after = lines.slice(cut);
@@ -1253,7 +1257,9 @@ class StepBibleSearchModal extends Modal {
             if (!path) return;
             this._changesCommitted = true;
             this.close();
-            await this.plugin.openNoteEditorPopout({ path, undo: track.undo, canons });
+            await this.plugin.openNoteEditorPopout({
+                path, undo: track.undo, canons, sectionIndex: track.sectionIndex
+            });
         } catch (e) {
             new Notice("Could not save the note: " + (e && e.message ? e.message : e));
         } finally {
@@ -2618,17 +2624,21 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const f = this.app.vault.getAbstractFileByPath(dest.file);
                 if (!f) { new Notice("That list note no longer exists."); return null; }
                 const text = await this.app.vault.read(f);
-                await this.app.vault.modify(f, insertListSection(text, withBody(heading), canon));
+                const report = {};
+                await this.app.vault.modify(f, insertListSection(text, withBody(heading), canon, report));
                 // Cancel puts the file back exactly as it was: the inserted
                 // section is the only change, so the original bytes undo it.
-                if (track) track.undo = { kind: "list", path: f.path, before: text };
+                if (track) {
+                    track.undo = { kind: "list", path: f.path, before: text };
+                    track.sectionIndex = report.index;
+                }
                 return f.path;
             }
             // A new list note: the section is its first section.
             if (!folder) { new Notice("Pick a Bible notes folder first."); return null; }
             const path = this.uniqueUntitledPath(folder);
             const created = await this.app.vault.create(path, withBody(heading) + "\n");
-            if (track) track.undo = { kind: "new", path: created.path };
+            if (track) { track.undo = { kind: "new", path: created.path }; track.sectionIndex = 0; }
             return created.path;
         }
 
@@ -2662,15 +2672,26 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // because a section is identified by where its reference starts, not by
     // the text of its link. Returns null when no section matches, so a caller
     // never mistakes "not found" for "the whole file".
-    noteSectionParts(text, canon) {
+    noteSectionParts(text, canon, preferIndex) {
         const doc = String(text == null ? "" : text);
         const lines = doc.split(/\r?\n/);
         const sections = listSectionStarts(doc);
         const target = canonBounds(canon || "");
         let idx = -1;
-        if (target) {
+        // A section the caller just wrote is addressed by its position: two
+        // sections can share a reference, and the first match would then be
+        // someone else's note.
+        if (typeof preferIndex === "number" && preferIndex >= 0 && preferIndex < sections.length) {
+            idx = preferIndex;
+        }
+        if (idx < 0 && target) {
+            // A chapter reference and its first verse are written differently
+            // ("Numbers.21" vs "Numbers.21.1"), and canonBounds gives their
+            // starts one apart. An exact comparison therefore missed the
+            // section and the editor opened with its fields blank.
             for (let i = 0; i < sections.length; i++) {
-                if (sections[i].canon && sections[i].canon.start === target.start) { idx = i; break; }
+                const c = sections[i].canon;
+                if (c && Math.abs(c.start - target.start) <= 1) { idx = i; break; }
             }
         }
         if (idx < 0 && canon) {
@@ -2739,11 +2760,15 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // Delete a note outright: the section goes, link line and all, so the bar
     // disappears with it. An ordinary note that keeps no reference sections is
     // emptied instead — there is no section to remove.
-    async deleteNoteFor(path, canon) {
+    async deleteNoteFor(path, canon, title) {
         const f = this.app.vault.getAbstractFileByPath(path);
         if (!f) { new Notice("The note could not be found."); return false; }
         const text = await this.app.vault.read(f);
-        const found = canon ? this.noteSectionParts(text, canon) : null;
+        // A section with no verse has no reference to be addressed by, so its
+        // title is the address. Without it the delete fell through to the
+        // whole-file branch and emptied a section it had never found.
+        const address = canon || title || "";
+        const found = address ? this.noteSectionParts(text, address) : null;
         if (found) {
             const next = removeListSection(text, found.index);
             await this.app.vault.modify(f, next == null ? text : next);
@@ -2806,7 +2831,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // passage above it, the editable note beneath it, Cancel / Add note at the
     // bottom. The editor is a real MarkdownView, so links, embeds, pictures and
     // hover all behave exactly as they do in a normal note.
-    async openNoteEditorPopout({ path, undo, canons, mode, sectionTitle }) {
+    async openNoteEditorPopout({ path, undo, canons, mode, sectionTitle, sectionIndex }) {
         const file = this.app.vault.getAbstractFileByPath(path);
         if (!file) { new Notice("The note could not be opened."); return; }
         // Editing an existing note writes over its text; adding one starts
@@ -2821,7 +2846,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // text. If the file holds sections but none is this reference's, the
         // window refuses to open rather than editing the whole file: writing
         // the draft back over the lot would take the other notes with it.
-        const found = address ? this.noteSectionParts(text, address) : null;
+        const found = (typeof sectionIndex === "number")
+            ? this.noteSectionParts(text, "", sectionIndex)
+            : (address ? this.noteSectionParts(text, address) : null);
         const parts = found ? found.parts : this.noteBodyParts(text, "");
         const section = found ? found.section : null;
         if (address && !found && listSectionStarts(text).length) {
@@ -2843,32 +2870,80 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         if (!draftPath) { new Notice("Could not open a draft for the note."); return; }
         const draftFile = this.app.vault.getAbstractFileByPath(draftPath);
 
-        const leaf = this.app.workspace.openPopoutLeaf
-            ? this.app.workspace.openPopoutLeaf()
-            : this.app.workspace.getLeaf("window");
-        if (!leaf) { await this.removeDraft(draftPath); new Notice("Could not open a popout window."); return; }
+        // A popout window of its own, half the screen's width and height, so
+        // the note sits beside the text you are reading instead of covering
+        // it. Moving the tab into the main window docks it; see finish().
+        let leaf = null;
+        // The window is created at Obsidian's default size and the note paints
+        // into it immediately, so shrinking it afterwards reads as a large
+        // window snapping small. The size is applied on the window-open event,
+        // before the file is loaded into it, and its contents stay hidden
+        // until the size is right.
+        let popWinRef = null;
+        const sizePopout = (win) => {
+            if (!win || win === window) return;
+            popWinRef = win;
+            try {
+                const sw = (win.screen && win.screen.availWidth) || 1200;
+                const sh = (win.screen && win.screen.availHeight) || 800;
+                const w = Math.max(520, Math.round(sw / 2));
+                const h = Math.max(420, Math.round(sh / 2));
+                const reveal = () => {
+                    try { win.document.documentElement.style.visibility = ""; } catch (e) { /* gone */ }
+                };
+                try { win.document.documentElement.style.visibility = "hidden"; } catch (e) { /* gone */ }
+                win.resizeTo(w, h);
+                win.moveTo(Math.round((sw - w) / 2), Math.round((sh - h) / 2));
+                win.addEventListener("load", reveal, { once: true });
+                setTimeout(reveal, 400);
+            } catch (e) { /* a fixed-size manager still opens it usable */ }
+        };
+        const windowOpenRef = this.app.workspace.on("window-open", (win) => sizePopout(win));
+        // Resizing a window after it exists can still show one frame at the
+        // old size. Obsidian builds popouts with window.open, so the size is
+        // given at creation instead: the window is born at half-screen and
+        // never has a larger size to flash through. Restored immediately, so
+        // nothing else in Obsidian is affected.
+        const realOpen = window.open;
+        let patchedOpen = null;
+        try {
+            patchedOpen = window.open = function (url, name, features) {
+                let extra = "";
+                try {
+                    const sw = window.screen && window.screen.availWidth ? window.screen.availWidth : 1200;
+                    const sh = window.screen && window.screen.availHeight ? window.screen.availHeight : 800;
+                    const w = Math.max(520, Math.round(sw / 2));
+                    const h = Math.max(420, Math.round(sh / 2));
+                    const x = Math.round((sw - w) / 2);
+                    const y = Math.round((sh - h) / 2);
+                    extra = `,width=${w},height=${h},left=${x},top=${y}`;
+                } catch (e) { extra = ""; }
+                const win = realOpen.call(window, url, name, (features ? features + "," : "") + "popup=yes" + extra);
+                try { sizePopout(win); } catch (e) { /* sized already */ }
+                return win;
+            };
+        } catch (e) { patchedOpen = null; }
+        try {
+            leaf = this.app.workspace.getLeaf("window");
+            if (!leaf || !leaf.openFile) leaf = this.app.workspace.getLeaf(true);
+        } catch (e) {
+            leaf = this.app.workspace.getLeaf(true);
+        } finally {
+            if (patchedOpen) { try { window.open = realOpen; } catch (e) { /* already */ } }
+        }
+        if (!leaf) { await this.removeDraft(draftPath); new Notice("Could not open a window for the note."); return; }
         await leaf.openFile(draftFile);
 
         const view = leaf.view;
         const root = view && view.containerEl;
+        // The window this editor was born in. If the tab is moved to the main
+        // window later, the leaf's document stops being this one.
+        const popWin = root && root.ownerDocument ? root.ownerDocument.defaultView : null;
+        // window-open may not fire on every version, so size it here too.
+        if (popWin !== popWinRef) sizePopout(popWin);
+        try { this.app.workspace.offref(windowOpenRef); } catch (e) { /* once */ }
         if (!root) { await this.removeDraft(draftPath); return; }
 
-        // Editing, not reading: the window is for writing the note.
-        // The window's own name is the reference in readable form — "Numbers
-        // 22:22", not the link it was built from. Obsidian renames the window
-        // when the view settles, so the title is re-applied a beat later.
-        const winTitle = (canons || []).map(c => this.canonToDisplayRef(c)).filter(Boolean).join(", ")
-            || String(sectionTitle || "").trim();
-        const setWindowTitle = () => {
-            try {
-                const win = root.ownerDocument.defaultView;
-                if (!win || !winTitle) return;
-                win.document.title = winTitle;
-            } catch (e) { /* the OS keeps whatever name it was given */ }
-        };
-        setWindowTitle();
-        setTimeout(setWindowTitle, 60);
-        setTimeout(setWindowTitle, 400);
         try {
             if (view.getMode && view.getMode() !== "source" && view.setState) {
                 const state = view.getState ? view.getState() : {};
@@ -2878,27 +2953,14 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // A popout has its own document: every element must be made with it.
         const doc = root.ownerDocument;
 
-        // Half the screen, centred. A popout is a real OS window, so this is
-        // the window manager's job; resizeTo only affects a window the page
-        // opened itself, which a popout is. Deferred a beat because Obsidian
-        // places and sizes the window just after it opens.
-        setTimeout(() => {
-            try {
-                const win = doc.defaultView;
-                if (!win) return;
-                const sw = (win.screen && win.screen.availWidth) || 1200;
-                const sh = (win.screen && win.screen.availHeight) || 800;
-                const w = Math.round(sw / 2);
-                const h = Math.round(sh / 2);
-                win.resizeTo(w, h);
-                win.moveTo(Math.round((sw - w) / 2), Math.round((sh - h) / 2));
-            } catch (e) { /* the window keeps whatever size it opened at */ }
-        }, 60);
-
-        // The draft's own chrome (tab title, file title) is not part of the
-        // note, so it is hidden: passage, text, buttons, nothing else.
+        // The draft's own chrome (breadcrumbs, inline title) is not part of
+        // the note, so it is hidden: passage, text, buttons, nothing else.
+        // Scoped to this leaf, since the tab shares the window's stylesheet.
+        const chromeClass = "step-note-editor";
+        root.classList.add(chromeClass);
         const chrome = doc.createElement("style");
-        chrome.textContent = ".view-header,.inline-title,.view-content > .markdown-preview-view > .mod-header{display:none!important;}";
+        chrome.textContent = "." + chromeClass + " .view-header,." + chromeClass +
+            " .inline-title,." + chromeClass + " .view-content > .markdown-preview-view > .mod-header{display:none!important;}";
         doc.head.appendChild(chrome);
 
         root.style.display = "flex";
@@ -2918,38 +2980,42 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             (this.settings && this.settings.noteLinesColour) || "#17758f";
 
         const head = doc.createElement("div");
-        // The passage keeps the note's own surface, outlined in the bar
-        // colour so it reads as part of the note. Text colour is picked for
-        // contrast once the surface is resolved, below.
+        // The passage sits on the note's own surface with no outline of its
+        // own. Only the verse text scrolls: the reference row and its arrow
+        // stay put.
         head.style.cssText = "flex:0 0 auto;padding:9px 12px;box-sizing:border-box;" +
-            "border:1px solid " + barColour + ";border-radius:4px;" +
-            "margin:8px 10px 0;" +
+            "margin:6px 10px 0;" +
+            "border:1px solid var(--background-modifier-border);border-radius:4px;" +
             "background:var(--background-primary);" +
-            "color:var(--text-normal);max-height:34vh;overflow:auto;";
+            "color:var(--text-normal);max-height:34vh;" +
+            "display:flex;flex-direction:column;min-height:0;";
         const headRow = doc.createElement("div");
-        headRow.style.cssText = "display:flex;align-items:center;gap:8px;";
+        headRow.style.cssText = "display:flex;align-items:center;gap:6px;flex:0 0 auto;";
         const heading = doc.createElement("div");
-        heading.style.cssText = "font-weight:600;margin-bottom:5px;font-size:13.5px;flex:1 1 auto;min-width:0;";
+        heading.style.cssText = "font-weight:600;margin-bottom:5px;font-size:13.5px;flex:0 1 auto;min-width:0;";
         heading.textContent = (canons || []).map(c => this.canonToDisplayRef(c)).join(", ")
             || String(startTitle || "").trim();
+        // The only thing allowed to scroll.
+        const verseScroll = doc.createElement("div");
+        verseScroll.style.cssText = "flex:1 1 auto;min-height:0;overflow:auto;";
         const verseBox = doc.createElement("div");
         verseBox.style.cssText = "font-size:13px;line-height:1.55;";
         verseBox.textContent = "Loading passage\u2026";
 
         // Collapse the passage to its reference alone, leaving the editor more
-        // room. The choice is remembered for the next note in this session.
+        // room. A bare arrow, outside the scrolling area so it never slides
+        // away with the text. The choice is remembered for this session.
         const collapseBtn = doc.createElement("button");
         collapseBtn.type = "button";
-        collapseBtn.style.cssText = "flex:0 0 auto;margin-bottom:5px;padding:0 6px;height:20px;" +
-            "font-size:11px;line-height:18px;cursor:pointer;border-radius:4px;" +
+        collapseBtn.style.cssText = "flex:0 0 auto;width:22px;height:22px;margin-bottom:5px;padding:0;" +
+            "font-size:11px;line-height:20px;cursor:pointer;border-radius:4px;" +
             "border:1px solid var(--background-modifier-border);" +
             "background:var(--background-primary);color:var(--text-muted);";
         let collapsed = !!this.noteEditorVerseCollapsed;
         const applyCollapsed = () => {
-            verseBox.style.display = collapsed ? "none" : "";
+            verseScroll.style.display = collapsed ? "none" : "";
             head.style.maxHeight = collapsed ? "none" : "34vh";
-            head.style.overflow = collapsed ? "visible" : "auto";
-            collapseBtn.textContent = collapsed ? "show passage" : "minimise";
+            collapseBtn.textContent = collapsed ? "\u25b8" : "\u25be";
             collapseBtn.title = collapsed ? "Show the passage text" : "Show only the reference";
         };
         collapseBtn.addEventListener("click", (ev) => {
@@ -2962,36 +3028,76 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         headRow.appendChild(heading);
         headRow.appendChild(collapseBtn);
         head.appendChild(headRow);
-        head.appendChild(verseBox);
+        verseScroll.appendChild(verseBox);
+        head.appendChild(verseScroll);
         applyCollapsed();
         root.insertBefore(head, content);
 
-        // ---- title and source --------------------------------------------
-        // Two plain text fields. Whatever they hold is written back into the
-        // section's heading as "# (ref) Title | source", so the file keeps the
-        // one format the scan reads.
-        const meta = doc.createElement("div");
-        meta.style.cssText = "flex:0 0 auto;display:flex;gap:8px;padding:8px 10px 0;box-sizing:border-box;";
-        const fieldStyle = "flex:1 1 0;min-width:0;box-sizing:border-box;padding:6px 8px;" +
-            "font:inherit;font-size:12.5px;color:var(--text-normal);" +
-            "background:var(--background-primary);" +
-            "border:1px solid var(--background-modifier-border);border-radius:4px;";
+        // ---- the top bar: title, source, actions --------------------------
+        // The bar sits above the passage, in the note's own solid colour, and
+        // carries the fields and the two buttons. Nothing is left at the
+        // bottom of the tab.
+        const bar = doc.createElement("div");
+        bar.style.cssText = "flex:0 0 auto;display:flex;align-items:center;gap:8px;" +
+            "padding:8px 10px;box-sizing:border-box;margin:8px 10px 0;" +
+            "border-radius:4px;background:" + barColour + ";color:" + barInk(barColour) + ";";
+        // The fields share the bar's colour rather than punching a black hole
+        // in it. Their ink is read off the bar, like the hint's, so the text
+        // stays legible when a list colour is light.
+        const fieldStyle = "min-width:0;box-sizing:border-box;padding:6px 8px;" +
+            "font:inherit;font-size:12.5px;color:" + barInk(barColour) + ";" +
+            "background:" + barColour + ";" +
+            "border:1px solid " + barInk(barColour) + "59;border-radius:4px;" +
+            "outline:none;";
+        // Placeholders are hex-inked so they follow the same rule.
+        const fieldStyleEl = doc.createElement("style");
+        fieldStyleEl.textContent = "." + chromeClass + " input.step-note-field::placeholder{color:" +
+            barInk(barColour) + ";opacity:0.6;}";
         const titleInput = doc.createElement("input");
         titleInput.type = "text";
         titleInput.placeholder = "Title";
         titleInput.value = startTitle;
+        titleInput.className = "step-note-field";
         titleInput.style.cssText = fieldStyle + "flex:2 1 0;";
         const sourceInput = doc.createElement("input");
         sourceInput.type = "text";
         sourceInput.placeholder = "Source";
         sourceInput.value = startSource;
-        sourceInput.style.cssText = fieldStyle;
-        meta.appendChild(titleInput);
-        meta.appendChild(sourceInput);
+        sourceInput.className = "step-note-field";
+        sourceInput.style.cssText = fieldStyle + "flex:1 1 0;";
+        bar.appendChild(titleInput);
+        bar.appendChild(sourceInput);
         // "[[" completes to a vault file here too.
         attachInputLinkSuggest(titleInput, this.app, path);
         attachInputLinkSuggest(sourceInput, this.app, path);
-        root.insertBefore(meta, content);
+
+        // Two symbols rather than words: discard and save.
+        const iconBtnStyle = "flex:0 0 auto;display:flex;align-items:center;justify-content:center;" +
+            "width:28px;height:28px;padding:0;cursor:pointer;border-radius:4px;" +
+            "border:1px solid transparent;background:transparent;color:" + barInk(barColour) + ";";
+        const cancelBtn = doc.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.title = "Cancel";
+        cancelBtn.setAttribute("aria-label", "Cancel");
+        cancelBtn.style.cssText = iconBtnStyle;
+        try { setIcon(cancelBtn, "lucide-x"); } catch (e) { cancelBtn.textContent = "\u00d7"; }
+        const saveBtn = doc.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.title = "Save";
+        saveBtn.style.cssText = iconBtnStyle;
+        try { setIcon(saveBtn, "lucide-check"); } catch (e) { saveBtn.textContent = "\u2713"; }
+        bar.appendChild(cancelBtn);
+        bar.appendChild(saveBtn);
+
+        // The hint sits to the right of the two symbols. Its ink is read off
+        // the bar colour, since a chosen list colour can be light.
+        const hintEl = doc.createElement("span");
+        hintEl.textContent = "ctrl + enter to save";
+        hintEl.style.cssText = "flex:0 0 auto;margin-left:2px;white-space:nowrap;font-size:11px;" +
+            "letter-spacing:0.01em;opacity:0.85;user-select:none;color:" + barInk(barColour) + ";";
+        bar.appendChild(hintEl);
+        doc.head.appendChild(fieldStyleEl);
+        root.insertBefore(bar, head);
 
         // Pure black or pure white, whichever the surface can carry better.
         // The theme's own text colour is usually right, but a themed surface
@@ -3012,6 +3118,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 const ink = L > 0.45 ? "#000000" : "#ffffff";
                 head.style.color = ink;
                 verseBox.style.color = ink;
+                verseScroll.style.color = ink;
             } catch (e) { /* keep the theme colour */ }
         };
         setContrast();
@@ -3019,32 +3126,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // opens, so resolve again once it has.
         setTimeout(setContrast, 120);
 
-        // ---- Cancel / Add note -------------------------------------------
-        const foot = doc.createElement("div");
-        // The same solid colour as the note's bar. The buttons keep their own
-        // theme backgrounds on top of it.
-        foot.style.cssText = "flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;" +
-            "padding:10px 14px;border-top:1px solid " + barColour + ";" +
-            "background:" + barColour + ";";
-        const cancelBtn = doc.createElement("button");
-        cancelBtn.textContent = "Cancel";
-        const saveBtn = doc.createElement("button");
-        saveBtn.textContent = "Save";
-        saveBtn.style.cssText = "font-weight:600;";
-
-        // The hint sits at the far end of the bar from the buttons. Its ink is
-        // read off the bar colour, since a chosen list colour can be light.
-        const hintEl = doc.createElement("span");
-        hintEl.textContent = "ctrl + enter to save";
-        hintEl.style.cssText = "margin-right:auto;align-self:center;font-size:11.5px;" +
-            "letter-spacing:0.01em;opacity:0.9;user-select:none;color:" +
-            barInk(barColour) + ";";
-
-        foot.appendChild(hintEl);
-        foot.appendChild(cancelBtn);
-        foot.appendChild(saveBtn);
-        root.appendChild(foot);
-
+        // The bar's buttons and the editor's own key handling below.
         // After a mode switch the view is a new instance, so read the editor
         // from the leaf rather than the one captured before it.
         const editor = (leaf.view && leaf.view.editor) || view.editor;
@@ -3075,9 +3157,38 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             this.forgetNoteText(undo.path);
         };
 
+        // Whether the editor tab still lives in the popout window it opened
+        // in. A tab dragged into the main window is docked: it stays open as
+        // an ordinary tab and is never closed from under the user.
+        const leafIsDocked = () => {
+            let alive = false;
+            try {
+                this.app.workspace.iterateAllLeaves((l) => { if (l === leaf) alive = true; });
+            } catch (e) { alive = true; }
+            if (!alive) return false;
+            const win = leaf.view && leaf.view.containerEl
+                ? leaf.view.containerEl.ownerDocument.defaultView : null;
+            return !popWin || popWin === window || win !== popWin;
+        };
+        // Leave the leaf as a normal tab showing the real note, or close it if
+        // it is still our popout.
+        const releaseLeaf = async (realFile) => {
+            if (leafIsDocked()) {
+                try { await leaf.openFile(realFile); } catch (e) {}
+                return;
+            }
+            try { leaf.detach(); } catch (e) {}
+        };
+
+        const tidyChrome = () => {
+            try { chrome.remove(); } catch (e) {}
+            try { root.classList.remove(chromeClass); } catch (e) {}
+        };
+
         const finish = async (save) => {
             if (finished) return;
             finished = true;
+            tidyChrome();
             if (closeWatch) { clearInterval(closeWatch); closeWatch = null; }
             saveBtn.disabled = true;
             cancelBtn.disabled = true;
@@ -3095,14 +3206,16 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                     // The scan that follows must read this file, not the text
                     // it had before the note was added.
                     this.forgetNoteText(path);
-                    // Detach before deleting: the view must not write to the
-                    // draft on its way out and bring the file back.
-                    try { leaf.detach(); } catch (e) {}
+                    // Close the popout, or dock it on the saved note. Either
+                    // way, take the draft away before the view can write it
+                    // back.
+                    await releaseLeaf(file);
                     await this.removeDraft(draftPath);
                     new Notice((editing ? "Changes saved: " : "Note added: ") + path);
                 } else {
-                    // Detach first: the draft must not be read on the way out.
-                    try { leaf.detach(); } catch (e) {}
+                    // Release the window first: the draft must not be read on
+                    // the way out.
+                    await releaseLeaf(file);
                     await this.removeDraft(draftPath);
                     await undoIt();
                     new Notice("Note discarded.");
@@ -3123,6 +3236,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // so the fields count as part of the editor area for that purpose.
         const editorArea = root;
         doc.addEventListener("keydown", (ev) => {
+            // The tab shares the app window, so keys pressed anywhere else
+            // in Obsidian must be left alone.
+            if (!root.contains(ev.target)) return;
             if (ev.key === "Escape") {
                 ev.preventDefault();
                 ev.stopPropagation();
@@ -3146,8 +3262,10 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const discard = () => {
             if (finished) return;
             finished = true;
+            tidyChrome();
             if (closeWatch) { clearInterval(closeWatch); closeWatch = null; }
             Promise.resolve()
+                .then(() => releaseLeaf(file))
                 .then(() => this.removeDraft(draftPath))
                 .then(undoIt)
                 .then(() => { new Notice("Note discarded."); this.refreshNoteDots(); })
@@ -3164,7 +3282,13 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             // draft never lingers, cheap enough to ignore.
             closeWatch = setInterval(() => {
                 if (finished) { clearInterval(closeWatch); closeWatch = null; return; }
-                if (!root.isConnected) discard();
+                if (root.isConnected) return;
+                // The tab was moved rather than closed: docked, it is an
+                // ordinary tab now, and the note must not be thrown away
+                // behind the user's back.
+                clearInterval(closeWatch);
+                closeWatch = null;
+                if (!leafIsDocked()) discard();
             }, 300);
         } catch (e) { /* the buttons still work */ }
 
@@ -5189,7 +5313,10 @@ class StepInterfaceDOM {
                 if (window.__stepDotObserve) window.__stepDotObserve();
             }
             this.installPageWatch();
-            this.mountAddChip();
+            // The chip in the page is gone; a build that drew one may have
+            // left it behind, so clear it rather than leave a dead button.
+            const staleChip = document.getElementById("step-linker-addnote");
+            if (staleChip) staleChip.remove();
             window.__stepLastInjectError = null;
             return res;
         } catch (e) {
@@ -7398,7 +7525,11 @@ class StepInterfaceObsidian {
                             path,
                             mode: "edit",
                             undo: { kind: "list", path, before },
-                            canons: canon ? [canon] : []
+                            canons: canon ? [canon] : [],
+                            // A section with no verse has no reference; its
+                            // title is how the editor finds it, and how the
+                            // fields start filled in.
+                            sectionTitle: (note.info && note.info.title) || ""
                         });
                     } catch (e) {
                         new Notice("Could not edit the note: " + (e && e.message ? e.message : e));
@@ -7415,7 +7546,7 @@ class StepInterfaceObsidian {
                     try {
                         const path = note.notePath;
                         killAdj(makePinned ? "pinned" : "hover");
-                        if (await this.plugin.deleteNoteFor(path, note.canon || "")) {
+                        if (await this.plugin.deleteNoteFor(path, note.canon || "", (note.info && note.info.title) || "")) {
                             new Notice("Note deleted.");
                         }
                     } catch (e) {
@@ -7674,6 +7805,20 @@ class StepInterfaceObsidian {
             for (const other of Object.keys(contentOf)) {
                 if (other.indexOf(prefix) !== 0) continue;
                 if (matches(contentOf[other])) return contentOf[other];
+            }
+            // Last resort: the id no longer names a note the cache knows (a
+            // renamed or moved file, or a bar drawn from a scan the cache has
+            // since replaced). The bar still says exactly which passage it is,
+            // so any record drawn over that same passage is right.
+            for (const other of Object.keys(contentOf)) {
+                if (other.indexOf("X:") === 0) continue;
+                const info = contentOf[other];
+                if (!info || !info.ownCanon) continue;
+                const b = canonBounds(info.ownCanon);
+                if (b && b.start === want.start && b.end === want.end) return info;
+            }
+            if (!direct && (typeof console !== "undefined")) {
+                console.warn("STEP Plugin: no note record for bar", hit && hit.id, hit && hit.ref);
             }
             return direct;
         };
@@ -7964,7 +8109,8 @@ class StepInterfaceObsidian {
                             path,
                             mode: "edit",
                             undo: { kind: "list", path, before },
-                            canons: canon ? [canon] : []
+                            canons: canon ? [canon] : [],
+                            sectionTitle: (info && info.title) || ""
                         });
                     } catch (e) {
                         new Notice("Could not edit the note: " + (e && e.message ? e.message : e));
@@ -7979,7 +8125,7 @@ class StepInterfaceObsidian {
                     try {
                         const path = notePathOf();
                         closePinned();
-                        if (await this.plugin.deleteNoteFor(path, noteCanonOf())) {
+                        if (await this.plugin.deleteNoteFor(path, noteCanonOf(), (info && info.title) || "")) {
                             new Notice("Note deleted.");
                         }
                     } catch (e) {

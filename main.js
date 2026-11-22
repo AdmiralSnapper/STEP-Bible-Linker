@@ -174,11 +174,240 @@ function isDraftFilePath(path) {
 }
 
 
+// The heading in a source file that stands for a section reference, as an
+// Obsidian link target ("EV Numbers#Numbers 22-24 | Sermons"), or null when
+// the file has no such heading. Compares loosely: the reference is written
+// with dots ("Numbers.22-24") while a heading is written as prose and may
+// carry a title and a source after it, so both sides are reduced to
+// lowercase letters and digits and the heading must START with the reference.
+function headingLinkFor(app, target, sourcePath, ref) {
+    try {
+        const want = String(ref || "").trim();
+        if (!want) return target;
+        const wantBounds = canonBoundsOfBarRef(want) || canonBounds(want);
+        if (!wantBounds) return target;
+        const file = app.metadataCache.getFirstLinkpathDest(String(target).split("#")[0].trim(), sourcePath || "");
+        if (!file) return target;
+        const cache = app.metadataCache.getFileCache(file);
+        const headings = (cache && cache.headings) || [];
+        if (!headings.length) return target;
+        // A heading reads "Numbers 22-24 | Sermons ([[EV Numbers]])" or
+        // "Genesis 1:2", so the reference is read off its front: the book
+        // name is matched against the known books (longest first, so
+        // "1 Samuel" wins over "Samuel") and the numbers after it parsed as
+        // chapter[:verse][-end]. Comparing the canonical START means a
+        // chapter heading and a verse heading are not confused for one
+        // another, while a range still matches the chapter it begins at.
+        const books = (typeof BibleInformation !== "undefined" ? BibleInformation.getBookOrder() : [])
+            .slice().sort((a, b) => b.length - a.length);
+        const readRef = (text) => {
+            const t = String(text || "").toLowerCase().replace(/^#+\s*/, "");
+            const book = books.find((b) => t.startsWith(String(b).toLowerCase()));
+            if (!book) return null;
+            const rest = t.slice(String(book).length);
+            const m = rest.match(/^\s*(\d+)(?:\s*[.:]\s*(\d+))?(?:\s*[-\u2013]\s*(?:(\d+)\s*[.:]\s*)?(\d+))?/);
+            if (!m) return null;
+            const ch = m[1];
+            const v = m[2];
+            const left = v ? book + "." + ch + "." + v : book + "." + ch;
+            if (m[3] != null && m[4] != null) return left + "-" + book + "." + ch + "." + m[4];
+            if (m[4] != null && m[2] == null) return left + "-" + book + "." + m[4];
+            return left;
+        };
+        for (const h of headings) {
+            const got = readRef(h.heading);
+            if (!got) continue;
+            const b = canonBounds(got);
+            if (!b) continue;
+            if (b.start === wantBounds.start) return file.path + "#" + h.heading;
+            // A chapter heading stands for every verse in that chapter, so a
+            // bar on Genesis 1:2 still finds "Genesis 1".
+            if (b.start % 1e6 === 0 && wantBounds.start >= b.start && wantBounds.start < b.start + 1e6) {
+                return file.path + "#" + h.heading;
+            }
+        }
+    } catch (e) { console.warn("STEP Plugin: heading lookup failed", target, e); }
+    return target;
+}
+
+// Where a section's "#" heading sits in its note file, and the reference
+// that identifies it. Used to land the note's open button at the top of the
+// section rather than at the top of the file or on a verse link inside it.
+async function sectionHeadingFor(app, info, fallbackPath) {
+    try {
+        if (!app || !info) return null;
+        const path = String(info.path || fallbackPath || "").trim();
+        if (!path) return null;
+        // The record's own path first; then the same path as link text (which
+        // resolves a note kept in a subfolder); then the bare name.
+        const name = path.split("/").pop().replace(/\.md$/i, "");
+        const file = app.vault.getAbstractFileByPath(path) ||
+            app.metadataCache.getFirstLinkpathDest(path, "") ||
+            app.metadataCache.getFirstLinkpathDest(name, "") ||
+            app.vault.getMarkdownFiles().find((f) => f.basename === name || f.path === path);
+        if (!file) return null;
+        const text = await app.vault.cachedRead(file);
+        const secs = listSectionStarts(text);
+        if (!secs.length) return null;
+        // A crosslink's own reference is the verse it points at; the section
+        // it was written in is the parent, and that is the heading to land on.
+        const wantRaw = String(info.parentCanon || info.ownCanon || info.refRaw || "").trim();
+        const want = wantRaw ? (canonBoundsOfBarRef(wantRaw) || canonBounds(wantRaw)) : null;
+        const wantText = String(info.refText || "").replace(/[\[\]]/g, "").trim();
+        // Index is the section's position among the file's "#" headings, which
+        // is what reading mode needs: it renders one h1 per section, in order.
+        const out = (sec, i) => ({ path: file.path, line: sec.line, heading: sec.heading, index: i, count: secs.length });
+        if (want) {
+            for (let i = 0; i < secs.length; i++) {
+                const sec = secs[i];
+                if (sec.canon && sec.canon.start === want.start) return out(sec, i);
+            }
+            // A chapter bar and a chapter section differ by one step
+            // (…21000000 vs …21000001); accept the chapter that contains it.
+            for (let i = 0; i < secs.length; i++) {
+                const sec = secs[i];
+                if (!sec.canon) continue;
+                const head = sec.canon.start;
+                if (head % 1e6 === 0 && want.start >= head && want.start < head + 1e6) return out(sec, i);
+            }
+        }
+        if (wantText) {
+            for (let i = 0; i < secs.length; i++) {
+                if (String(secs[i].heading || "").includes(wantText)) return out(secs[i], i);
+            }
+        }
+        // One section and no reference: it is the whole file.
+        if (secs.length === 1) return out(secs[0], 0);
+    } catch (e) { console.warn("STEP Plugin: section heading lookup failed", e); }
+    return null;
+}
+
+// Put a line at the top of the editor's viewport. CodeMirror 6 is the engine
+// underneath, so its own block coordinates give an exact top rather than the
+// nearest-it-can-get of Editor.scrollIntoView.
+function scrollLineToTop(view, lineNo) {
+    const ed = view && view.editor;
+    if (!ed) return false;
+    try {
+        const cm = ed.cm;
+        if (cm && cm.state && cm.state.doc && cm.lineBlockAt && cm.scrollDOM) {
+            const total = cm.state.doc.lines;
+            const n = Math.max(1, Math.min(total, lineNo + 1));
+            const block = cm.lineBlockAt(cm.state.doc.line(n).from);
+            if (block) {
+                cm.scrollDOM.scrollTop = Math.max(0, block.top);
+                return true;
+            }
+        }
+    } catch (e) { /* fall through to the editor API */ }
+    try {
+        const pos = { line: lineNo, ch: 0 };
+        ed.setCursor(pos);
+        ed.scrollIntoView({ from: pos, to: pos }, false);
+        return true;
+    } catch (e) { return false; }
+}
+
+// Puts a section's heading at the top of the view, in either editing mode.
+// The line number alone is only an estimate in reading mode, where Obsidian
+// renders one <h1> per "#" heading in file order — so the section's index
+// among the file's headings picks the exact element to scroll to.
+async function scrollSectionToTop(leaf, lineNo, sectionIndex) {
+    const ready = () => {
+        const v = leaf && leaf.view;
+        return !!(v && (v.editor || v.previewMode));
+    };
+    // A freshly opened leaf builds its view asynchronously; scrolling before
+    // that is thrown away.
+    const t0 = Date.now();
+    while (!ready() && Date.now() - t0 < 1500) {
+        await new Promise((r) => setTimeout(r, 40));
+    }
+    const view = leaf && leaf.view;
+    if (!view) return false;
+    const apply = () => {
+        try {
+            if (view.editor) return scrollLineToTop(view, lineNo);
+            const root = view.containerEl;
+            if (!root) return false;
+            const h1s = root.querySelectorAll(".markdown-preview-view h1, .markdown-preview-sizer h1");
+            if (!h1s.length) return false;
+            // One h1 per "#" heading, in file order, so the section's index
+            // among the file's headings is the element's index here.
+            const el = sectionIndex >= 0 && sectionIndex < h1s.length ? h1s[sectionIndex] : null;
+            if (!el) return false;
+            // The scroll container's name has moved between versions, so fall
+            // back to the nearest ancestor that actually scrolls.
+            let scroller = el.closest(".markdown-preview-view") ||
+                el.closest(".markdown-reading-view");
+            if (!scroller) {
+                let up = el.parentElement;
+                while (up) {
+                    if (up.scrollHeight > up.clientHeight + 4) { scroller = up; break; }
+                    up = up.parentElement;
+                }
+            }
+            if (scroller) {
+                const r = el.getBoundingClientRect(), c = scroller.getBoundingClientRect();
+                scroller.scrollTop = Math.max(0, scroller.scrollTop + (r.top - c.top) - 6);
+                if (scroller.scrollTop > 0) return true;
+            }
+            el.scrollIntoView({ block: "start" });
+            return true;
+        } catch (e) { return false; }
+    };
+    apply();
+    // Layout lands in dribs: repeat once the view has been measured.
+    for (const ms of [60, 200, 500]) setTimeout(apply, ms);
+    return true;
+}
+
+// Opens a source link. Both the note bar and the wider-references rows use
+// this, so a link behaves the same wherever it is drawn. Resolution is tried
+// in order (exact link path, Obsidian's own link opener, then a vault search
+// by name) and every failure is logged rather than swallowed.
+function openSourceTarget(app, target, sourcePath, ref) {
+    if (!app) { console.warn("STEP Plugin: no app for source link", target); return; }
+    const t = String(target || "").trim();
+    if (!t) return;
+    // A "#heading" suffix opens the file, not the anchor.
+    const filePart = t.split("#")[0].trim();
+    if (/^[a-z]+:\/\//i.test(t)) { window.open(t, "_blank"); return; }
+    // A source link names a file, not a section of one: the section heading
+    // lives in the note file (that is what the popover's open button is for),
+    // so this opens the source file as written.
+    const dest = t;
+    // Obsidian's own opener first: it resolves link text exactly as a rendered
+    // markdown link would, including shortest-path and relative resolution.
+    try {
+        const res = app.workspace.openLinkText(dest, sourcePath || "", true);
+        if (res && res.then) {
+            res.then((leaf) => {
+                if (!leaf) console.warn("STEP Plugin: source link not found:", t, "from", sourcePath);
+            }).catch((e) => console.warn("STEP Plugin: source open failed", t, e));
+        }
+        return;
+    } catch (e) { console.warn("STEP Plugin: openLinkText failed", t, e); }
+    try {
+        const file = app.metadataCache.getFirstLinkpathDest(filePart || t, sourcePath || "");
+        if (file) { app.workspace.getLeaf(false).openFile(file); return; }
+    } catch (e) { console.warn("STEP Plugin: source lookup failed", t, e); }
+    try {
+        // Last resort: a vault file whose path or name matches.
+        const want = (filePart || t).toLowerCase();
+        const hit = app.vault.getMarkdownFiles().find((f) =>
+            f.path.toLowerCase() === want || f.path.toLowerCase() === want + ".md" ||
+            f.basename.toLowerCase() === want);
+        if (hit) { app.workspace.getLeaf(false).openFile(hit); return; }
+    } catch (e) { console.warn("STEP Plugin: vault search failed", t, e); }
+    console.warn("STEP Plugin: could not open source link", t);
+}
+
 // Renders the bottom meta line of a bar/row: "Type (Source)". The source is
 // the text after the "|" in a section heading, which is usually a wiki link
 // ([[EV Numbers]]) or a markdown link, so it is drawn as a real, clickable
 // link rather than as inert text. Anything that is not a link stays text.
-function renderMetaLine(el, typeText, sourceText, app, sourcePath, fallback) {
+function renderMetaLine(el, typeText, sourceText, app, sourcePath, fallback, ref) {
     const type = typeText && String(typeText).trim() ? String(typeText).trim() : "";
     const source = sourceText && String(sourceText).trim() ? String(sourceText).trim() : "";
     if (!source) {
@@ -191,17 +420,33 @@ function renderMetaLine(el, typeText, sourceText, app, sourcePath, fallback) {
     const linkRe = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]|\[([^\]]+)\]\(([^)]+)\)/g;
     let last = 0;
     let m;
-    const addLink = (label, onclick) => {
+    // The source is drawn as an ordinary Obsidian internal link — the same
+    // class and data-href that rendered markdown uses — so Obsidian's own
+    // click handler opens it, resolves it and gives it a page preview, rather
+    // than this plugin re-implementing link opening behind its own listeners.
+    // A guarded fallback covers the case where the click reaches us first.
+    const addLink = (label, target, isExternal, onclick) => {
         const a = doc.createElement("a");
         a.textContent = label;
+        a.className = isExternal ? "external-link" : "internal-link";
+        a.setAttribute("data-href", target);
+        a.setAttribute("href", target);
+        if (isExternal) { a.setAttribute("target", "_blank"); a.setAttribute("rel", "noopener"); }
+        a.setAttribute("data-step-src", "1");
+        a.setAttribute("data-step-href", encodeURIComponent(target));
+        a.setAttribute("data-step-srcpath", sourcePath || "");
+        a.setAttribute("data-step-ref", ref ? String(ref) : "");
         a.style.color = "inherit";
         a.style.textDecoration = "underline";
         a.style.cursor = "pointer";
-        a.addEventListener("click", (ev) => {
-            ev.preventDefault();
-            ev.stopPropagation();
-            onclick();
-        });
+        a.style.position = "relative";
+        a.style.zIndex = "3";
+        // The click itself is handled by the plugin's delegated document
+        // listener (see onload): an anchor inside a popover is not reliably
+        // the element that receives the press, so the link is recognised from
+        // the event target instead of from a listener on this element.
+        a.addEventListener("mouseenter", () => { a.style.filter = "brightness(1.35)"; });
+        a.addEventListener("mouseleave", () => { a.style.filter = ""; });
         el.appendChild(a);
     };
     while ((m = linkRe.exec(source)) !== null) {
@@ -209,20 +454,14 @@ function renderMetaLine(el, typeText, sourceText, app, sourcePath, fallback) {
         if (m[1] !== undefined) {
             const target = m[1].trim();
             const label = (m[2] || target).trim();
-            addLink(label, () => {
-                if (!app) return;
-                const file = app.metadataCache.getFirstLinkpathDest(target, sourcePath || "");
-                if (file) app.workspace.getLeaf(false).openFile(file);
-                else app.workspace.openLinkText(target, sourcePath || "", false);
-            });
+            addLink(label, target, false, () => openSourceTarget(app, target, sourcePath, ref));
         } else {
             const label = (m[3] || "").trim();
             const href = (m[4] || "").trim();
-            addLink(label, () => {
-                if (!app) return;
-                const file = app.metadataCache.getFirstLinkpathDest(href, sourcePath || "");
-                if (file) app.workspace.getLeaf(false).openFile(file);
-                else window.open(href, "_blank");
+            const external = /^[a-z]+:\/\//i.test(href);
+            addLink(label, href, external, () => {
+                if (external) { window.open(href, "_blank"); return; }
+                openSourceTarget(app, href, sourcePath, ref);
             });
         }
         last = linkRe.lastIndex;
@@ -1922,6 +2161,33 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         // "[[" in a note draft completes to a vault file.
         this.registerEditorSuggest(new DraftLinkSuggest(this));
 
+        // Source links in a note's title bar or a wider-references row open
+        // here, by delegation on the document. An anchor nested in a popover
+        // is not reliably the element that receives the click — the popover
+        // and the row both listen on the press — so the link is recognised
+        // from the event target instead, wherever the listener ends up firing.
+        // Obsidian's own link handler is on the document too; if it has
+        // already dealt with the click it calls preventDefault, and this does
+        // nothing.
+        this.registerDomEvent(document, "click", (ev) => {
+            const a = ev.target && ev.target.closest ? ev.target.closest("a[data-step-src]") : null;
+            if (!a) return;
+            if (ev.defaultPrevented) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+            const target = a.getAttribute("data-step-href") || "";
+            const from = a.getAttribute("data-step-srcpath") || "";
+            const ref = a.getAttribute("data-step-ref") || "";
+            const key = target + "|" + ref;
+            const now = Date.now();
+            this._srcOpen = this._srcOpen || {};
+            if (now - (this._srcOpen[key] || 0) < 700) return;
+            this._srcOpen[key] = now;
+            try { openSourceTarget(this.app, decodeURIComponent(target), from, ref); }
+            catch (e) { console.error("STEP Plugin: source link failed", e); }
+        }, true);
+
         console.log('STEP Bible Linker Loaded.');
 
         // Note-dots state (vault scan derived from the per-file text cache)
@@ -3132,16 +3398,56 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
         const editor = (leaf.view && leaf.view.editor) || view.editor;
         let finished = false;
         let closeWatch = null;
+        let winFocusHandler = null;
 
-        // The caret starts where the note starts.
-        setTimeout(() => {
+        // The caret starts where the note starts, and the editor has the
+        // keyboard, so typing can begin without a click.
+        //
+        // Focusing once, shortly after open, is not enough: the popout window
+        // itself is not focused yet at that point (the OS gives it focus a
+        // moment later), and the mode switch replaces the editor instance. So
+        // focus is retried for the first second, until it takes — and stops
+        // early the moment the user has focused something in the window that
+        // isn't the editor, so their click is never overridden.
+        const focusEditor = () => {
+            if (finished) return true;
+            const live = (leaf.view && leaf.view.editor) || editor;
+            if (!live) return false;
+            // Someone has already put the caret where they want it.
             try {
-                if (!editor) return;
-                editor.setCursor({ line: 0, ch: 0 });
-                editor.scrollIntoView({ from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } }, true);
-                editor.focus();
-            } catch (e) { /* the caret is a convenience, not the job */ }
-        }, 80);
+                const doc = (leaf.view && leaf.view.containerEl && leaf.view.containerEl.ownerDocument) || null;
+                const active = doc && doc.activeElement;
+                const inEditor = active && live.cm && live.cm.dom && live.cm.dom.contains(active);
+                const isBody = !active || active === doc.body || active === doc.documentElement;
+                const onField = active && root.contains(active) && !inEditor && !isBody;
+                if (onField) return true;
+            } catch (e) { /* fall through and focus */ }
+            try {
+                if (popWin && popWin !== window && popWin.focus) popWin.focus();
+            } catch (e) { /* the window may be gone */ }
+            try {
+                live.setCursor({ line: 0, ch: 0 });
+                live.scrollIntoView({ from: { line: 0, ch: 0 }, to: { line: 0, ch: 0 } }, true);
+                live.focus();
+            } catch (e) { return false; }
+            try {
+                const doc = leaf.view.containerEl.ownerDocument;
+                return doc.activeElement === doc.body ? false : !!live.hasFocus();
+            } catch (e) { return false; }
+        };
+        // First attempt after the mode switch has settled, then keep trying
+        // while the window is still taking focus.
+        [0, 80, 250, 500, 900].forEach((ms) => setTimeout(focusEditor, ms));
+        // The window gaining focus is the reliable moment: focus the editor
+        // then too, but only if the note is in that window and the window
+        // has no other intention (the user clicked a button).
+        try {
+            if (popWin && popWin !== window) {
+                const onWinFocus = () => { setTimeout(focusEditor, 0); };
+                popWin.addEventListener("focus", onWinFocus);
+                winFocusHandler = onWinFocus; // removed on finish
+            }
+        } catch (e) { /* no focus event available */ }
 
         const undoIt = async () => {
             if (!undo) return;
@@ -3190,6 +3496,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
             finished = true;
             tidyChrome();
             if (closeWatch) { clearInterval(closeWatch); closeWatch = null; }
+            if (winFocusHandler) { try { popWin.removeEventListener("focus", winFocusHandler); } catch (e) {} winFocusHandler = null; }
             saveBtn.disabled = true;
             cancelBtn.disabled = true;
             try {
@@ -3649,7 +3956,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // Re-scan the vault and re-inject bars into every open STEP webview.
     // Used after settings changes (e.g. type colours) so they apply immediately.
     refreshNoteDots() {
-        if (this._noteDotsBusy) { this._noteDotsRefreshPending = true; return; }
+        if (this._noteDotsBusy) { this._noteDotsRefreshPending = true; return null; }
         this._noteDotsBusy = true;
         // Watchdog: executeJavaScript can hang while the page is navigating,
         // and a wedged "busy" flag would block every future rebuild — the page
@@ -3671,7 +3978,9 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 jobs.push(this.injectNoteDots(wv).catch(e => console.error("STEP Plugin: refresh error:", e)));
             }
         }
-        Promise.all(jobs).finally(() => {
+        // Returned so a caller that needs the rebuilt data (the hover
+        // popover, after a save) can wait for it instead of guessing.
+        return Promise.all(jobs).finally(() => {
             this._noteDotsBusy = false;
             if (this._noteDotsBusyTimer) { clearTimeout(this._noteDotsBusyTimer); this._noteDotsBusyTimer = null; }
             if (this._noteDotsRefreshPending) {
@@ -3679,6 +3988,32 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                 this.scheduleNoteDotsRefresh();
             }
         });
+    }
+
+    // Rebuild now and wait for the result.
+    //
+    // The scan is dropped the moment a note is saved (that is what makes the
+    // bars redraw) and rebuilt asynchronously. A save fires several vault
+    // events — the note write, the draft write, the draft delete — and any one
+    // of them landing after a rebuild leaves the cache null again, with the
+    // next rebuild only 200ms behind. A hover inside that window found no
+    // record and gave up silently: no popover, until the page was reloaded and
+    // the scan ran in full.
+    //
+    // So a caller that needs the data can ask for it and wait, rather than
+    // reading whatever happens to be in the cache at that instant.
+    async rebuildNoteDotsAndWait(timeoutMs) {
+        const deadline = Date.now() + (timeoutMs || 4000);
+        for (;;) {
+            this._noteDotsCache = null;
+            const job = this.refreshNoteDots();
+            if (job) { try { await job; } catch (e) { /* rebuild errors are logged there */ } }
+            if (this._noteDotsCache) return this._noteDotsCache;
+            if (Date.now() > deadline) return null;
+            // Busy with someone else's rebuild, or this one produced nothing:
+            // give it a beat and try again.
+            await new Promise((r) => setTimeout(r, 60));
+        }
     }
 
     // Small badge in the top right of the STEP page while the initial vault
@@ -3978,6 +4313,11 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                                     colour: colour,
                                     noMentions: true,
                                     ownCanon: canonRange(r.refRaw),
+                                    // The file this section actually lives in.
+                                    // Without it the path had to be guessed
+                                    // from the notes folder + list name, which
+                                    // fails for a note kept anywhere else.
+                                    path: f.path,
                                     // Every bar of this section shows the same
                                     // section text, so stepping must not treat
                                     // them as three separate notes.
@@ -4032,7 +4372,7 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
                             // crosslink's own spot in the body is marked.
                             const ownCanon = parentId && typedData.contentOf[parentId] ? typedData.contentOf[parentId].ownCanon : null;
                             const dropFirstMention = !!(ownCanon && canonRange(c.refRaw) === ownCanon);
-                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, text: parentText, colour: colour, wholeFile: true, parentId: parentId, dropFirstMention: dropFirstMention };
+                            typedData.contentOf[id] = { label: base, refText: c.target.refText, refRaw: c.target.refRaw, searchRef: searchRef, crossRef: canonRange(c.refRaw) || rp || "", title: c.target.title || "", type: base, source: c.target.source || "", text: parentText, colour: colour, wholeFile: true, parentId: parentId, dropFirstMention: dropFirstMention, path: f.path, parentCanon: ownCanon || "", parentTitle: (parentId && typedData.contentOf[parentId] ? typedData.contentOf[parentId].title : "") || "" };
                         });
                     }
                     if (coloursDirty) this.saveSettings();
@@ -4215,13 +4555,19 @@ module.exports = class StepBibleLinkerPlugin extends Plugin {
     // Every place a reference is mentioned in rendered note text: anchors whose
     // link points at the same passage, else plain-text hits for the reference.
     // Returns the marked elements in document order.
-    findMentions(root, refRaw, needles) {
+    findMentions(root, refRaw, needles, colour) {
         const spans = [];
+        // Outline the mention in the colour of the bar it came from, rather
+        // than tinting its background: the note's own text stays perfectly
+        // readable and the marker still reads as belonging to that bar.
+        const ink = String(colour || "").trim() || "rgb(190, 190, 163)";
         const mark = (el) => {
             el.classList.add("step-popover-mention");
-            el.style.backgroundColor = "rgba(190, 190, 163, 0.22)";
+            el.style.backgroundColor = "transparent";
             el.style.borderRadius = "3px";
-            el.style.boxShadow = "0 0 0 2px rgba(190, 190, 163, 0.16)";
+            el.style.outline = "1.5px solid " + ink;
+            el.style.outlineOffset = "1px";
+            el.style.boxShadow = "none";
             el.style.color = "inherit";
             spans.push(el);
         };
@@ -7482,6 +7828,8 @@ class StepInterfaceObsidian {
 
                 // Clone, not a fresh div: same colour, outline, text, sizes.
                 // cloneNode drops the row's listeners, which is what we want.
+                // A crosslink row stays its outlined reference chip here; the
+                // note it opens brings its own normal title bar.
                 const bar = row.cloneNode(true);
                 bar.addClass("step-adj-bar");
                 bar.style.position = "fixed";
@@ -7502,16 +7850,38 @@ class StepInterfaceObsidian {
                 // Buttons live at the far right so the note can be minimised
                 // even when another note covers the bar's left end.
                 const barBtns = document.createElement("div");
-                barBtns.style.cssText = "position:absolute;right:5px;top:50%;transform:translateY(-50%);display:flex;gap:2px;";
+                barBtns.style.cssText = "position:absolute;right:6px;top:50%;transform:translateY(-50%);display:flex;gap:4px;";
                 // The note's own header is hidden (this bar is its title bar),
                 // so edit and delete live here, alongside the other two.
-                const barBtnStyle = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;";
-                const editB = document.createElement("button");
-                editB.title = "Edit note text";
-                editB.style.cssText = barBtnStyle;
+                //
+                // These buttons match the pinned note's title bar exactly —
+                // transparent circle, grey hover disc, 16px glyph — so the two
+                // kinds of title bar are interchangeable. Arrows stay as the
+                // plain glyphs used here (↗ open, → minimise) in both bars.
+                const barBtnStyle = "background:transparent;border:none;border-radius:50%;color:#fff;width:26px;height:26px;padding:0;font-size:16px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;";
+                const mkBarBtn = (label) => {
+                    const b = document.createElement("button");
+                    b.title = label;
+                    b.setAttribute("aria-label", label);
+                    b.style.cssText = barBtnStyle;
+                    b.addEventListener("mouseenter", () => { b.style.background = "rgba(128,128,128,0.35)"; });
+                    b.addEventListener("mouseleave", () => { b.style.background = "transparent"; });
+                    b.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                    return b;
+                };
+                // A lucide svg sizes from font-size, which a row-height bar can
+                // clamp; pin the size and the ink as the pinned bar does.
+                const hardenBarIcon = (b) => {
+                    b.querySelectorAll("svg").forEach(s => {
+                        s.style.width = "16px";
+                        s.style.height = "16px";
+                        s.style.stroke = "#fff";
+                        s.style.display = "block";
+                    });
+                };
+                const editB = mkBarBtn("Edit note text");
                 setIcon(editB, "lucide-pencil");
-                editB.querySelectorAll("svg").forEach(s => { s.style.width = "13px"; s.style.height = "13px"; s.style.stroke = "#fff"; });
-                editB.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                hardenBarIcon(editB);
                 editB.addEventListener("click", async (ev) => {
                     ev.stopPropagation();
                     try {
@@ -7535,12 +7905,9 @@ class StepInterfaceObsidian {
                         new Notice("Could not edit the note: " + (e && e.message ? e.message : e));
                     }
                 });
-                const delB = document.createElement("button");
-                delB.title = "Delete note";
-                delB.style.cssText = barBtnStyle;
+                const delB = mkBarBtn("Delete note");
                 setIcon(delB, "lucide-trash-2");
-                delB.querySelectorAll("svg").forEach(s => { s.style.width = "13px"; s.style.height = "13px"; s.style.stroke = "#fff"; });
-                delB.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                hardenBarIcon(delB);
                 delB.addEventListener("click", async (ev) => {
                     ev.stopPropagation();
                     try {
@@ -7553,11 +7920,9 @@ class StepInterfaceObsidian {
                         new Notice("Could not delete the note: " + (e && e.message ? e.message : e));
                     }
                 });
-                const goto = document.createElement("button");
-                goto.textContent = "\u2197";
-                goto.title = "Open in Obsidian at this reference";
-                goto.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
-                goto.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                const goto = mkBarBtn("Open in Obsidian at this reference");
+                setIcon(goto, "lucide-arrow-up-right");
+                hardenBarIcon(goto);
                 goto.addEventListener("click", async (ev) => {
                     ev.stopPropagation();
                     try {
@@ -7565,11 +7930,9 @@ class StepInterfaceObsidian {
                         killAdj(makePinned ? "pinned" : "hover");
                     } catch (e) {}
                 });
-                const mini = document.createElement("button");
-                mini.textContent = "\u2192";
-                mini.title = "Minimise";
-                mini.style.cssText = "background:rgba(0,0,0,0.3);border:none;border-radius:4px;color:#fff;width:22px;height:20px;padding:0;font-size:13px;line-height:1;cursor:pointer;";
-                mini.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                const mini = mkBarBtn("Minimise");
+                mini.textContent = "\u2212";
+                mini.style.fontSize = "18px";
                 mini.addEventListener("click", (ev) => {
                     ev.stopPropagation();
                     killAdj(makePinned ? "pinned" : "hover");
@@ -7696,6 +8059,7 @@ class StepInterfaceObsidian {
                 // Clicking the stretched bar pins that note; a pinned note is
                 // replaced only by another click, never by mere hovering.
                 bar.addEventListener("click", async (ev) => {
+                    if (ev.target && ev.target.closest && ev.target.closest("a")) return;
                     ev.stopPropagation();
                     // A pinned bar is already extended: clicking it minimises
                     // it again, exactly like the arrow button.
@@ -7724,42 +8088,79 @@ class StepInterfaceObsidian {
                 row.style.margin = "0 0 4px 0";
                 row.style.borderRadius = "4px";
                 row.style.cursor = "pointer";
-                const col = info.colour || "#17758f";
-                if (isCross) {
-                    // Crosslink: hollow — dark grey fill, colour stroke.
-                    row.style.background = "#3a3a3a";
-                    row.style.boxShadow = "inset 0 0 0 2px " + col;
-                } else {
-                    row.style.background = col;
-                }
-                const hex = String(col).replace("#", "");
-                const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
-                const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
-                const darkText = !isCross && lum > 0.6;
-                const nameEl = row.createDiv();
-                const rowRef = showRefSafe(info.ownCanon) || showRefSafe(info.refRaw) || info.refText || "";
-                const rowTop = [rowRef, info.title].filter(v => v && String(v).trim()).join(" - ");
-                nameEl.setText(rowTop || info.label || "");
-                nameEl.style.fontWeight = "700";
-                nameEl.style.fontSize = "13px";
-                nameEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
-                const rowType = info.type && String(info.type).trim() ? String(info.type).trim() : "";
-                const rowSource = info.source && String(info.source).trim() ? String(info.source).trim() : "";
-                const rowBottom = rowSource ? (rowType ? rowType + " (" + rowSource + ")" : "(" + rowSource + ")") : rowType;
-                if (rowBottom) {
-                    const lbl = row.createDiv();
-                    renderMetaLine(lbl, rowType, rowSource, this.plugin.app, info.path || "", "");
-                    lbl.style.fontSize = "11px";
-                    lbl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
-                }
+                // A crosslink names a passage inside a note; the title belongs
+                // to the note. So while it sits in the list a crosslink is just
+                // its own reference, in an outlined box. Once the row is
+                // hovered or pinned it IS the note's title bar, and then it
+                // shows the note's title like any other.
+                //
+                // One painter for both, so the list row and the stretched bar
+                // can never drift apart.
+                const paint = (el, active) => {
+                    while (el.firstChild) el.removeChild(el.firstChild);
+                    const col = info.colour || "#17758f";
+                    const chip = isCross && !active;
+                    if (chip) {
+                        // Crosslink in the list: hollow — dark grey fill,
+                        // colour stroke.
+                        el.style.background = "#3a3a3a";
+                        el.style.boxShadow = "inset 0 0 0 2px " + col;
+                    } else {
+                        el.style.background = col;
+                        el.style.boxShadow = "none";
+                    }
+                    const hex = String(col).replace("#", "");
+                    const rgb = hex.length === 3 ? hex.split("").map(c => parseInt(c + c, 16)) : [0, 1, 2].map(i => parseInt(hex.substr(i * 2, 2), 16));
+                    const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+                    const darkText = !chip && lum > 0.6;
+                    const nameEl = el.createDiv();
+                    // The reference this bar is placed by: a note's own for a
+                    // note bar, the linked passage for a crosslink — never the
+                    // note's whole reference, which made a crosslink to one
+                    // verse read as the whole chapter it lives in.
+                    // In the list a crosslink box names the passage the link
+                    // points at, and says what it is. Hovered or pinned it
+                    // becomes the note's own title bar, titled by the section
+                    // the link was written in.
+                    const rowRef = chip
+                        ? [showRefSafe(info.crossRef) || showRefSafe(info.refRaw) || info.refText || "", "(crosslink)"].filter(v => v && String(v).trim()).join(" ")
+                        : showRefSafe(info.parentCanon) || showRefSafe(info.ownCanon) || showRefSafe(info.crossRef) || showRefSafe(info.refRaw) || info.refText || "";
+                    const rowTop = [rowRef, chip ? "" : info.title].filter(v => v && String(v).trim()).join(" - ");
+                    nameEl.setText(rowTop || info.label || "");
+                    nameEl.style.fontWeight = "700";
+                    nameEl.style.fontSize = "13px";
+                    nameEl.style.color = darkText ? "#3a3a3a" : "#ffffff";
+                    if (chip) return;
+                    const rowType = info.type && String(info.type).trim() ? String(info.type).trim() : "";
+                    const rowSource = info.source && String(info.source).trim() ? String(info.source).trim() : "";
+                    const rowBottom = rowSource ? (rowType ? rowType + " (" + rowSource + ")" : "(" + rowSource + ")") : rowType;
+                    if (rowBottom) {
+                        const lbl = el.createDiv();
+                        renderMetaLine(lbl, rowType, rowSource, this.plugin.app, info.path || "", "", info.parentCanon || info.ownCanon || info.crossRef || info.refRaw || "");
+                        lbl.style.fontSize = "11px";
+                        lbl.style.color = darkText ? "rgba(58,58,58,0.75)" : "rgba(255,255,255,0.8)";
+                    }
+                };
+                row._paint = paint;
+                paint(row, false);
                 row.addEventListener("mouseenter", () => {
                     row.style.filter = "brightness(1.12)";
                     // Preview to the left. Hovering replaces a hover preview and
                     // sits on top of a pinned note; it never replaces it.
                     makeAdj(id, row, false);
                 });
+                // A link in this row must stay reachable: the preview that
+                // opens beside the row can sit over it, and then the link never
+                // sees the press. Drop the preview while the pointer is on a
+                // link, and keep the link above the row's own surface.
+                row.addEventListener("mouseover", (ev) => {
+                    const t = ev.target;
+                    if (t && t.closest && t.closest("a")) killAdj("hover");
+                });
                 row.addEventListener("mouseleave", () => { row.style.filter = ""; });
                 row.addEventListener("click", async (ev) => {
+                    // A link inside the row is a link, not a pin/unpin.
+                    if (ev.target && ev.target.closest && ev.target.closest("a")) return;
                     ev.stopPropagation();
                     // Pin it exactly as clicking the stretched bar would.
                     killAdj("hover");
@@ -7823,6 +8224,34 @@ class StepInterfaceObsidian {
             return direct;
         };
 
+        // One rebuild, then look the bar up again.
+        //
+        // Guarded per bar and cooled down between attempts: a bar that names
+        // no record at all (a note deleted in another window, a bar the page
+        // has not re-drawn yet) must not put the plugin into a scan loop every
+        // time the pointer crosses it.
+        this._recoverNoteInfo = async (hit) => {
+            const id = String((hit && hit.id) || "");
+            if (!id) return null;
+            const now = Date.now();
+            this._recoverAt = this._recoverAt || {};
+            const last = this._recoverAt[id] || 0;
+            if (now - last < 4000) return null;
+            this._recoverAt[id] = now;
+            if (!this._recoverInFlight) {
+                this._recoverInFlight = this.plugin.rebuildNoteDotsAndWait(4000)
+                    .finally(() => { this._recoverInFlight = null; });
+            }
+            const cache = await this._recoverInFlight;
+            if (!cache || !cache.typedData) {
+                console.warn("STEP Plugin: note scan did not complete for bar", id, hit && hit.ref);
+                return null;
+            }
+            const info = this._infoForHit(hit, cache.typedData);
+            if (!info) console.warn("STEP Plugin: bar has no note after a rescan", id, hit && hit.ref);
+            return info;
+        };
+
         // Create the popover for one bar hit. Pinned popovers get a header
         // toolbar (open-in-Obsidian button), are draggable by the header and
         // resizable from the corner.
@@ -7841,9 +8270,20 @@ class StepInterfaceObsidian {
 
             // Content from the cached typed scan (same ids the page uses)
             const td = this.plugin._noteDotsCache && this.plugin._noteDotsCache.typedData;
-            const info = this._infoForHit(hit, td);
-            if (!info) { this._syncBarHold(); return; }
+            let info = this._infoForHit(hit, td);
+            if (!info) {
+                // No record for this bar. Either the scan has not finished
+                // since the note was saved (the cache is briefly null, or was
+                // rebuilt from text that predates the save) or the bar is
+                // stale. Rebuild once and look again: reloading the page used
+                // to be the only way out of this, because the popover simply
+                // returned here and showed nothing.
+                const recovered = await this._recoverNoteInfo(hit);
+                if (!recovered) { this._syncBarHold(); return; }
+                info = recovered;
+            }
             const base = hit.id.split(":")[1];
+            const isCrosslink = String(hit.id).indexOf("X:") === 0;
             const folder = (this.plugin.settings.noteTypesFolder || "").trim().replace(/\/+$/, "");
             // Typed entries live in the notes folder; ordinary notes record
             // their real path (they can sit anywhere in the vault).
@@ -7854,66 +8294,76 @@ class StepInterfaceObsidian {
             // "go to note" button on a row's stretched title bar.
             const goToNote = async () => {
                 try {
-
-                    const leaf2 = await this.plugin.app.workspace.openLinkText(sourcePath, "", true);
+                    const app = this.plugin.app;
+                    // Find the section's "#" heading BEFORE opening: the note
+                    // file holds it, and the button should land at the top of
+                    // the section, not at the top of the file and not on a
+                    // verse link somewhere inside it.
+                    const head = await sectionHeadingFor(app, info, sourcePath);
+                    const dest = head ? head.path : sourcePath;
+                    const lineNo = head ? head.line : -1;
+                    // The open line must be handed over AS the file opens.
+                    // setEphemeralState() called afterwards does nothing: the
+                    // view read its ephemeral state when the file loaded, so
+                    // the note opened at the top and stayed there.
+                    const file = app.vault.getAbstractFileByPath(dest) ||
+                        app.metadataCache.getFirstLinkpathDest(dest, "");
+                    const leaf2 = app.workspace.getLeaf(true);
+                    if (file && leaf2 && leaf2.openFile) {
+                        await leaf2.openFile(file, lineNo >= 0 ? { eState: { line: lineNo, ch: 0 } } : undefined);
+                    } else {
+                        await app.workspace.openLinkText(dest, "", true);
+                    }
                     const view = leaf2 && leaf2.view;
-                    if (view && view.getMode && view.getMode() === "source" && view.editor) {
-                        const ed = view.editor;
-                        const value = ed.getValue();
-                        const lines = value.split("\n");
-                        const wantRaw = String(info.refRaw || "").trim();
-                        const wantText = String(info.refText || "").replace(/[\[\]]/g, "").trim();
-                        let lineNo = -1;
-                        if (wantRaw) {
-                            for (let i = 0; i < lines.length; i++) {
-                                if (!lines[i].includes("reference=")) continue;
-                                const m = lines[i].match(/reference=([^)&\s]+)/);
-                                if (!m) continue;
-                                let got = m[1];
-                                try { got = decodeURIComponent(got); } catch (e) {}
-                                if (got.trim() === wantRaw) { lineNo = i; break; }
-                            }
-                        }
-                        // Fallback: the line that names the reference, so a
-                        // hand-written or odd-encoded link still lands right.
-                        if (lineNo < 0 && wantText) {
-                            for (let i = 0; i < lines.length; i++) {
-                                if (lines[i].includes("reference=") && lines[i].includes(wantText)) { lineNo = i; break; }
-                            }
-                        }
-                        if (lineNo >= 0) {
-                            const pos = { line: lineNo, ch: 0 };
-                            // Select the whole line: scrolling lands there and
-                            // the line is visibly highlighted.
-                            ed.setSelection(pos, { line: lineNo, ch: lines[lineNo].length });
-                            ed.scrollIntoView({ from: pos, to: pos }, true);
+                    if (!view) return;
+                    if (lineNo >= 0) {
+                        await scrollSectionToTop(leaf2, lineNo, head.index);
+                        return;
+                    }
+                    // No heading (an older note, a plain file): fall back to
+                    // the line that names this section's reference.
+                    // Reading mode has no editor to read through, so take the
+                    // lines from the file itself.
+                    let lines = [];
+                    try {
+                        lines = view.editor
+                            ? view.editor.getValue().split("\n")
+                            : (file ? (await app.vault.cachedRead(file)).split("\n") : []);
+                    } catch (e) { lines = []; }
+                    const wantRaw = String(info.parentCanon || info.ownCanon || info.refRaw || "").trim();
+                    const wantText = String(info.refText || "").replace(/[\[\]]/g, "").trim();
+                    let fallback = -1;
+                    if (wantRaw) {
+                        for (let i = 0; i < lines.length; i++) {
+                            if (!lines[i].includes("reference=")) continue;
+                            const m = lines[i].match(/reference=([^)&\s]+)/);
+                            if (!m) continue;
+                            let got = m[1];
+                            try { got = decodeURIComponent(got); } catch (e) {}
+                            if (got.trim() === wantRaw) { fallback = i; break; }
                         }
                     }
-            
-                } catch (e) {}
+                    if (fallback < 0 && wantText) {
+                        for (let i = 0; i < lines.length; i++) {
+                            if (lines[i].includes("reference=") && lines[i].includes(wantText)) { fallback = i; break; }
+                        }
+                    }
+                    if (fallback >= 0) await scrollSectionToTop(leaf2, fallback, -1);
+                } catch (e) {
+                    console.warn("STEP Plugin: could not open note", e);
+                }
             };
-
-            // Pinning replaces the pinned note and any transient hover note;
-            // hovering keeps the pinned note where it is.
-            // An adjacent note belongs to the "Wider References" list, so
-            // opening it must not close the very popover that owns it.
-            if (!adjacent) { closeHover(); if (pinned) closePinned(); }
-
-            // Anchor at the webview's top right corner
+            // Our own fixed-position box beside the bar. (Obsidian's
+            // HoverPopover used to draw this; `pop` keeps the small surface
+            // dispose() and the pinned code still expect.)
             const anchorEl = document.createElement("div");
             anchorEl.style.cssText = "position:fixed;width:0;height:0;pointer-events:none;";
             anchorEl.style.left = (box.right - 8) + "px";
             anchorEl.style.top = (box.top + 8) + "px";
             document.body.appendChild(anchorEl);
 
-            let pop = null;
-            // Own element, not Obsidian's HoverPopover. HoverPopover keeps a
-            // single shared hover element for the whole app and hides itself on
-            // mouseleave; that closed pinned notes when the pointer moved off
-            // them and made two independent notes impossible. A plain div we
-            // own is torn down only when we say so.
             const body = document.createElement("div");
-            pop = {
+            const pop = {
                 hoverEl: body,
                 hide() { try { body.remove(); } catch (e) {} },
                 position() {},
@@ -7921,37 +8371,30 @@ class StepInterfaceObsidian {
             };
             document.body.appendChild(body);
             body.addClass("step-bar-popover");
-            // A transient hover note must stack above the pinned one.
-            // An adjacent note sits above the list it was opened from (and
-            // above every title bar it hangs from).
+            body.style.position = "fixed";
+            // A row-owned note hangs from its row; a bar note sits to the
+            // left of its bar, right-aligned with it.
+            body.style.left = (adjacent ? adjacent.left : box.right - 8) + "px";
+            body.style.top = (adjacent ? adjacent.top : box.top + 8) + "px";
+            body.style.right = "auto";
+            body.style.bottom = "auto";
+            body.style.transform = adjacent ? "none" : "translateX(-100%)";
             body.style.zIndex = adjacent
                 ? (pinned ? "1000020" : "1000038")
                 : (pinned ? "1000010" : "1000050");
-            // Anchor at the top right of the webview: right-aligned by pulling
-            // the box back over its own width.
-            body.style.position = "fixed";
-            body.style.left = (box.right - 8) + "px";
-            body.style.top = (box.top + 8) + "px";
-            body.style.right = "auto";
-            body.style.bottom = "auto";
-            body.style.transform = "translateX(-100%)";
-            if (adjacent) {
-                body.style.transform = "none";
-                body.style.left = adjacent.left + "px";
-                body.style.top = adjacent.top + "px";
-                body.style.width = adjacent.width + "px";
-                body.dataset.stepAdjacent = "1";
-            }
-            // Register immediately: any later failure must still leave the
-            // popover closeable (otherwise the X does nothing).
-            const entry = { pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body, ovf: !!hit.ovf, page: hit.page || "" };
-            // The note behind this bar: its file and the reference it is filed
-            // under. Carried so a row in the Wider References list — whose own
-            // header is hidden — can still offer edit and delete.
-            entry.info = info;
-            entry.notePath = sourcePath;
-            entry.canon = info.ownCanon || info.refRaw || "";
+            body.style.overflow = "hidden";
+
+            const entry = {
+                pop, id: hit.id, anchorEl, pinned: !!pinned, hide: null, body,
+                page: hit.page || "", stackKey: hit.stackKey || null
+            };
+
             entry.goToNote = goToNote;
+            // One hover note at a time: a note left behind for another bar
+            // would sit on screen with nothing owning it.
+            if (!pinned && this._hoverPop && this._hoverPop !== entry) {
+                try { dispose(this._hoverPop); } catch (e) {}
+            }
             if (pinned) { this._pinnedPop = entry; this._barPinned = true; }
             else this._hoverPop = entry;
             this._barWebview = webviewEl;
@@ -7996,8 +8439,11 @@ class StepInterfaceObsidian {
             const darkText = lum > 0.6;
             if (info.colour) header.style.backgroundColor = info.colour;
             else header.style.backgroundColor = "var(--background-secondary)";
-            // Its title bar is the row stretched over it, so hide the header.
-            if (adjacent) header.style.display = "none";
+            // Its title bar is the row stretched over it, so hide the header —
+            // except for a crosslink. Its list row is only an outlined chip
+            // naming the linked verse, not a title bar, so the note keeps its
+            // own normal header and is scrolled to the crosslink inside it.
+            if (adjacent && !isCrosslink) header.style.display = "none";
             // Pin the title block: it stays in view while the note scrolls under it.
             header.style.position = "sticky";
             header.style.top = "0";
@@ -8019,7 +8465,10 @@ class StepInterfaceObsidian {
             // "Reference (Source)". Any part that is absent is not shown, and
             // if the whole top line is empty the reference takes its place so
             // the header never goes blank.
-            const refLabelText = showRef(info.ownCanon) || showRef(info.refRaw) || info.refText || "";
+            // A crosslink opens the section it was written in, so its title
+            // bar carries that section's reference — the same reference an
+            // ordinary bar on that section shows — not the linked verse.
+            const refLabelText = showRef(info.parentCanon) || showRef(info.ownCanon) || showRef(info.crossRef) || showRef(info.refRaw) || info.refText || "";
             // Top: "Reference - Title". Bottom: "Type (Source)".
             const topParts = [refLabelText, info.title].filter(v => v && String(v).trim());
             const topText = topParts.join(" - ");
@@ -8036,7 +8485,8 @@ class StepInterfaceObsidian {
             // The bottom line is "Type (Source)". If the top line is empty the
             // type is already shown there, so only the source is repeated here.
             renderMetaLine(refEl, topText ? bottomType : "", bottomSource,
-                this.plugin.app, info.path || "", topText ? "" : (info.label || ""));
+                this.plugin.app, info.path || "", topText ? "" : (info.label || ""),
+                refLabelText ? (info.parentCanon || info.ownCanon || info.crossRef || info.refRaw || "") : "");
             if (hit.stackCount > 1) {
                 refEl.appendText("   \u00b7   " + ((hit.stackPos || 0) + 1) + " of " + hit.stackCount);
             }
@@ -8089,7 +8539,7 @@ class StepInterfaceObsidian {
                 // filed under. A typed note is in the notes folder; an ordinary
                 // note records its real path.
                 const notePathOf = () => info.path || (folder ? `${folder}/${base}.md` : `${base}.md`);
-                const noteCanonOf = () => info.ownCanon || info.refRaw || "";
+                const noteCanonOf = () => info.ownCanon || info.parentCanon || info.refRaw || "";
 
                 // Edit: the same window a new note is written in, over this
                 // note's existing text.
@@ -8353,7 +8803,7 @@ class StepInterfaceObsidian {
             if (info.refText) needles.push(info.refText);
             // A note's own bar shows the note unmarked, at the top. Only a
             // crosslink marks and scrolls to its reference.
-            let mentions = info.noMentions ? [] : this.plugin.findMentions(mdEl, info.searchRef, needles);
+            let mentions = info.noMentions ? [] : this.plugin.findMentions(mdEl, info.searchRef, needles, info.colour);
             // Skip the note's own heading line, which carries the same reference
             // text as this crosslink. The crosslink's spot in the body is the
             // first mention worth marking.
